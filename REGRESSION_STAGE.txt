@@ -1,0 +1,2 @@
+Stage 1: TargetResolver only
+Dashboard renderer intentionally unchanged from baseline.

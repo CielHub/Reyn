@@ -15,3 +15,15 @@ class UpdaterState(Enum):
 
 # TODO Phase 3: Tambahkan LauncherState, MonitorState, dll di sini.
 
+
+
+class PackageState(Enum):
+    """Explicit lifecycle states for a Roblox package."""
+    OFFLINE = "OFFLINE"
+    LAUNCHING = "LAUNCHING"
+    CONNECTING = "CONNECTING"
+    ONLINE = "ONLINE"
+    RECOVERING = "RECOVERING"
+    COOLDOWN = "COOLDOWN"
+    FAILED = "FAILED"
+    NO_TARGET = "NO TARGET"

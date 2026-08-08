@@ -12,6 +12,8 @@ from core.logger import log
 from core.config import load_config, save_config
 from core.deeplink import get_intent_url
 from core.target_resolver import TargetResolver
+from core.state_machine import set_state
+from core.states import PackageState
 from core.scanner import get_roblox_packages
 from core.launcher import launch_and_wait
 from core.monitor import start_monitoring, draw_dashboard
@@ -306,7 +308,7 @@ def run_auto_rejoiner():
         stats[pkg] = {
             'pid': '-', 'status': 'OFFLINE', 'uptime_start': 0,
             'launch_count': 0, 'recovery_count': 0, 'crash_count': 0,
-            'consecutive_crashes': 0, 'last_recovery_time': current_time, 'cooldown_until': 0
+            'consecutive_crashes': 0, 'last_recovery_time': current_time, 'cooldown_until': 0, 'state': 'OFFLINE'
         }
     
     for handler in log.handlers[:]:
@@ -319,13 +321,13 @@ def run_auto_rejoiner():
         for pkg in packages:
             clean_package_cache(pkg)
             
-            stats[pkg]['status'] = 'LOADING'
+            set_state(stats, pkg, PackageState.LAUNCHING)
             stats[pkg]['launch_count'] += 1
             live.update(draw_dashboard(stats, time.time(), len(packages), include_header=True))
             
             intent_url = intent_dict.get(pkg)
             if not intent_url:
-                stats[pkg]['status'] = 'NO TARGET'
+                set_state(stats, pkg, PackageState.NO_TARGET)
                 live.update(draw_dashboard(stats, time.time(), len(packages), include_header=True))
                 log.error(f"LAUNCH SKIPPED: {pkg} tidak memiliki target join yang valid.")
                 continue
@@ -352,11 +354,11 @@ def run_auto_rejoiner():
                     pass
             
             if success:
-                stats[pkg]['status'] = 'ONLINE'
+                set_state(stats, pkg, PackageState.ONLINE)
                 stats[pkg]['uptime_start'] = time.time()
             else:
                 if stats[pkg]['status'] not in ['LOGIN FAILED', 'CAPTCHA']:
-                    stats[pkg]['status'] = 'FAILED'
+                    set_state(stats, pkg, PackageState.FAILED)
                 
             time.sleep(delay_seconds)
             live.update(draw_dashboard(stats, time.time(), len(packages), include_header=True))

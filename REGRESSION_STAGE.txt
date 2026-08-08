@@ -1,2 +1,4 @@
-Stage 1: TargetResolver only
-Dashboard renderer intentionally unchanged from baseline.
+STAGE 2 - JOIN STATE MACHINE ONLY
+Base: Stage 1 Target Resolver
+Added: core.state_machine, PackageState enum, minimal menu state transitions.
+Not added: Smart Verification, Tiered Recovery, Anti Recovery Loop, Health Check, dashboard changes, renderer changes.

@@ -1,109 +1,53 @@
-CARRERA-HUB REGRESSION STAGE 4R4
-================================
-Name: Dashboard Resize & Table Layout Hardening
-
-Baseline: Stage 3B - Startup Full Terminal Reset
-Parent experiment: Stage 4R3
+CARRERA-HUB PHASE D2-L
+=======================
+Name: Local Controller Hub
+Parent: Official Stage 4R4 - Auto Clear Terminal UI + Phase D1
 
 Purpose:
-- Fix the dashboard visual corruption that can occur when Android/Termux
-  changes terminal geometry while the keyboard is opened and then closed.
-- Tighten the dashboard table so PACKAGE/PID spacing no longer pushes the
-  rightmost columns outside the 60-column dashboard rule.
+- Turn one normal CARRERA-HUB device into the optional Controller Device.
+- Keep the Controller Hub embedded in CARRERA-HUB; no separate server process is required.
+- Maintain a local registry of worker devices and aggregate their heartbeats.
+- Provide authenticated read-only status endpoints for the future Discord layer.
 
-Changes:
-1. Dashboard renderer uses deterministic/manual Rich Live refreshes
-   (`auto_refresh=False`) so terminal writes are controlled by the dashboard
-   loop instead of a background refresh thread.
-2. Added a non-throwing SIGWINCH watcher for the dashboard lifecycle.
-   Resize events are recorded and consumed by the next dashboard refresh.
-3. When a resize is detected, Rich's cached previous frame shape is invalidated,
-   the visible terminal is cleared, and the current dashboard frame is drawn
-   from a clean cursor position.
-4. The resize recovery uses a visual `clear` only. It does NOT call the full
-   terminal `reset` and does not alter the Stage 3B startup-reset rule.
-5. Applied the same resize-safe Live renderer to both the initial auto-rejoiner
-   dashboard and the long-running monitoring dashboard.
-6. Dashboard table widths were tightened to fit exactly inside the 60-column
-   rule while retaining one-cell horizontal padding:
-   ID=3, PACKAGE=11, PID=6, STATUS=10, UPTIME=8, L=2, R=2, C=2.
+Architecture:
+    Discord (future D3)
+          |
+          v
+    Controller Device
+    CARRERA-HUB + D2-L Hub
+          |
+       workers
+          |
+    CARRERA-HUB devices
 
-Intentionally unchanged:
-- Recovery manager / Tier 1-3 recovery logic
-- Package-isolated recovery verification
-- 30-second minimum single-package recovery delay
-- Target resolver / join state machine
-- Launcher / PID tracking
-- Memory guard / global recovery behavior
-- One-time startup full terminal `reset`
-
-Test focus:
-1. Start dashboard normally and verify one CARRERA logo only.
-2. Open Android keyboard while dashboard is running.
-3. Leave keyboard open long enough for at least one dashboard refresh.
-4. Close keyboard and verify the dashboard redraws cleanly.
-5. Repeat keyboard open/close multiple times.
-6. Repeat with the keyboard opened and closed quickly, testing SIGWINCH handling.
-7. Verify no duplicated/overlapping ASCII logo remains.
-8. Verify the table's rightmost C/R/L columns stay inside the 60-column rule.
-9. Verify 2 packages, then 5-7 packages, without changing recovery behavior.
-10. Verify force-close/recovery behavior remains identical to Stage 4R3.
-
-Status:
-Experimental. NOT baseline until user testing passes.
-
-
-STAGE 4R4-AUTO-CLEAR-UI
-- Auto-clear terminal at main.py startup.
-- Clear terminal at menu-selection boundaries and menu entry.
-- show_transition clears before/after transitions.
-- No changes to recovery, monitoring, launcher, resolver, or state-machine logic.
-
-
-STAGE D1 - DEVICE REGISTRATION & HEARTBEAT
-===========================================
-Purpose:
-- Give each CARRERA-HUB device a stable random device ID.
-- Provide an optional control-plane registration + heartbeat client.
-- Keep the agent completely separate from Roblox recovery/monitoring.
-
-Design:
-- Identity is persisted in device.json and uses a random UUID; no hardware
-  identifiers such as IMEI, MAC, or Android serial are collected.
-- Network agent is disabled by default (DEVICE_AGENT_ENABLED=0).
-- When enabled, registration uses /api/v1/devices/register and heartbeat uses
-  /api/v1/devices/heartbeat.
-- Gateway failures never crash the main CARRERA-HUB process.
-- Heartbeat includes device identity and lightweight package/PID presence.
-- Device agent runs as a daemon thread and does not control recovery.
+D2-L changes:
+1. Added core/controller_hub.py.
+2. Controller is disabled by default (CONTROLLER_ENABLED=0).
+3. Controller exposes:
+   - POST /api/v1/devices/register
+   - POST /api/v1/devices/heartbeat
+   - GET  /api/v1/controller/status
+   - GET  /api/v1/controller/devices
+4. Registration uses a controller enrollment token and returns a per-device token.
+5. Heartbeats use the per-device token and are isolated by device_id.
+6. Status endpoints use a separate read-only status token.
+7. Device secrets/tokens are never returned by status endpoints.
+8. Controller device itself is represented in the registry from its local CARRERA snapshot.
+9. Worker Device Agent from D1 remains compatible: DEVICE_GATEWAY_URL points to the Controller Device.
+10. No Discord command, remote restart, kill, stop, or recovery control is added in D2-L.
 
 Safety boundary:
-- D1 does NOT add Discord commands.
-- D1 does NOT add remote restart/kill.
-- D1 does NOT modify recovery manager, launcher, target resolver, state machine,
-  dashboard renderer, or auto-clear behavior.
+- D2-L is control-plane only.
+- Recovery, launcher, monitoring, target resolver, state machine, dashboard, and auto-clear remain unchanged.
+- If the controller fails or is unreachable, worker CARRERA-HUB instances continue operating.
 
-Status: Experimental until gateway integration is tested.
+Testing:
+- Compile all Python files.
+- Start controller on localhost with temporary test tokens.
+- Register a synthetic worker.
+- Send heartbeat.
+- Verify aggregated status and offline transition.
+- Verify status endpoint rejects an invalid token.
+- Verify device token is not present in public status.
 
-STAGE D2 - GLOBAL DISCORD STATUS
-=================================
-Purpose:
-- Add a read-only global status endpoint to the gateway.
-- Add a Discord `/status` command that renders aggregate device/account state.
-- Keep Discord bot and its dependency outside the Android/Termux runtime.
-
-Design:
-- Gateway endpoint: GET /api/v1/devices/status.
-- Separate read-only status token.
-- Offline is derived from heartbeat freshness; default threshold 90 seconds,
-  minimum 30 seconds.
-- Status response excludes device secrets/tokens.
-- D2 exposes no destructive commands.
-
-Safety boundary:
-- No restart/kill/stop command.
-- No recovery logic changes.
-- No monitor/launcher/resolver/state-machine changes.
-- No dashboard or auto-clear changes.
-
-Status: Experimental until D2 testing passes.
+Status: Experimental. NOT baseline.

@@ -34,8 +34,27 @@ The gateway contract for this stage is:
 Registration may return `device_token`; CARRERA-HUB stores it in the local
 `device.json` identity file and uses it for subsequent heartbeats.
 
-## Phase D2 - Global Discord Status
+## Phase D2-L - Local Controller Hub
 
-D2 adds a read-only `/status` Discord command backed by the gateway. It is
-separate from the Android/Termux runtime and does not add remote control yet.
-See `phaseD2.md` and `discord_bot/README.md`.
+D2-L remodels the D1 gateway into an optional Controller Hub embedded directly
+inside CARRERA-HUB. No separate gateway process is required on the Controller
+Device. One CARRERA-HUB instance can remain a normal Roblox worker while also
+serving the device registry and status API.
+
+Enable D2-L only on the designated Controller Device:
+
+- `CONTROLLER_ENABLED=1`
+- `CONTROLLER_HOST="0.0.0.0"`
+- `CONTROLLER_PORT=8765`
+- `CONTROLLER_ENROLLMENT_TOKEN="..."`
+- `CONTROLLER_STATUS_TOKEN="..."`
+- `CONTROLLER_OFFLINE_AFTER=90`
+
+Worker devices continue using the D1 agent, but set:
+
+- `DEVICE_AGENT_ENABLED=1`
+- `DEVICE_GATEWAY_URL="http://<controller-address>:8765"`
+- `DEVICE_ENROLLMENT_TOKEN="<same-enrollment-token>"`
+
+D2-L does not add Discord commands yet. The read-only status endpoints are the
+foundation for the Discord layer planned for D3.

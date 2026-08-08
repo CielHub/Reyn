@@ -1,53 +1,23 @@
-CARRERA-HUB PHASE D2-L
-=======================
-Name: Local Controller Hub
-Parent: Official Stage 4R4 - Auto Clear Terminal UI + Phase D1
+CARRERA-HUB PHASE D3R1 - INTEGRATED DISCORD CONTROLLER SETTINGS
+================================================================
+BASELINE: CARRERA-HUB Stage 4R4 - Auto Clear Terminal UI
+PREVIOUS: Phase D2-L - Local Controller Hub
 
-Purpose:
-- Turn one normal CARRERA-HUB device into the optional Controller Device.
-- Keep the Controller Hub embedded in CARRERA-HUB; no separate server process is required.
-- Maintain a local registry of worker devices and aggregate their heartbeats.
-- Provide authenticated read-only status endpoints for the future Discord layer.
+D3R1 scope:
+- Integrated Discord Controller menu inside CARRERA-HUB.
+- Store Discord Bot Token (masked in UI).
+- Store Discord Guild/Server ID.
+- Toggle Discord bot enable/disable.
+- Test Discord Bot Token without logging the token.
+- Test local Controller Hub connection.
+- Keep Discord Controller URL local by default (127.0.0.1:8765).
+- Synchronize Discord status credential from local Controller status token.
+- Optional read-only /status Discord runtime.
 
-Architecture:
-    Discord (future D3)
-          |
-          v
-    Controller Device
-    CARRERA-HUB + D2-L Hub
-          |
-       workers
-          |
-    CARRERA-HUB devices
+Safety:
+- No restart/stop/kill/recovery commands in D3R1.
+- Discord runtime failure must not stop CARRERA-HUB.
+- Recovery, launcher, monitor, dashboard, target resolver and state machine are untouched.
+- Startup full terminal reset and auto-clear menu behavior are preserved.
 
-D2-L changes:
-1. Added core/controller_hub.py.
-2. Controller is disabled by default (CONTROLLER_ENABLED=0).
-3. Controller exposes:
-   - POST /api/v1/devices/register
-   - POST /api/v1/devices/heartbeat
-   - GET  /api/v1/controller/status
-   - GET  /api/v1/controller/devices
-4. Registration uses a controller enrollment token and returns a per-device token.
-5. Heartbeats use the per-device token and are isolated by device_id.
-6. Status endpoints use a separate read-only status token.
-7. Device secrets/tokens are never returned by status endpoints.
-8. Controller device itself is represented in the registry from its local CARRERA snapshot.
-9. Worker Device Agent from D1 remains compatible: DEVICE_GATEWAY_URL points to the Controller Device.
-10. No Discord command, remote restart, kill, stop, or recovery control is added in D2-L.
-
-Safety boundary:
-- D2-L is control-plane only.
-- Recovery, launcher, monitoring, target resolver, state machine, dashboard, and auto-clear remain unchanged.
-- If the controller fails or is unreachable, worker CARRERA-HUB instances continue operating.
-
-Testing:
-- Compile all Python files.
-- Start controller on localhost with temporary test tokens.
-- Register a synthetic worker.
-- Send heartbeat.
-- Verify aggregated status and offline transition.
-- Verify status endpoint rejects an invalid token.
-- Verify device token is not present in public status.
-
-Status: Experimental. NOT baseline.
+D3R1 IS NOT A BASELINE YET.

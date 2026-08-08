@@ -58,6 +58,13 @@ def load_config(config_path="config.conf"):
         "CONTROLLER_ENROLLMENT_TOKEN": "",
         "CONTROLLER_STATUS_TOKEN": "",
         "CONTROLLER_OFFLINE_AFTER": 90,
+        # Phase D3R1: integrated Discord Controller settings.
+        "DISCORD_BOT_ENABLED": 0,
+        "DISCORD_BOT_TOKEN": "",
+        "DISCORD_GUILD_ID": "",
+        "DISCORD_CONTROLLER_URL": "http://127.0.0.1:8765",
+        "DISCORD_CONTROLLER_STATUS_TOKEN": "",
+        "DISCORD_STATUS_TIMEOUT": 8,
     }
 
     with open(config_path, 'r') as f:
@@ -81,18 +88,25 @@ def load_config(config_path="config.conf"):
                              "GRID_ENABLED", "GRID_COLS", "GRID_CELL_W", "GRID_CELL_H", 
                              "GRID_MARGIN", "GRID_OFFSET_Y", "CLEAR_CACHE_MINUTES",
                              "DEVICE_AGENT_ENABLED", "DEVICE_HEARTBEAT_INTERVAL", "DEVICE_GATEWAY_TIMEOUT",
-                             "CONTROLLER_ENABLED", "CONTROLLER_PORT", "CONTROLLER_OFFLINE_AFTER"]:
+                             "CONTROLLER_ENABLED", "CONTROLLER_PORT", "CONTROLLER_OFFLINE_AFTER",
+                             "DISCORD_BOT_ENABLED", "DISCORD_STATUS_TIMEOUT"]:
                     try: 
                         config[key] = int(val)
                     except ValueError: 
                         pass
                 elif key in ["DEVICE_NAME", "DEVICE_GATEWAY_URL", "DEVICE_ENROLLMENT_TOKEN",
-                            "CONTROLLER_HOST", "CONTROLLER_ENROLLMENT_TOKEN", "CONTROLLER_STATUS_TOKEN"]:
+                            "CONTROLLER_HOST", "CONTROLLER_ENROLLMENT_TOKEN", "CONTROLLER_STATUS_TOKEN",
+                            "DISCORD_BOT_TOKEN", "DISCORD_GUILD_ID", "DISCORD_CONTROLLER_URL",
+                            "DISCORD_CONTROLLER_STATUS_TOKEN"]:
                     config[key] = val
                 elif key.startswith("PKG_"):
                     # Sekarang "PKG_com.roblox.client " akan otomatis jadi "PKG_com.roblox.client"
                     config[key] = val
                     
+    # D3R1: local Controller status token is the default credential for the integrated bot.
+    if not str(config.get("DISCORD_CONTROLLER_STATUS_TOKEN", "")).strip():
+        config["DISCORD_CONTROLLER_STATUS_TOKEN"] = str(config.get("CONTROLLER_STATUS_TOKEN", "")).strip()
+
     _normalize_targets(config)
 
     log.info("CONFIG: Konfigurasi berhasil dimuat dengan aman.")

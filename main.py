@@ -15,6 +15,7 @@ from core.menu import show_main_menu
 from core.config import load_config
 from core.device_agent import start_device_agent, stop_device_agent
 from core.controller_hub import start_controller_hub, stop_controller_hub
+from core.discord_controller import start_discord_controller, stop_discord_controller
 
 def ensure_root():
     """Memastikan script berjalan di bawah environment Root."""
@@ -59,6 +60,7 @@ def main():
     # Phase D2-L: optional embedded controller hub. Disabled by default.
     start_controller_hub(config_data)
     start_device_agent(config_data)
+    start_discord_controller(config_data)
 
     # Langsung panggil Menu Interaktif
     show_main_menu()
@@ -68,6 +70,7 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("") # Jarak enter
+        stop_discord_controller()
         stop_device_agent()
         stop_controller_hub()
         log.info("SHUTDOWN: Script dihentikan oleh user (CTRL+C).")

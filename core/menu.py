@@ -30,6 +30,7 @@ from core.ui import (
 )
 from core.tester import show_test_menu
 from core.cache_cleaner import clean_package_cache
+from core.discord_controller import mask_secret, test_discord_token, test_controller_connection, start_discord_controller, stop_discord_controller
 #from core.accounts import load_accounts, save_accounts
 
 try:
@@ -412,23 +413,126 @@ def run_auto_rejoiner():
         
     start_monitoring(packages, intent_dict, timeout_seconds, max_retries, cooldown_secs, stats, config_data)
 
+def show_discord_controller_menu():
+    """Integrated D3R1 Discord Controller settings.
+
+    D3R1 owns configuration and connection tests. The actual /status bot runtime
+    is optional and starts only from main.py when explicitly enabled.
+    """
+    clear_screen()
+    config_data = load_config("config.conf")
+
+    while True:
+        reset_terminal()
+        draw_header("DISCORD CONTROLLER")
+
+        enabled = str(config_data.get("DISCORD_BOT_ENABLED", 0)).lower() in {"1", "true", "yes", "on"}
+        token = str(config_data.get("DISCORD_BOT_TOKEN", ""))
+        guild_id = str(config_data.get("DISCORD_GUILD_ID", ""))
+        controller_enabled = str(config_data.get("CONTROLLER_ENABLED", 0)).lower() in {"1", "true", "yes", "on"}
+        controller_url = str(config_data.get("DISCORD_CONTROLLER_URL", "http://127.0.0.1:8765"))
+
+        table = Table(box=None, padding=(0, 0), show_header=False)
+        table.add_column("No", style="bold cyan", width=5, no_wrap=True)
+        table.add_column("Icon", style="white", width=3, no_wrap=True)
+        table.add_column("Setting", style="white", width=28, no_wrap=True)
+        table.add_column("Value", style="dim white", justify="right", width=22, no_wrap=True)
+        table.add_row("[0]", "●", "Discord Bot", "[green]ENABLED[/]" if enabled else "[dim]DISABLED[/]")
+        table.add_row("[1]", "🔑", "Bot Token", f"[cyan]{mask_secret(token)}[/]")
+        table.add_row("[2]", "🏠", "Discord Server / Guild ID", f"[cyan]{guild_id or '<Not Set>'}[/]")
+        table.add_row("[3]", "🌐", "Controller", f"[green]LOCAL[/] {controller_url}")
+        table.add_row("[4]", "🔌", "Controller Hub", "[green]ENABLED[/]" if controller_enabled else "[yellow]DISABLED[/]")
+        table.add_row("[5]", "🧪", "Test Discord Token", ">")
+        table.add_row("[6]", "🧪", "Test Controller", ">")
+        table.add_row("[7]", "💾", "Save / Apply", ">")
+        table.add_row("[8]", "⏻", "Enable / Disable Bot", ">")
+        table.add_row("[9]", "↩", "Kembali", ">")
+        console.print(table)
+        draw_footer("D3R1  Local Controller  |  Token selalu dimasking")
+
+        choice = safe_prompt_ask("\n[dim]Pilih (1-9)[/]", choices=[str(i) for i in range(1, 10)])
+        if choice == "RESIZE_EVENT":
+            continue
+
+        if choice == '1':
+            new_token = safe_console_input("\n[dim]Masukkan Discord Bot Token (kosongkan untuk hapus):[/] ")
+            if new_token != "RESIZE_EVENT":
+                config_data["DISCORD_BOT_TOKEN"] = new_token.strip()
+                save_config(config_data, "config.conf")
+        elif choice == '2':
+            new_guild = safe_console_input("\n[dim]Masukkan Discord Server/Guild ID (kosongkan untuk hapus):[/] ")
+            if new_guild != "RESIZE_EVENT":
+                new_guild = new_guild.strip()
+                if new_guild and not new_guild.isdigit():
+                    console.print("[bold red][!] Guild ID harus berupa angka.[/]")
+                    time.sleep(1)
+                else:
+                    config_data["DISCORD_GUILD_ID"] = new_guild
+                    save_config(config_data, "config.conf")
+        elif choice == '3':
+            console.print("\n[dim]D3R1 menggunakan Controller lokal. URL default adalah http://127.0.0.1:8765.[/]")
+            new_url = safe_console_input(f"[dim]Controller URL [{controller_url}]:[/] ")
+            if new_url != "RESIZE_EVENT":
+                new_url = new_url.strip()
+                if new_url:
+                    config_data["DISCORD_CONTROLLER_URL"] = new_url
+                    save_config(config_data, "config.conf")
+        elif choice == '4':
+            config_data["CONTROLLER_ENABLED"] = 0 if controller_enabled else 1
+            save_config(config_data, "config.conf")
+            config_data = load_config("config.conf")
+        elif choice == '5':
+            ok, message = test_discord_token(config_data.get("DISCORD_BOT_TOKEN", ""), config_data.get("DISCORD_STATUS_TIMEOUT", 8))
+            console.print(f"\n{'[bold green]✔' if ok else '[bold red]✘'} {message}[/]")
+            safe_console_input("\n[dim]Tekan Enter...[/]")
+        elif choice == '6':
+            ok, message = test_controller_connection(config_data)
+            console.print(f"\n{'[bold green]✔' if ok else '[bold red]✘'} {message}[/]")
+            safe_console_input("\n[dim]Tekan Enter...[/]")
+        elif choice == '7':
+            # Keep the Discord status credential synchronized with the local Controller credential.
+            controller_token = str(config_data.get("CONTROLLER_STATUS_TOKEN", "")).strip()
+            if controller_token:
+                config_data["DISCORD_CONTROLLER_STATUS_TOKEN"] = controller_token
+            save_config(config_data, "config.conf")
+            console.print("\n[bold green]✔ Konfigurasi Discord Controller tersimpan.[/]")
+            time.sleep(0.8)
+        elif choice == '8':
+            if not str(config_data.get("DISCORD_BOT_TOKEN", "")).strip():
+                console.print("\n[bold red][!] Bot Token belum diisi.[/]")
+                time.sleep(1)
+                continue
+            config_data["DISCORD_BOT_ENABLED"] = 0 if enabled else 1
+            save_config(config_data, "config.conf")
+            config_data = load_config("config.conf")
+            if config_data["DISCORD_BOT_ENABLED"]:
+                if not config_data.get("CONTROLLER_ENABLED"):
+                    console.print("\n[bold yellow][!] Controller Hub masih DISABLED. Aktifkan Controller Hub terlebih dahulu.[/]")
+                    config_data["DISCORD_BOT_ENABLED"] = 0
+                    save_config(config_data, "config.conf")
+                else:
+                    started = start_discord_controller(config_data)
+                    if not started:
+                        console.print("\n[bold yellow][!] Bot belum berjalan. Pastikan discord.py terpasang dan credential lengkap.[/]")
+            else:
+                stop_discord_controller()
+        elif choice == '9':
+            break
+
+
 def show_settings():
     clear_screen()
     config_data = load_config("config.conf")
-    
     while True:
         reset_terminal()
         draw_header("SETTINGS")
-        
         link = config_data.get('PRIVATE_SERVER_LINK', '')
         display_link = link[:25] + "..." if len(link) > 25 else link
-        
         table = Table(box=None, padding=(0, 0), show_header=False)
         table.add_column("No", style="bold cyan", width=5, no_wrap=True)
         table.add_column("Icon", style="white", width=3, no_wrap=True)
         table.add_column("Config", style="white", width=25, no_wrap=True)
         table.add_column("Value", style="dim white", justify="right", width=23, no_wrap=True)
-        
         global_place_id = config_data.get('GLOBAL_PLACE_ID', '')
         target_mode = "PRIVATE SERVER" if link else ("MAP / PLACE ID" if global_place_id else "NOT SET")
         table.add_row("[0]", "🎯", "Global Target", f"[cyan]{target_mode}[/]")
@@ -442,19 +546,15 @@ def show_settings():
         table.add_row("[8]", "📦", "Atur Link per Package", ">")
         table.add_row("[9]", "🗺", "Atur Map ID per Package", ">")
         table.add_row("[10]", "↩", "Kembali", ">")
-        
         console.print(table)
         draw_footer("ESC / 10  Back to Menu  |  Global Link dan Map ID saling eksklusif")
-        
-        choice = safe_prompt_ask("\n[dim]Pilih (1-10)[/]", choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"])
+        choice = safe_prompt_ask("\n[dim]Pilih (1-10)[/]", choices=[str(i) for i in range(1, 11)])
         if choice == "RESIZE_EVENT": continue
-        
         if choice == '1':
             new_link = safe_console_input("\n[dim]Masukkan Global Private Server Link (kosongkan untuk hapus):[/] ")
             if new_link != "RESIZE_EVENT":
                 new_link = new_link.strip()
                 if new_link:
-                    # Global target bersifat mutually exclusive.
                     config_data['PRIVATE_SERVER_LINK'] = new_link
                     config_data['GLOBAL_PLACE_ID'] = ''
                 else:
@@ -465,7 +565,6 @@ def show_settings():
             if new_place_id != "RESIZE_EVENT":
                 new_place_id = new_place_id.strip()
                 if new_place_id and new_place_id.isdigit() and int(new_place_id) > 0:
-                    # Global target bersifat mutually exclusive.
                     config_data['GLOBAL_PLACE_ID'] = new_place_id
                     config_data['PRIVATE_SERVER_LINK'] = ''
                     save_config(config_data, "config.conf")
@@ -477,27 +576,27 @@ def show_settings():
                     time.sleep(1)
         elif choice == '3':
             new_timeout = safe_console_input("\n[dim]Masukkan Timeout (detik):[/] ")
-            if new_timeout != "RESIZE_EVENT" and new_timeout.isdigit(): 
+            if new_timeout != "RESIZE_EVENT" and new_timeout.isdigit():
                 config_data['TIMEOUT_SECONDS'] = int(new_timeout)
                 save_config(config_data, "config.conf")
         elif choice == '4':
             new_delay = safe_console_input("\n[dim]Masukkan Delay (detik):[/] ")
-            if new_delay != "RESIZE_EVENT" and new_delay.isdigit(): 
+            if new_delay != "RESIZE_EVENT" and new_delay.isdigit():
                 config_data['DELAY_SECONDS'] = int(new_delay)
                 save_config(config_data, "config.conf")
         elif choice == '5':
             new_retries = safe_console_input("\n[dim]Masukkan Max Retries:[/] ")
-            if new_retries != "RESIZE_EVENT" and new_retries.isdigit(): 
+            if new_retries != "RESIZE_EVENT" and new_retries.isdigit():
                 config_data['MAX_RETRIES'] = int(new_retries)
                 save_config(config_data, "config.conf")
         elif choice == '6':
             new_cooldown = safe_console_input("\n[dim]Masukkan Cooldown (detik):[/] ")
-            if new_cooldown != "RESIZE_EVENT" and new_cooldown.isdigit(): 
+            if new_cooldown != "RESIZE_EVENT" and new_cooldown.isdigit():
                 config_data['COOLDOWN_SECONDS'] = int(new_cooldown)
                 save_config(config_data, "config.conf")
         elif choice == '7':
             new_cache = safe_console_input("\n[dim]Masukkan Interval Clear Cache (menit, 0 untuk nonaktif):[/] ")
-            if new_cache != "RESIZE_EVENT" and new_cache.isdigit(): 
+            if new_cache != "RESIZE_EVENT" and new_cache.isdigit():
                 config_data['CLEAR_CACHE_MINUTES'] = int(new_cache)
                 save_config(config_data, "config.conf")
         elif choice == '8':
@@ -567,84 +666,71 @@ def show_main_menu():
     while True:
         reset_terminal()
         draw_header("MENU UTAMA")
-        
         table = Table(box=None, padding=(0, 0), show_header=False)
         table.add_column("No", style="bold cyan", width=5, no_wrap=True)
         table.add_column("Icon", style="white", width=3, no_wrap=True)
         table.add_column("Menu", style="white", width=45, no_wrap=True)
         table.add_column("Chevron", style="dim white", justify="right", width=3, no_wrap=True)
-        
         table.add_row("[1]", "▶", "Auto Rejoiner", ">")
         table.add_row("[2]", "⚙", "Settings", ">")
-        table.add_row("[3]", "🔑", "Auto Login Roblox", ">")
-        table.add_row("[4]", "🧪", "Test (Unit Testing)", ">")
-        table.add_row("[5]", "📝", "Logs (Lihat Log)", ">")
-        table.add_row("[6]", "ⓘ", "About", ">")
-        table.add_row("[7]", "🔄", "Update Program", ">")
-        table.add_row("[bold red][8][/]", "[red]⏻[/]", "[red]Exit[/]", "[red]>[/]")
-        
+        table.add_row("[3]", "🤖", "Discord Controller", ">")
+        table.add_row("[4]", "🔑", "Auto Login Roblox", ">")
+        table.add_row("[5]", "🧪", "Test (Unit Testing)", ">")
+        table.add_row("[6]", "📝", "Logs (Lihat Log)", ">")
+        table.add_row("[7]", "ⓘ", "About", ">")
+        table.add_row("[8]", "🔄", "Update Program", ">")
+        table.add_row("[9]", "⏻", "Exit", ">")
         console.print(table)
         draw_footer("CTRL+C  Dashboard    CTRL+Z  Exit")
-        
-        choice = safe_prompt_ask("\n[dim]Pilih menu (1-8)[/]", choices=["1", "2", "3", "4", "5", "6", "7", "8"])
-        
-        # BUG FIX: Deteksi event resize, ulangi loop untuk render ulang layar
-        if choice == "RESIZE_EVENT": 
+        choice = safe_prompt_ask("\n[dim]Pilih menu (1-9)[/]", choices=[str(i) for i in range(1, 10)])
+        if choice == "RESIZE_EVENT":
             continue
-
-        # A menu selection is a UI boundary: remove the previous menu before
-        # entering the selected screen. The destination menu may clear again
-        # on entry; that is intentional and keeps every screen self-contained.
         clear_screen()
-        
         if choice == '1':
             show_transition("Starting Engine...")
             run_auto_rejoiner()
         elif choice == '2':
-            show_transition("Loading Menu...")
+            show_transition("Loading Settings...")
             show_settings()
         elif choice == '3':
+            show_transition("Loading Discord Controller...")
+            show_discord_controller_menu()
+        elif choice == '4':
             show_transition("Loading Auto Login...")
             show_auto_login_menu()
-        elif choice == '4':
-            show_test_menu()
-            show_transition("Loading Menu...")
         elif choice == '5':
+            show_transition("Loading Unit Testing...")
+            show_test_menu()
+        elif choice == '6':
             show_transition("Fetching Logs...")
             reset_terminal()
             draw_header("LOGS VIEWER")
-            
             log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "latest.log")
             if os.path.exists(log_path):
-                console.print("[dim]Menampilkan 20 baris terakhir...[/]")
-                console.print("")
+                console.print("[dim]Menampilkan 20 baris terakhir...[/]\n")
                 os.system(f"tail -n 20 {log_path}")
             else:
                 console.print("[dim]File log belum tersedia.[/]")
-            
             draw_footer("Enter  Back to Menu")
             safe_console_input("\n[dim]Tekan Enter...[/]")
-        elif choice == '6':
+        elif choice == '7':
             show_transition("Opening About...")
             reset_terminal()
             draw_header("ABOUT")
-            
             table = Table(box=None, padding=(0, 0), show_header=False)
             table.add_column("Key", style="dim white", width=20)
             table.add_column("Value", style="bold white", width=35)
-            
             table.add_row("Aplikasi", "CARRERA-HUB Auto Rejoiner")
             table.add_row("Versi", "[cyan]Python Modular Edition[/]")
             table.add_row("Status", "[green]Stabil & Termux Root Ready[/]")
             table.add_row("Developer", "[magenta]Carrera-Hub Team[/]")
-            
             console.print(table)
             draw_footer("Enter  Back to Menu")
             safe_console_input("\n[dim]Tekan Enter...[/]")
-        elif choice == '7':
+        elif choice == '8':
             show_transition("Checking Server...")
             run_updater()
-        elif choice == '8':
+        elif choice == '9':
             show_transition("Shutting Down...")
             try:
                 sniper_agent.stop()
@@ -652,3 +738,4 @@ def show_main_menu():
                 pass
             reset_terminal()
             sys.exit(0)
+

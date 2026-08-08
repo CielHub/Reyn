@@ -14,7 +14,13 @@ except ImportError:
     pass
 
 from core.logger import log, set_console_logging
-from core.ui import console, reset_terminal
+from core.ui import (
+    console,
+    reset_terminal,
+    start_dashboard_resize_watcher,
+    stop_dashboard_resize_watcher,
+    consume_dashboard_resize_event,
+)
 from core.error_detector import start_error_detector
 from core.recovery_manager import start_recovery_manager, trigger_recovery, is_global_recovery
 from core.memory_guard import start_memory_guard
@@ -25,6 +31,53 @@ from rich.console import Group
 from rich.text import Text
 
 _CACHED_HEADER_ART = None
+
+
+def get_dashboard_terminal_size():
+    """Return the current terminal size used by the dashboard renderer."""
+    size = shutil.get_terminal_size(fallback=(80, 24))
+    return size.columns, size.lines
+
+
+def create_dashboard_live(renderable, *, screen=False):
+    """Create a deterministic Rich Live renderer for the dashboard.
+
+    Auto-refresh is intentionally disabled so only the dashboard loop controls
+    terminal writes. This prevents a background Rich refresh from racing a
+    terminal resize on Android/Termux.
+    """
+    return Live(
+        renderable,
+        console=console,
+        refresh_per_second=1,
+        auto_refresh=False,
+        transient=False,
+        screen=screen,
+    )
+
+
+def refresh_dashboard_live(live, renderable, previous_size=None):
+    """Refresh the dashboard and fully redraw only when terminal size changes.
+
+    A resize (for example Android keyboard open/close) invalidates Rich's
+    previous cursor/height calculation. We clear the visible terminal and
+    reset Rich's cached frame shape before drawing the new frame. This is a
+    visual redraw only; it is deliberately NOT a terminal `reset`.
+    """
+    current_size = get_dashboard_terminal_size()
+    resized = previous_size is not None and current_size != previous_size
+
+    if resized or consume_dashboard_resize_event():
+        # Invalidate Rich's previous frame geometry BEFORE clearing so it won't
+        # emit cursor-up sequences based on the old terminal height.
+        try:
+            live._live_render._shape = None
+        except AttributeError:
+            pass
+        console.clear(home=True)
+
+    live.update(renderable, refresh=True)
+    return current_size, resized
 
 def format_uptime(start_time, current_time):
     if start_time == 0: return "00:00:00"
@@ -66,12 +119,16 @@ def draw_dashboard(stats, current_time, pkg_count, include_header=True):
     renderables.append(Text.from_markup(summary_text))
     renderables.append(rule)
 
+    # Keep the table inside the 60-column dashboard rule. With one cell of
+    # horizontal padding on both sides, these widths total exactly 60 columns.
+    # The old PACKAGE=16/PID=5 layout totaled 67 columns and pushed the right
+    # side of the table beyond the rule on normal 60-column terminals.
     table = Table(box=None, padding=(0, 1), show_header=True, header_style="dim white", expand=False)
     table.add_column("ID", style="bold cyan", width=3, no_wrap=True)
-    table.add_column("PACKAGE", style="white", width=16, no_wrap=True, overflow="ellipsis") 
-    table.add_column("PID", style="cyan", width=5, no_wrap=True)
-    table.add_column("STATUS", width=12, no_wrap=True) 
-    table.add_column("UPTIME", style="white", width=9, no_wrap=True) 
+    table.add_column("PACKAGE", style="white", width=11, no_wrap=True, overflow="ellipsis")
+    table.add_column("PID", style="cyan", width=6, no_wrap=True)
+    table.add_column("STATUS", width=10, no_wrap=True)
+    table.add_column("UPTIME", style="white", width=8, no_wrap=True)
     table.add_column("L", style="dim white", width=2, justify="right", no_wrap=True)
     table.add_column("R", style="dim white", width=2, justify="right", no_wrap=True)
     table.add_column("C", style="dim white", width=2, justify="right", no_wrap=True)
@@ -133,8 +190,14 @@ def start_monitoring(packages, intent_url, timeout_seconds, max_retries, cooldow
 
     set_console_logging(False)
 
+    dashboard_size = get_dashboard_terminal_size()
+    resize_handler = start_dashboard_resize_watcher()
+
     try:
-        with Live(draw_dashboard(stats, current_time, pkg_count, include_header=True), console=console, refresh_per_second=1, transient=False, screen=False) as live:
+        with create_dashboard_live(
+            draw_dashboard(stats, current_time, pkg_count, include_header=True),
+            screen=False,
+        ) as live:
             try:
                 while True:
                     current_time = time.time()
@@ -189,12 +252,18 @@ def start_monitoring(packages, intent_url, timeout_seconds, max_retries, cooldow
                         
                         last_check_time = current_time
 
-                    # Dashboard refresh only. No terminal reset after startup.
-                    live.update(draw_dashboard(stats, current_time, pkg_count, include_header=True))
+                    # Dashboard refresh only. A terminal resize gets a clean
+                    # visual redraw, never a full terminal `reset`.
+                    dashboard_size, _ = refresh_dashboard_live(
+                        live,
+                        draw_dashboard(stats, current_time, pkg_count, include_header=True),
+                        dashboard_size,
+                    )
                     time.sleep(1)
                     
             except KeyboardInterrupt:
                 pass
     finally:
+        stop_dashboard_resize_watcher(resize_handler)
         set_console_logging(True)
           

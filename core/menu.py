@@ -16,7 +16,18 @@ from core.state_machine import set_state
 from core.states import PackageState
 from core.scanner import get_roblox_packages
 from core.launcher import launch_and_wait
-from core.monitor import start_monitoring, draw_dashboard
+from core.monitor import (
+    start_monitoring,
+    draw_dashboard,
+    create_dashboard_live,
+    refresh_dashboard_live,
+    get_dashboard_terminal_size,
+)
+from core.ui import (
+    console, reset_terminal, full_terminal_reset, draw_header, show_transition,
+    draw_footer, safe_prompt_ask, safe_console_input,
+    start_dashboard_resize_watcher, stop_dashboard_resize_watcher,
+)
 from core.tester import show_test_menu
 from core.cache_cleaner import clean_package_cache
 #from core.accounts import load_accounts, save_accounts
@@ -27,10 +38,8 @@ except ImportError:
     pass
 
 # BUG FIX: Import safe_prompt_ask dan safe_console_input
-from core.ui import console, reset_terminal, full_terminal_reset, draw_header, show_transition, draw_footer, safe_prompt_ask, safe_console_input
 from rich.prompt import Prompt
 from rich.table import Table
-from rich.live import Live
 
 def show_auto_login_menu():
     while True:
@@ -319,52 +328,80 @@ def run_auto_rejoiner():
     # After this point the dashboard lifecycle never performs another terminal reset.
     full_terminal_reset()
     
-    with Live(draw_dashboard(stats, time.time(), len(packages), include_header=True), console=console, refresh_per_second=1, screen=True) as live:
-        for pkg in packages:
-            clean_package_cache(pkg)
-            
-            set_state(stats, pkg, PackageState.LAUNCHING)
-            stats[pkg]['launch_count'] += 1
-            live.update(draw_dashboard(stats, time.time(), len(packages), include_header=True))
-            
-            intent_url = intent_dict.get(pkg)
-            if not intent_url:
-                set_state(stats, pkg, PackageState.NO_TARGET)
-                live.update(draw_dashboard(stats, time.time(), len(packages), include_header=True))
-                log.error(f"LAUNCH SKIPPED: {pkg} tidak memiliki target join yang valid.")
-                continue
+    dashboard_size = get_dashboard_terminal_size()
+    resize_handler = start_dashboard_resize_watcher()
+    try:
+        with create_dashboard_live(
+            draw_dashboard(stats, time.time(), len(packages), include_header=True),
+            screen=True,
+        ) as live:
+            for pkg in packages:
+                clean_package_cache(pkg)
 
-            success = launch_and_wait(pkg, intent_url, timeout_seconds)
-            
-            if not success:
-                try:
-                    from core.autologin import run as run_autologin
-                    stats[pkg]['status'] = 'LOGIN'
-                    live.update(draw_dashboard(stats, time.time(), len(packages), include_header=True))
-                    
-                    login_status = run_autologin(pkg)
-                    
-                    if login_status in ["SUCCESS", "ALREADY_LOGGED_IN"]:
-                        stats[pkg]['status'] = 'LOADING'
-                        live.update(draw_dashboard(stats, time.time(), len(packages), include_header=True))
-                        success = launch_and_wait(pkg, intent_url, timeout_seconds)
-                    elif login_status == "CAPTCHA":
-                        stats[pkg]['status'] = 'CAPTCHA'
-                    else:
-                        stats[pkg]['status'] = 'LOGIN FAILED'
-                except ImportError:
-                    pass
-            
-            if success:
-                set_state(stats, pkg, PackageState.ONLINE)
-                stats[pkg]['uptime_start'] = time.time()
-            else:
-                if stats[pkg]['status'] not in ['LOGIN FAILED', 'CAPTCHA']:
-                    set_state(stats, pkg, PackageState.FAILED)
-                
-            time.sleep(delay_seconds)
-            live.update(draw_dashboard(stats, time.time(), len(packages), include_header=True))
-        
+                set_state(stats, pkg, PackageState.LAUNCHING)
+                stats[pkg]['launch_count'] += 1
+                dashboard_size, _ = refresh_dashboard_live(
+                    live,
+                    draw_dashboard(stats, time.time(), len(packages), include_header=True),
+                    dashboard_size,
+                )
+
+                intent_url = intent_dict.get(pkg)
+                if not intent_url:
+                    set_state(stats, pkg, PackageState.NO_TARGET)
+                    dashboard_size, _ = refresh_dashboard_live(
+                        live,
+                        draw_dashboard(stats, time.time(), len(packages), include_header=True),
+                        dashboard_size,
+                    )
+                    log.error(f"LAUNCH SKIPPED: {pkg} tidak memiliki target join yang valid.")
+                    continue
+
+                success = launch_and_wait(pkg, intent_url, timeout_seconds)
+
+                if not success:
+                    try:
+                        from core.autologin import run as run_autologin
+                        stats[pkg]['status'] = 'LOGIN'
+                        dashboard_size, _ = refresh_dashboard_live(
+                            live,
+                            draw_dashboard(stats, time.time(), len(packages), include_header=True),
+                            dashboard_size,
+                        )
+
+                        login_status = run_autologin(pkg)
+
+                        if login_status in ["SUCCESS", "ALREADY_LOGGED_IN"]:
+                            stats[pkg]['status'] = 'LOADING'
+                            dashboard_size, _ = refresh_dashboard_live(
+                                live,
+                                draw_dashboard(stats, time.time(), len(packages), include_header=True),
+                                dashboard_size,
+                            )
+                            success = launch_and_wait(pkg, intent_url, timeout_seconds)
+                        elif login_status == "CAPTCHA":
+                            stats[pkg]['status'] = 'CAPTCHA'
+                        else:
+                            stats[pkg]['status'] = 'LOGIN FAILED'
+                    except ImportError:
+                        pass
+
+                if success:
+                    set_state(stats, pkg, PackageState.ONLINE)
+                    stats[pkg]['uptime_start'] = time.time()
+                else:
+                    if stats[pkg]['status'] not in ['LOGIN FAILED', 'CAPTCHA']:
+                        set_state(stats, pkg, PackageState.FAILED)
+
+                time.sleep(delay_seconds)
+                dashboard_size, _ = refresh_dashboard_live(
+                    live,
+                    draw_dashboard(stats, time.time(), len(packages), include_header=True),
+                    dashboard_size,
+                )
+    finally:
+        stop_dashboard_resize_watcher(resize_handler)
+
     try:
         sniper_agent.start()
     except NameError:

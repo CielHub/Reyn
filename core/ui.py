@@ -36,6 +36,40 @@ def _restore_sigwinch_handler(old_handler):
     if hasattr(signal, 'SIGWINCH') and old_handler is not None:
         signal.signal(signal.SIGWINCH, old_handler)
 
+
+# Dashboard resize watcher. Unlike safe_prompt_ask(), this handler does not
+# raise an exception. It only records that Android/Termux changed the terminal
+# geometry so the next dashboard frame can perform a clean redraw.
+_dashboard_resize_pending = False
+
+def _dashboard_sigwinch_handler(signum, frame):
+    global _dashboard_resize_pending
+    _dashboard_resize_pending = True
+
+def start_dashboard_resize_watcher():
+    """Install a non-throwing SIGWINCH watcher for the dashboard lifecycle."""
+    global _dashboard_resize_pending
+    _dashboard_resize_pending = False
+    if hasattr(signal, 'SIGWINCH'):
+        old_handler = signal.getsignal(signal.SIGWINCH)
+        signal.signal(signal.SIGWINCH, _dashboard_sigwinch_handler)
+        return old_handler
+    return None
+
+def stop_dashboard_resize_watcher(old_handler):
+    """Restore the SIGWINCH handler used before dashboard rendering."""
+    global _dashboard_resize_pending
+    _dashboard_resize_pending = False
+    if hasattr(signal, 'SIGWINCH') and old_handler is not None:
+        signal.signal(signal.SIGWINCH, old_handler)
+
+def consume_dashboard_resize_event():
+    """Return True once for each pending terminal resize event."""
+    global _dashboard_resize_pending
+    pending = _dashboard_resize_pending
+    _dashboard_resize_pending = False
+    return pending
+
 def safe_prompt_ask(text, choices=None, password=False):
     """Menangkap event resize (keyboard muncul) HANYA saat menunggu input."""
     old = _set_sigwinch_handler()

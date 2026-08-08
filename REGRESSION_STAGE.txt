@@ -1,4 +1,29 @@
-STAGE 2 - JOIN STATE MACHINE ONLY
-Base: Stage 1 Target Resolver
-Added: core.state_machine, PackageState enum, minimal menu state transitions.
-Not added: Smart Verification, Tiered Recovery, Anti Recovery Loop, Health Check, dashboard changes, renderer changes.
+CARRERA-HUB REGRESSION LAB
+STAGE 3A - SMART JOIN VERIFICATION ONLY
+
+BASE:
+  Stage 2 - State Machine
+
+ADDED:
+  core/join_verifier.py
+  launcher post-launch verification
+
+NOT CHANGED:
+  core/monitor.py
+  dashboard renderer / Rich Live
+  terminal reset behavior
+  logger console behavior
+  recovery manager
+  state machine
+  target resolver
+  watchdog
+  RAM guard
+  cache cleaner
+
+TEST GOAL:
+  Determine whether Smart Join Verification alone causes the dashboard
+  corruption observed during Roblox force-close/recovery.
+
+IMPORTANT:
+  Do not add recovery terminal reset in Stage 3A.
+  That will be isolated separately as Stage 3B only if Stage 3A passes.

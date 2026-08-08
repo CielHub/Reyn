@@ -58,3 +58,29 @@ STAGE 4R4-AUTO-CLEAR-UI
 - Clear terminal at menu-selection boundaries and menu entry.
 - show_transition clears before/after transitions.
 - No changes to recovery, monitoring, launcher, resolver, or state-machine logic.
+
+
+STAGE D1 - DEVICE REGISTRATION & HEARTBEAT
+===========================================
+Purpose:
+- Give each CARRERA-HUB device a stable random device ID.
+- Provide an optional control-plane registration + heartbeat client.
+- Keep the agent completely separate from Roblox recovery/monitoring.
+
+Design:
+- Identity is persisted in device.json and uses a random UUID; no hardware
+  identifiers such as IMEI, MAC, or Android serial are collected.
+- Network agent is disabled by default (DEVICE_AGENT_ENABLED=0).
+- When enabled, registration uses /api/v1/devices/register and heartbeat uses
+  /api/v1/devices/heartbeat.
+- Gateway failures never crash the main CARRERA-HUB process.
+- Heartbeat includes device identity and lightweight package/PID presence.
+- Device agent runs as a daemon thread and does not control recovery.
+
+Safety boundary:
+- D1 does NOT add Discord commands.
+- D1 does NOT add remote restart/kill.
+- D1 does NOT modify recovery manager, launcher, target resolver, state machine,
+  dashboard renderer, or auto-clear behavior.
+
+Status: Experimental until gateway integration is tested.

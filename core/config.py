@@ -43,6 +43,14 @@ def load_config(config_path="config.conf"):
         "GRID_MARGIN": 10,
         "GRID_OFFSET_Y": 60,
         "CLEAR_CACHE_MINUTES": 30,
+        # Phase D1: optional remote-control plane device identity/heartbeat.
+        # Disabled by default so the existing CARRERA-HUB runtime is unchanged.
+        "DEVICE_AGENT_ENABLED": 0,
+        "DEVICE_NAME": "",
+        "DEVICE_GATEWAY_URL": "",
+        "DEVICE_ENROLLMENT_TOKEN": "",
+        "DEVICE_HEARTBEAT_INTERVAL": 30,
+        "DEVICE_GATEWAY_TIMEOUT": 8,
     }
 
     with open(config_path, 'r') as f:
@@ -64,11 +72,14 @@ def load_config(config_path="config.conf"):
                     config[key] = val
                 elif key in ["TIMEOUT_SECONDS", "RECOVERY_DELAY_SECONDS", "DELAY_SECONDS", "MAX_RETRIES", "COOLDOWN_SECONDS", 
                              "GRID_ENABLED", "GRID_COLS", "GRID_CELL_W", "GRID_CELL_H", 
-                             "GRID_MARGIN", "GRID_OFFSET_Y", "CLEAR_CACHE_MINUTES"]:
+                             "GRID_MARGIN", "GRID_OFFSET_Y", "CLEAR_CACHE_MINUTES",
+                             "DEVICE_AGENT_ENABLED", "DEVICE_HEARTBEAT_INTERVAL", "DEVICE_GATEWAY_TIMEOUT"]:
                     try: 
                         config[key] = int(val)
                     except ValueError: 
                         pass
+                elif key in ["DEVICE_NAME", "DEVICE_GATEWAY_URL", "DEVICE_ENROLLMENT_TOKEN"]:
+                    config[key] = val
                 elif key.startswith("PKG_"):
                     # Sekarang "PKG_com.roblox.client " akan otomatis jadi "PKG_com.roblox.client"
                     config[key] = val

@@ -1,0 +1,12 @@
+# Discord bot token. Keep this file private when populated.
+DISCORD_BOT_TOKEN=
+
+# Base URL of the CARRERA gateway.
+CARRERA_GATEWAY_URL=http://127.0.0.1:8765
+
+# Read-only status token configured on the gateway.
+CARRERA_GATEWAY_STATUS_TOKEN=
+
+# Optional: set a test server ID for near-instant slash command registration.
+# Leave blank to sync globally.
+DISCORD_GUILD_ID=

@@ -24,3 +24,21 @@ Endpoints:
 - `POST /api/v1/devices/heartbeat`
 
 This gateway is intentionally minimal. Discord command routing, permissions, queues, and remote actions belong to later phases.
+
+## Phase D2 status endpoint
+
+Start the gateway with both an enrollment token and a separate read-only
+status token:
+
+```bash
+python gateway/d1_gateway.py --host 0.0.0.0 --port 8765 \
+  --enrollment-token '<enrollment-secret>' \
+  --status-token '<status-secret>'
+```
+
+Read-only endpoint:
+
+```text
+GET /api/v1/devices/status
+Authorization: Bearer <status-secret>
+```

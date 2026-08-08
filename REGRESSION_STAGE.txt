@@ -84,3 +84,26 @@ Safety boundary:
   dashboard renderer, or auto-clear behavior.
 
 Status: Experimental until gateway integration is tested.
+
+STAGE D2 - GLOBAL DISCORD STATUS
+=================================
+Purpose:
+- Add a read-only global status endpoint to the gateway.
+- Add a Discord `/status` command that renders aggregate device/account state.
+- Keep Discord bot and its dependency outside the Android/Termux runtime.
+
+Design:
+- Gateway endpoint: GET /api/v1/devices/status.
+- Separate read-only status token.
+- Offline is derived from heartbeat freshness; default threshold 90 seconds,
+  minimum 30 seconds.
+- Status response excludes device secrets/tokens.
+- D2 exposes no destructive commands.
+
+Safety boundary:
+- No restart/kill/stop command.
+- No recovery logic changes.
+- No monitor/launcher/resolver/state-machine changes.
+- No dashboard or auto-clear changes.
+
+Status: Experimental until D2 testing passes.

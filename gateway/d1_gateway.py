@@ -9,6 +9,7 @@ import json
 import os
 import secrets
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -52,6 +53,53 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path != "/api/v1/devices/status":
+            self._json(404, {"ok": False, "error": "not_found"})
+            return
+        if not auth(self.headers.get("Authorization", ""), self.server.status_token):
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+
+        offline_after = max(30, int(self.server.offline_after))
+        now_epoch = time.time()
+        with LOCK:
+            devices = []
+            for raw in DEVICES.values():
+                device = {
+                    "device_id": raw.get("device_id"),
+                    "device_name": raw.get("device_name"),
+                    "last_seen": raw.get("last_seen"),
+                    "status": raw.get("status", "OFFLINE"),
+                    "accounts_total": int(raw.get("accounts_total", 0) or 0),
+                    "accounts_online": int(raw.get("accounts_online", 0) or 0),
+                    "uptime_seconds": int(raw.get("uptime_seconds", 0) or 0),
+                }
+                try:
+                    seen = datetime.fromisoformat(str(device["last_seen"]).replace("Z", "+00:00")).timestamp()
+                    if now_epoch - seen > offline_after:
+                        device["status"] = "OFFLINE"
+                except (TypeError, ValueError, OverflowError):
+                    device["status"] = "OFFLINE"
+                devices.append(device)
+
+        online = sum(1 for d in devices if d["status"] == "ONLINE")
+        offline = len(devices) - online
+        total_accounts = sum(d["accounts_total"] for d in devices)
+        active_accounts = sum(d["accounts_online"] for d in devices)
+        devices.sort(key=lambda d: (d["status"] != "ONLINE", str(d.get("device_name") or d["device_id"])))
+        self._json(200, {
+            "ok": True,
+            "generated_at": now(),
+            "offline_after_seconds": offline_after,
+            "total_devices": len(devices),
+            "online_devices": online,
+            "offline_devices": offline,
+            "total_accounts": total_accounts,
+            "active_accounts": active_accounts,
+            "devices": devices,
+        })
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -129,10 +177,14 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--enrollment-token", required=True)
+    parser.add_argument("--status-token", required=True, help="Read-only token for D2 global status")
+    parser.add_argument("--offline-after", type=int, default=90, help="Seconds without heartbeat before device is OFFLINE")
     args = parser.parse_args()
     load()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.enrollment_token = args.enrollment_token
+    server.status_token = args.status_token
+    server.offline_after = max(30, args.offline_after)
     print(f"CARRERA D1 gateway listening on http://{args.host}:{args.port}")
     server.serve_forever()
 

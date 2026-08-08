@@ -33,3 +33,9 @@ The gateway contract for this stage is:
 
 Registration may return `device_token`; CARRERA-HUB stores it in the local
 `device.json` identity file and uses it for subsequent heartbeats.
+
+## Phase D2 - Global Discord Status
+
+D2 adds a read-only `/status` Discord command backed by the gateway. It is
+separate from the Android/Termux runtime and does not add remote control yet.
+See `phaseD2.md` and `discord_bot/README.md`.

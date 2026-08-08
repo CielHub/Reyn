@@ -1,4 +1,6 @@
-STAGE 3B - RECOVERY TERMINAL RESET
-Base: Stage 3A
-Added: one-shot terminal reset request consumed by dashboard renderer during recovery.
-Purpose: determine whether recovery-time terminal reset causes dashboard corruption.
+REGRESSION STAGE 3B - STARTUP FULL TERMINAL RESET
+
+Inherited: Stage 3A (Smart Join Verification)
+Added: one full terminal reset immediately before the first monitoring dashboard frame.
+Recovery resets: disabled. No terminal reset is performed after startup.
+Dashboard renderer otherwise unchanged.

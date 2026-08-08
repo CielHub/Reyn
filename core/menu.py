@@ -27,7 +27,7 @@ except ImportError:
     pass
 
 # BUG FIX: Import safe_prompt_ask dan safe_console_input
-from core.ui import console, reset_terminal, draw_header, show_transition, draw_footer, safe_prompt_ask, safe_console_input
+from core.ui import console, reset_terminal, full_terminal_reset, draw_header, show_transition, draw_footer, safe_prompt_ask, safe_console_input
 from rich.prompt import Prompt
 from rich.table import Table
 from rich.live import Live
@@ -315,7 +315,9 @@ def run_auto_rejoiner():
         if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
             log.removeHandler(handler)
             
-    reset_terminal()
+    # Full terminal reset happens exactly once, immediately before the first dashboard frame.
+    # After this point the dashboard lifecycle never performs another terminal reset.
+    full_terminal_reset()
     
     with Live(draw_dashboard(stats, time.time(), len(packages), include_header=True), console=console, refresh_per_second=1, screen=True) as live:
         for pkg in packages:

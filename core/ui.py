@@ -59,6 +59,13 @@ def safe_console_input(text):
 def reset_terminal():
     os.system('clear' if os.name == 'posix' else 'cls')
 
+def full_terminal_reset():
+    """Perform a full terminal reset once before the monitoring dashboard starts."""
+    if os.name == 'posix':
+        os.system('reset')
+    else:
+        os.system('cls')
+
 def get_compact_header(title="CARRERA-HUB v1.0", user="root", pkg_count="-", status="Active"):
     t = time.strftime("%H:%M:%S")
     header_text = Text.from_markup(

@@ -1,47 +1,53 @@
-CARRERA-HUB REGRESSION STAGE 4R5-A
-==================================
-Name: Recovery Trigger Instrumentation
+CARRERA-HUB REGRESSION STAGE 4R4
+================================
+Name: Dashboard Resize & Table Layout Hardening
 
-Baseline: Stage 4R4 - Dashboard Resize & Table Layout Hardening
-Parent experiment: Stage 4R4
+Baseline: Stage 3B - Startup Full Terminal Reset
+Parent experiment: Stage 4R3
 
 Purpose:
-- Diagnose the newly observed clienu recovery loop after simultaneous
-  force-close of multiple packages.
-- Determine whether the second recovery is caused by a false PID mismatch,
-  duplicate recovery worker, stale tracked PID, or a recovery-state timing race.
+- Fix the dashboard visual corruption that can occur when Android/Termux
+  changes terminal geometry while the keyboard is opened and then closed.
+- Tighten the dashboard table so PACKAGE/PID spacing no longer pushes the
+  rightmost columns outside the 60-column dashboard rule.
 
-Behavioral policy:
-- NO recovery algorithm or timing change in this stage.
-- NO state-guard fix in this stage.
-- The existing 30-second minimum single-package recovery delay is preserved.
-- Dashboard rendering is untouched.
+Changes:
+1. Dashboard renderer uses deterministic/manual Rich Live refreshes
+   (`auto_refresh=False`) so terminal writes are controlled by the dashboard
+   loop instead of a background refresh thread.
+2. Added a non-throwing SIGWINCH watcher for the dashboard lifecycle.
+   Resize events are recorded and consumed by the next dashboard refresh.
+3. When a resize is detected, Rich's cached previous frame shape is invalidated,
+   the visible terminal is cleared, and the current dashboard frame is drawn
+   from a clean cursor position.
+4. The resize recovery uses a visual `clear` only. It does NOT call the full
+   terminal `reset` and does not alter the Stage 3B startup-reset rule.
+5. Applied the same resize-safe Live renderer to both the initial auto-rejoiner
+   dashboard and the long-running monitoring dashboard.
+6. Dashboard table widths were tightened to fit exactly inside the 60-column
+   rule while retaining one-cell horizontal padding:
+   ID=3, PACKAGE=11, PID=6, STATUS=10, UPTIME=8, L=2, R=2, C=2.
 
-Instrumentation added:
-1. Watchdog logs every recovery trigger with package, reason, expected PID,
-   observed PID, and current status.
-2. Each single recovery worker logs its thread identity and lifecycle.
-3. Recovery worker logs state/PID before and after the 30-second delay.
-4. Each recovery tier logs entry/exit context, current PID, tracked PID,
-   baseline PID, and visible state.
-5. Recovery success/failure is logged with worker identity so duplicate or
-   overlapping workers can be identified.
-6. Trigger requests are logged before a recovery worker is spawned.
+Intentionally unchanged:
+- Recovery manager / Tier 1-3 recovery logic
+- Package-isolated recovery verification
+- 30-second minimum single-package recovery delay
+- Target resolver / join state machine
+- Launcher / PID tracking
+- Memory guard / global recovery behavior
+- One-time startup full terminal `reset`
 
 Test focus:
-1. Start 2 packages normally.
-2. Force-close clienu + clienv simultaneously.
-3. Wait until both reach Farming.
-4. Observe whether clienu produces another RECOVERY trigger without a genuine
-   process loss.
-5. Repeat with reversed order and with only one package interrupted.
-6. Inspect logs/latest.log for [WATCHDOG] and [RECOVERY-TRACE] entries.
-7. For 5-7 packages, verify no duplicate workers are created during one
-   recovery event.
-
-Expected diagnostic result:
-- We should be able to identify the exact trigger and PID transition that
-  causes any unexpected Farming -> Recovery -> Loading -> Farming loop.
+1. Start dashboard normally and verify one CARRERA logo only.
+2. Open Android keyboard while dashboard is running.
+3. Leave keyboard open long enough for at least one dashboard refresh.
+4. Close keyboard and verify the dashboard redraws cleanly.
+5. Repeat keyboard open/close multiple times.
+6. Repeat with the keyboard opened and closed quickly, testing SIGWINCH handling.
+7. Verify no duplicated/overlapping ASCII logo remains.
+8. Verify the table's rightmost C/R/L columns stay inside the 60-column rule.
+9. Verify 2 packages, then 5-7 packages, without changing recovery behavior.
+10. Verify force-close/recovery behavior remains identical to Stage 4R3.
 
 Status:
 Experimental. NOT baseline until user testing passes.

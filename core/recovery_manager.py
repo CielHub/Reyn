@@ -398,29 +398,12 @@ class RecoveryManager:
 
     def single_recovery_worker(self, pkg):
         """Single-package tiered recovery with package-isolated diagnostics."""
-        worker_id = threading.current_thread().name + f"#{threading.get_ident()}"
         try:
             recovery_delay = max(30, int(self.config_data.get("RECOVERY_DELAY_SECONDS", 30)))
-            baseline_pid = self.recovery_baseline_pids.get(pkg, '')
-            log.warning(
-                f"[RECOVERY-TRACE] WORKER_START pkg={pkg} worker={worker_id} "
-                f"status={self.stats[pkg].get('status')} "
-                f"tracked_pid={self.tracked_pids.get(pkg) or '-'} "
-                f"baseline_pid={baseline_pid or '-'} delay={recovery_delay}s"
-            )
-            log.warning(
-                f"[RECOVERY-TRACE] PRE_DELAY pkg={pkg} worker={worker_id} "
-                f"current_pid={get_pid(pkg) or '-'} status={self.stats[pkg].get('status')}"
-            )
             log.info(f"[SINGLE] Crash detected for {pkg}. Waiting {recovery_delay} seconds...")
             time.sleep(recovery_delay)
 
             baseline_pid = self.recovery_baseline_pids.get(pkg, '')
-            log.warning(
-                f"[RECOVERY-TRACE] POST_DELAY pkg={pkg} worker={worker_id} "
-                f"current_pid={get_pid(pkg) or '-'} status={self.stats[pkg].get('status')} "
-                f"tracked_pid={self.tracked_pids.get(pkg) or '-'} baseline_pid={baseline_pid or '-'}"
-            )
             log.info(f"[RECOVERY] TARGET={pkg} BASELINE_PID={baseline_pid or '-'}")
 
             # Give Android a short window to fully release the crashed target.
@@ -433,12 +416,6 @@ class RecoveryManager:
 
             for level in levels:
                 existing_pid = get_pid(pkg)
-                log.warning(
-                    f"[RECOVERY-TRACE] LEVEL_ENTER pkg={pkg} worker={worker_id} "
-                    f"level={level} existing_pid={existing_pid or '-'} "
-                    f"tracked_pid={self.tracked_pids.get(pkg) or '-'} "
-                    f"baseline_pid={baseline_pid or '-'} status={self.stats[pkg].get('status')}"
-                )
                 if existing_pid and existing_pid != baseline_pid:
                     ok, reason, _ = self._recovery_process_is_real(
                         pkg, baseline_pid=baseline_pid, stable_seconds=2.0
@@ -449,18 +426,7 @@ class RecoveryManager:
                     log.info(f"[RECOVERY] {pkg} target PID exists but is not verified: {reason}")
 
                 if self._launch_recovery_attempt(pkg, level):
-                    log.warning(
-                        f"[RECOVERY-TRACE] WORKER_SUCCESS pkg={pkg} worker={worker_id} "
-                        f"level={level} pid={self.tracked_pids.get(pkg) or '-'} "
-                        f"status={self.stats[pkg].get('status')}"
-                    )
                     return
-
-                log.warning(
-                    f"[RECOVERY-TRACE] LEVEL_FAIL pkg={pkg} worker={worker_id} "
-                    f"level={level} current_pid={get_pid(pkg) or '-'} "
-                    f"status={self.stats[pkg].get('status')}"
-                )
 
                 if level < 3:
                     log.warning(f"[RECOVERY] {pkg} advancing from Tier {level} to Tier {level + 1}.")
@@ -468,19 +434,9 @@ class RecoveryManager:
 
             log.error(f"[RECOVERY] {pkg} failed after all 3 recovery tiers.")
             self.stats[pkg]['status'] = 'FAILED'
-            log.warning(
-                f"[RECOVERY-TRACE] WORKER_END pkg={pkg} worker={worker_id} "
-                f"result=FAILED status={self.stats[pkg].get('status')} "
-                f"current_pid={get_pid(pkg) or '-'} tracked_pid={self.tracked_pids.get(pkg) or '-'}"
-            )
         except Exception as e:
             log.error(f"SINGLE RECOVERY FATAL [{pkg}]: {str(e)}")
             self.stats[pkg]['status'] = 'FAILED'
-            log.warning(
-                f"[RECOVERY-TRACE] WORKER_END pkg={pkg} worker={worker_id} "
-                f"result=EXCEPTION status={self.stats[pkg].get('status')} "
-                f"error={e!r}"
-            )
 
 _manager = RecoveryManager()
 
@@ -492,12 +448,6 @@ def stop_recovery_manager():
     _manager.stop()
 
 def trigger_recovery(pkg):
-    log.warning(
-        f"[RECOVERY-TRACE] TRIGGER_REQUEST pkg={pkg} "
-        f"status={_manager.stats.get(pkg, {}).get('status', '-')} "
-        f"tracked_pid={_manager.tracked_pids.get(pkg) or '-'} "
-        f"baseline_pid={_manager.recovery_baseline_pids.get(pkg) or '-'}"
-    )
     threading.Thread(
         target=_manager.single_recovery_worker,
         args=(pkg,),

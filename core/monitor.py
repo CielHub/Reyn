@@ -221,14 +221,6 @@ def start_monitoring(packages, intent_url, timeout_seconds, max_retries, cooldow
                             current_pid = get_pid(pkg)
 
                             if not current_pid or current_pid != tracked_pids[pkg]:
-                                expected_pid = tracked_pids[pkg] or '-'
-                                observed_pid = current_pid or '-'
-                                reason = 'PID_MISSING' if not current_pid else 'PID_CHANGED'
-                                log.warning(
-                                    f"[WATCHDOG] RECOVERY_TRIGGER pkg={pkg} "
-                                    f"reason={reason} expected_pid={expected_pid} "
-                                    f"observed_pid={observed_pid} status={stats[pkg]['status']}"
-                                )
                                 stats[pkg]['crash_count'] += 1
                                 stats[pkg]['consecutive_crashes'] += 1
                                 

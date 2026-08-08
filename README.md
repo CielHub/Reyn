@@ -1,5 +1,7 @@
-# CARRERA-HUB Stage 4R5-A
+# CARRERA-HUB Stage 4R2
 
-Recovery Trigger Instrumentation experiment built from the Stage 4R4 baseline.
-This stage is diagnostic only: recovery behavior, the 30-second minimum
-recovery delay, and dashboard rendering are intentionally unchanged.
+Package-isolated recovery diagnostics and strict failure-state handling.
+
+Built from the Stage 3B startup-full-terminal-reset baseline and the Stage 4R1
+experiment. Runtime terminal reset behavior is unchanged: full `reset` occurs
+once before the first dashboard frame and never during recovery/runtime.

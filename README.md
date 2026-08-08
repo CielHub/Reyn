@@ -1,36 +1,24 @@
-# CARRERA-HUB Stage 3A
+# CARRERA-HUB Regression Stage 3B
 
-Regression test build based directly on **Stage 2 - State Machine**.
+Baseline inheritance: Stage 3A (Target Resolver + State Machine + Smart Join Verification).
 
-## Added in this stage
+## Added in Stage 3B
 
-Only one functional change was introduced:
+**Recovery Terminal Reset only.** Background recovery workers never write to the terminal. They set a one-shot reset event, and the existing dashboard renderer consumes it and performs `console.clear()` exactly once on the next dashboard frame.
 
-- `core/join_verifier.py`
-- `core/launcher.py` performs a post-launch verification after the existing PID check.
+Reset requests are generated when:
+- single-package watchdog recovery is triggered;
+- global recovery (memory/error event) begins.
 
-The verifier checks:
+## Explicitly unchanged
 
-1. Roblox process is still alive via `pidof`.
-2. Android foreground/focus information when available.
-3. A floating Delta Lite window is not treated as a failure when the process remains alive.
+- Target Resolver
+- State Machine
+- Smart Join Verification
+- Dashboard layout/renderer architecture
+- Rich Live lifecycle
+- Watchdog timing/logic except the reset request hook
+- Recovery launch/kill behavior
+- RAM Guard / Cache Cleaner
 
-## Explicitly NOT changed
-
-- Dashboard renderer
-- Rich `Live` lifecycle
-- `screen=True` / `screen=False` settings
-- Terminal reset behavior
-- Console logging behavior
-- Recovery manager
-- State machine
-- Target resolver
-- Watchdog
-- RAM guard
-- Cache cleaner
-
-## Regression goal
-
-Run the same force-close test used on Stage 2. If Stage 2 is stable and Stage 3A becomes unstable, Smart Join Verification or its launcher integration becomes the primary suspect.
-
-Do not use this build as the baseline until the user confirms the regression test passes.
+This is a regression experiment, not a baseline update.

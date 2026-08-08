@@ -15,6 +15,7 @@ except ImportError:
 
 from core.logger import log, set_console_logging
 from core.ui import console, reset_terminal
+from core.terminal_events import consume_terminal_reset, request_terminal_reset
 from core.error_detector import start_error_detector
 from core.recovery_manager import start_recovery_manager, trigger_recovery, is_global_recovery
 from core.memory_guard import start_memory_guard
@@ -170,7 +171,11 @@ def start_monitoring(packages, intent_url, timeout_seconds, max_retries, cooldow
                                 stats[pkg]['status'] = 'RECOVERY'
                                 stats[pkg]['pid'] = '-'
                                 tracked_pids[pkg] = ''
-                                
+
+                                # Background recovery tidak menyentuh terminal.
+                                # Renderer dashboard yang akan melakukan reset sekali.
+                                request_terminal_reset()
+
                                 # Panggil Watchdog Recovery via RecoveryManager (SINGLE MODE)
                                 trigger_recovery(pkg)
                                 
@@ -185,7 +190,13 @@ def start_monitoring(packages, intent_url, timeout_seconds, max_retries, cooldow
                         
                         last_check_time = current_time
 
-                    live.update(draw_dashboard(stats, current_time, pkg_count, include_header=True))
+                    # Hanya thread dashboard yang boleh menyentuh terminal.
+                    # Recovery worker cukup mengirim request reset satu kali.
+                    if consume_terminal_reset():
+                        live.console.clear()
+                        live.update(draw_dashboard(stats, current_time, pkg_count, include_header=True), refresh=True)
+                    else:
+                        live.update(draw_dashboard(stats, current_time, pkg_count, include_header=True))
                     time.sleep(1)
                     
             except KeyboardInterrupt:

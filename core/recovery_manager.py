@@ -17,6 +17,7 @@ from core.process_manager import graceful_kill, get_pid
 from core.cache_cleaner import clean_package_cache
 from core.launcher import launch_and_wait
 from core.logger import log
+from core.terminal_events import request_terminal_reset
 
 class RecoveryMode(Enum):
     SINGLE = 0
@@ -143,6 +144,7 @@ class RecoveryManager:
 
                 try:
                     self.enter_global_recovery()
+                    request_terminal_reset()
                     
                     avail = event['available_mb']
                     thresh = self.config_data.get("MEMORY_THRESHOLD_MB", 200)
@@ -197,6 +199,7 @@ class RecoveryManager:
 
                     try:
                         self.enter_global_recovery()
+                        request_terminal_reset()
                         
                         log.info(f"[ERROR{reason}] Detected on PID {event.get('pid')}. Initiating Global Recovery.")
                         log.info(f"[GLOBAL] Killing {len(self.packages)} Packages...")

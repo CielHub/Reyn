@@ -14,7 +14,14 @@ from enum import Enum
 
 from core.error_detector import has_event, get_event
 from core.memory_guard import has_memory_event, get_memory_event, reset_memory_guard
-from core.process_manager import graceful_kill, get_pid, hard_force_stop
+from core.process_manager import (
+    graceful_kill,
+    get_pid,
+    get_package_pids,
+    choose_package_pid,
+    package_has_pid,
+    hard_force_stop,
+)
 from core.cache_cleaner import clean_package_cache
 from core.launcher import launch_and_wait
 from core.logger import log
@@ -325,8 +332,7 @@ class RecoveryManager:
             return True
         deadline = time.time() + timeout
         while time.time() < deadline:
-            current = get_pid(pkg)
-            if not current or current != baseline_pid:
+            if not package_has_pid(pkg, baseline_pid):
                 return True
             time.sleep(0.25)
         return False
@@ -448,8 +454,8 @@ class RecoveryManager:
                     log.info(f"[SINGLE] {pkg} cancelled before Tier {level}: global recovery active.")
                     return
 
-                existing_pid = get_pid(pkg)
-                if existing_pid and existing_pid != baseline_pid:
+                existing_pid = choose_package_pid(pkg, exclude_pid=baseline_pid)
+                if existing_pid:
                     ok, reason, _ = self._recovery_process_is_real(
                         pkg, baseline_pid=baseline_pid, stable_seconds=2.0
                     )

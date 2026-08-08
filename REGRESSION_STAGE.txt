@@ -1,19 +1,39 @@
-CARRERA-HUB REGRESSION STAGE 4R5
+CARRERA-HUB REGRESSION STAGE 4R6
 ================================
-Name: Concurrent Recovery Synchronization / Race Hardening
-Parent baseline: Stage 4R4 - Dashboard Resize & Table Layout Hardening
+Name: Stable Package Process Identity
 
-Fixes:
-- Canonical single numeric PID shared by watchdog and strict verifier.
-- Per-package single-flight recovery; duplicate workers are rejected.
-- Single recovery yields when global recovery owns the packages.
-- Watchdog snapshots all packages first, commits crash states second, then
-  starts recovery workers, preventing interleaving during simultaneous crash.
+Parent baseline: Stage 4R5 - Concurrent Recovery Synchronization / Race Hardening
 
-Stage 4R4 invariants remain unchanged: resize-safe manual Rich Live refresh,
-one-time startup terminal reset, 60-column dashboard, tier 1-3 semantics,
-30-second minimum recovery delay, and strict package-isolated verification.
+Purpose:
+- Stop false Farming -> Recovery -> Loading -> Farming loops caused by
+  nondeterministic multi-PID ordering from Android `pidof`.
+- Preserve Stage 4R4 dashboard invariants and Stage 4R5 concurrency hardening.
 
-Regression test:
-Force-close both clones together. Both should recover to Farming and remain
-stable for multiple watchdog cycles unless a real package process loss occurs.
+Changes:
+1. Package PID discovery is now deterministic and explicitly set-aware.
+2. Watchdog no longer compares "first PID" values. A package stays healthy
+   when its previously verified/tracked PID is still present in the current
+   package PID set.
+3. Recovery verification locks onto one fresh candidate PID and verifies that
+   candidate by membership for the whole stability window. Extra/reordered
+   helper PIDs no longer cause TARGET_PID_CHANGED.
+4. Baseline PID exit checks use package-set membership, so they cannot falsely
+   pass merely because `pidof` reordered another PID to the first position.
+5. Pre-tier recovery detection selects a non-baseline PID explicitly instead
+   of relying on positional PID ordering.
+
+Preserved:
+- Stage 4R5 per-package single-flight recovery and simultaneous crash batching
+- Stage 4R5 suppression of stale single recovery during global recovery
+- Stage 4R4 resize-safe Rich Live/manual refresh
+- One-time startup terminal reset and 60-column dashboard
+- Tier 1-3 recovery semantics and minimum 30-second single recovery delay
+- Strict package-specific UI/activity recovery verification
+
+Primary regression test:
+1. Wait until both clones are Farming.
+2. Force-close both packages nearly simultaneously.
+3. Confirm both recover to Farming.
+4. Keep them running across multiple watchdog cycles.
+5. Confirm neither clone re-enters Recovery only because `pidof` reports
+   multiple PIDs in a different order.

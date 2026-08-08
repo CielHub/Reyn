@@ -176,8 +176,12 @@ def start_monitoring(packages, intent_url, timeout_seconds, max_retries, cooldow
                                 
                             else:
                                 stats[pkg]['pid'] = current_pid
+                                # A live PID alone is never recovery success.
+                                # RecoveryManager is the only component allowed
+                                # to promote a package to ONLINE/Farming.
                                 if stats[pkg]['status'] in ['FAILED', 'LOGIN FAILED', 'CAPTCHA']:
-                                    stats[pkg]['status'] = 'ONLINE'
+                                    last_check_time = current_time
+                                    continue
                                     
                                 if stats[pkg]['consecutive_crashes'] > 0:
                                     if current_time - stats[pkg]['last_recovery_time'] > STABILITY_THRESHOLD:

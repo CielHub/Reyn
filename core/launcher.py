@@ -26,10 +26,18 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds):
     
     start_time_str = datetime.datetime.now().strftime('%m-%d %H:%M:%S.000')
     
-    subprocess.run(
+    launch_result = subprocess.run(
         ['am', 'start', '-p', pkg_name, '-a', 'android.intent.action.VIEW', '-d', intent_url],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        capture_output=True,
+        text=True,
+        errors='replace',
     )
+    launch_output = ((launch_result.stdout or '') + '\n' + (launch_result.stderr or '')).strip()
+    if launch_output:
+        log.info(f"LAUNCH RESULT [{pkg_name}]: {launch_output.replace(chr(10), ' | ')}")
+    if launch_result.returncode != 0:
+        log.error(f"LAUNCH COMMAND FAILED [{pkg_name}]: rc={launch_result.returncode}")
+        return False
     
     log.info(f"Smart Wait: Menunggu {pkg_name} terhubung ({timeout_seconds} detik)...")
     

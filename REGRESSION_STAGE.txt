@@ -1,22 +1,27 @@
-REGRESSION STAGE 4R1 - TIERED RECOVERY STRICT SUCCESS VERIFICATION
+CARRERA-HUB REGRESSION STAGE 4R2
+================================
+Name: Package-Isolated Recovery Diagnostics + Strict Failure State
 
-Inherited: Stage 4 - Tiered Recovery
+Baseline: Stage 3B - Startup Full Terminal Reset
+Parent experiment: Stage 4R1
 
-Changed ONLY recovery success validation:
-- A recovery attempt is NOT considered successful from PID existence alone.
-- The PID must remain stable for 4 seconds.
-- Android must expose the target package in dumpsys window/activity output.
-- ONLINE/Farming is committed only after strict verification passes.
-- A false/weak launch result advances to the next recovery tier.
-- Existing-PID shortcut now uses the same strict verification.
+Changes:
+- Recovery verification is isolated to the exact target package.
+- The pre-recovery PID is captured and cannot be reused as recovery success.
+- The crashed target gets a short package-local PID-release window.
+- If the old PID remains, recovery skips straight to the hard-stop tier.
+- Strong Android UI/activity signals are required for that same package.
+- Recovery logs package, baseline PID and resolved intent for diagnosis.
+- `am start` return code/output is captured instead of being discarded.
+- A live PID alone can never promote FAILED/LOGIN FAILED/CAPTCHA to ONLINE.
+- Dashboard rendering and the one-time startup full terminal reset are unchanged.
 
-Unchanged:
-- Dashboard renderer
-- Startup full terminal reset
-- Target Resolver
-- Join State Machine
-- Smart Join Verification
-- Tier 1/2/3 structure
-- Global recovery
-- Anti-loop/cooldown
-- Health Check
+Test focus:
+1. Force-close clienu while clienv remains healthy.
+2. Force-close clienv while clienu remains healthy.
+3. Reverse the order.
+4. Repeat with 5-7 packages.
+5. Verify a failed target remains RECOVER/FAILED and never becomes Farming.
+6. Compare per-package recovery logs if a target fails.
+
+This stage is experimental and is NOT the baseline until user testing passes.

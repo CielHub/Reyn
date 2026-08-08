@@ -13,7 +13,7 @@ from enum import Enum
 
 from core.error_detector import has_event, get_event
 from core.memory_guard import has_memory_event, get_memory_event, reset_memory_guard
-from core.process_manager import graceful_kill, get_pid
+from core.process_manager import graceful_kill, get_pid, hard_force_stop
 from core.cache_cleaner import clean_package_cache
 from core.launcher import launch_and_wait
 from core.logger import log
@@ -284,12 +284,99 @@ class RecoveryManager:
             log.error(f"LAUNCH FATAL: {str(e)}")
             self.stats[pkg]['status'] = 'FAILED'
 
+    def _launch_recovery_attempt(self, pkg, level):
+        """Run one isolated recovery tier. Returns True only after a verified launch."""
+        if level == 1:
+            # Tier 1: relaunch only. No cache cleanup and no hard reset.
+            log.info(f"[RECOVERY L1] Relaunching {pkg} without cache cleanup...")
+
+        elif level == 2:
+            # Tier 2: clean package cache, then relaunch.
+            log.info(f"[RECOVERY L2] Cleaning cache for {pkg}, then relaunching...")
+            clean_package_cache(pkg)
+
+        elif level == 3:
+            # Tier 3: hard-stop through Android package manager, clean cache, relaunch.
+            log.info(f"[RECOVERY L3] Hard-stopping {pkg} + cache cleanup before relaunch...")
+            hard_force_stop(pkg)
+            time.sleep(1)
+            clean_package_cache(pkg)
+
+        else:
+            return False
+
+        self.stats[pkg]['status'] = 'LOADING'
+        pkg_intent = self.intent_url[pkg] if isinstance(self.intent_url, dict) else self.intent_url
+        if not pkg_intent:
+            log.error(f"[RECOVERY L{level}] {pkg} has no valid Intent URL.")
+            return False
+
+        success = launch_and_wait(pkg, pkg_intent, self.timeout_seconds)
+
+        # Preserve the existing auto-login fallback, but keep it inside the
+        # current tier so a failed attempt can advance to the next tier.
+        if not success:
+            try:
+                from core.autologin import run as run_autologin
+                self.stats[pkg]['status'] = 'LOGIN'
+                login_status = run_autologin(pkg)
+
+                if login_status in ["SUCCESS", "ALREADY_LOGGED_IN"]:
+                    self.stats[pkg]['status'] = 'LOADING'
+                    success = launch_and_wait(pkg, pkg_intent, self.timeout_seconds)
+                elif login_status == "CAPTCHA":
+                    self.stats[pkg]['status'] = 'CAPTCHA'
+                    return False
+                else:
+                    self.stats[pkg]['status'] = 'LOGIN FAILED'
+                    return False
+            except ImportError:
+                pass
+
+        if success:
+            new_pid = get_pid(pkg)
+            current_time = time.time()
+            self.tracked_pids[pkg] = new_pid or ''
+            self.stats[pkg]['pid'] = new_pid if new_pid else '-'
+            self.stats[pkg]['status'] = 'ONLINE'
+            self.stats[pkg]['uptime_start'] = current_time
+            self.stats[pkg]['last_recovery_time'] = current_time
+            self.stats[pkg]['recovery_count'] += 1
+            self.stats[pkg]['consecutive_crashes'] = 0
+            log.info(f"[RECOVERY L{level}] {pkg} recovered successfully.")
+            return True
+
+        if self.stats[pkg]['status'] not in ['LOGIN FAILED', 'CAPTCHA']:
+            self.stats[pkg]['status'] = 'FAILED'
+        log.warning(f"[RECOVERY L{level}] {pkg} recovery attempt failed.")
+        return False
+
     def single_recovery_worker(self, pkg):
-        """Hanya dipanggil oleh Watchdog saat mendeteksi crash tunggal (PID hilang)"""
+        """Single-package tiered recovery: L1 -> L2 -> L3."""
         try:
             log.info(f"[SINGLE] Crash detected for {pkg}. Waiting 15 seconds...")
             time.sleep(15)
-            self.launch_single_package(pkg)
+
+            for level in (1, 2, 3):
+                # A prior tier may have restored the process while this worker
+                # was preparing the next attempt. Do not relaunch unnecessarily.
+                existing_pid = get_pid(pkg)
+                if existing_pid:
+                    self.tracked_pids[pkg] = existing_pid
+                    self.stats[pkg]['pid'] = existing_pid
+                    self.stats[pkg]['status'] = 'ONLINE'
+                    log.info(f"[RECOVERY] {pkg} is already online before Tier {level}; stopping recovery chain.")
+                    return
+
+                if self._launch_recovery_attempt(pkg, level):
+                    return
+
+                if level < 3:
+                    log.warning(f"[RECOVERY] {pkg} advancing from Tier {level} to Tier {level + 1}.")
+                    time.sleep(2)
+
+            log.error(f"[RECOVERY] {pkg} failed after all 3 recovery tiers.")
+            self.stats[pkg]['status'] = 'FAILED'
         except Exception as e:
             log.error(f"SINGLE RECOVERY FATAL: {str(e)}")
             self.stats[pkg]['status'] = 'FAILED'

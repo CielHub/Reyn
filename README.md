@@ -1,36 +1,39 @@
-# CARRERA-HUB Stage 3A
+# CARRERA-HUB - Regression Stage 4
 
-Regression test build based directly on **Stage 2 - State Machine**.
+This build is based on **Stage 3B - Startup Full Terminal Reset**.
 
-## Added in this stage
+## Stage 4 addition
 
-Only one functional change was introduced:
+Stage 4 adds a three-tier recovery chain for **single-package crash recovery**:
 
-- `core/join_verifier.py`
-- `core/launcher.py` performs a post-launch verification after the existing PID check.
+1. **Tier 1 - Relaunch**
+   - Relaunch the package directly.
+   - Does not clean cache.
+   - Does not perform a hard force-stop.
 
-The verifier checks:
+2. **Tier 2 - Cache Recovery**
+   - Clean the package cache/code_cache.
+   - Relaunch the package.
 
-1. Roblox process is still alive via `pidof`.
-2. Android foreground/focus information when available.
-3. A floating Delta Lite window is not treated as a failure when the process remains alive.
+3. **Tier 3 - Hard Recovery**
+   - Android `am force-stop` through root.
+   - Clean package cache/code_cache.
+   - Relaunch the package.
 
-## Explicitly NOT changed
+The chain stops as soon as a verified launch succeeds.
+
+## Regression isolation
+
+This stage intentionally does **not** modify:
 
 - Dashboard renderer
-- Rich `Live` lifecycle
-- `screen=True` / `screen=False` settings
-- Terminal reset behavior
-- Console logging behavior
-- Recovery manager
-- State machine
-- Target resolver
-- Watchdog
-- RAM guard
-- Cache cleaner
+- Rich Live configuration
+- Startup full terminal reset
+- Smart Join Verification
+- Target Resolver
+- State Machine
+- Anti Recovery Loop
+- Startup Health Check
+- Global Recovery flow
 
-## Regression goal
-
-Run the same force-close test used on Stage 2. If Stage 2 is stable and Stage 3A becomes unstable, Smart Join Verification or its launcher integration becomes the primary suspect.
-
-Do not use this build as the baseline until the user confirms the regression test passes.
+Global recovery remains unchanged for this stage. The new tiered logic is isolated to the existing single-package watchdog recovery path.

@@ -1,6 +1,22 @@
-REGRESSION STAGE 3B - STARTUP FULL TERMINAL RESET
+REGRESSION STAGE 4 - TIERED RECOVERY
 
-Inherited: Stage 3A (Smart Join Verification)
-Added: one full terminal reset immediately before the first monitoring dashboard frame.
-Recovery resets: disabled. No terminal reset is performed after startup.
-Dashboard renderer otherwise unchanged.
+Inherited: Stage 3B (Startup Full Terminal Reset + Smart Join Verification)
+
+Added ONLY:
+- Single-package tiered recovery in core/recovery_manager.py
+- hard_force_stop() helper in core/process_manager.py
+
+Recovery tiers:
+1. Tier 1: Relaunch only (no cache cleanup, no hard reset)
+2. Tier 2: Clean package cache, then relaunch
+3. Tier 3: Android hard force-stop, clean package cache, then relaunch
+
+Behavior:
+- A successful tier ends the recovery chain immediately.
+- A failed tier advances to the next tier.
+- Existing 15-second crash wait is preserved.
+- Existing Smart Join Verification remains active through launch_and_wait().
+- Global recovery behavior is unchanged in this stage.
+- No dashboard renderer changes.
+- No terminal reset/clear changes.
+- No anti-loop/cooldown changes beyond the inherited watchdog behavior.

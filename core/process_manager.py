@@ -78,4 +78,20 @@ def graceful_kill(pid, package=None):
         time.sleep(1)
 
     return not pid_exists(pid)
-    
+
+def hard_force_stop(package):
+    """Hard-stop a package through Android's package manager.
+
+    Used by the highest recovery tier only, after lighter relaunch/cache
+    attempts have failed. Returns True when the command succeeds.
+    """
+    if not package:
+        return False
+
+    result = subprocess.run(
+        ["su", "-c", f"am force-stop {package}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+

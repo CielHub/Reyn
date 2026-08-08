@@ -122,9 +122,6 @@ def start_monitoring(packages, intent_url, timeout_seconds, max_retries, cooldow
         tracked_pids[pkg] = pid
         stats[pkg]['pid'] = pid if pid else '-'
 
-    # Mute background console output before starting workers.
-    set_console_logging(False)
-
     # ERROR DETECTOR, RECOVERY MANAGER, & MEMORY GUARD AKTIF
     start_error_detector()
     start_recovery_manager(packages, stats, tracked_pids, intent_url, timeout_seconds, config_data)
@@ -132,11 +129,11 @@ def start_monitoring(packages, intent_url, timeout_seconds, max_retries, cooldow
 
     check_interval = 15
     last_check_time = current_time
-    STABILITY_THRESHOLD = 300
+    STABILITY_THRESHOLD = 300 
+
+    set_console_logging(False)
 
     try:
-        # Explicit reset immediately before the dashboard takes ownership.
-        reset_terminal()
         with Live(draw_dashboard(stats, current_time, pkg_count, include_header=True), console=console, refresh_per_second=1, transient=False, screen=False) as live:
             try:
                 while True:

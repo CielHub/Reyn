@@ -9,6 +9,7 @@ Tanggung Jawab:
 
 import threading
 import time
+import subprocess
 from enum import Enum
 
 from core.error_detector import has_event, get_event
@@ -284,6 +285,85 @@ class RecoveryManager:
             log.error(f"LAUNCH FATAL: {str(e)}")
             self.stats[pkg]['status'] = 'FAILED'
 
+
+    def _recovery_process_is_real(self, pkg, stable_seconds=4.0):
+        """Strict recovery verification used ONLY by single-package recovery.
+
+        A PID alone is not enough to declare Farming/ONLINE. The process must
+        remain alive with the same PID for a short stability window and Android
+        must expose a window/activity belonging to the target package. Delta
+        Lite may be floating, so the package does not need to be the global
+        foreground app.
+        """
+        deadline = time.time() + stable_seconds
+        first_pid = get_pid(pkg)
+        if not first_pid:
+            return False, "PROCESS_NOT_RUNNING"
+
+        saw_android_ui = False
+        while time.time() < deadline:
+            current_pid = get_pid(pkg)
+            if not current_pid:
+                return False, "PROCESS_DIED_DURING_VERIFY"
+            if current_pid != first_pid:
+                return False, "PID_CHANGED_DURING_VERIFY"
+
+            if self._android_ui_mentions_package(pkg):
+                saw_android_ui = True
+
+            time.sleep(0.5)
+
+        if not saw_android_ui:
+            return False, "NO_PACKAGE_WINDOW_OR_ACTIVITY"
+
+        return True, "PROCESS_STABLE_AND_UI_PRESENT"
+
+    @staticmethod
+    def _android_ui_mentions_package(pkg):
+        """Best-effort check that Android exposes a UI/window for pkg."""
+        commands = (
+            ["dumpsys", "window", "windows"],
+            ["dumpsys", "activity", "activities"],
+        )
+        for cmd in commands:
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    errors="replace",
+                )
+                output = (result.stdout or "")
+                if pkg in output:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _commit_recovery_success(self, pkg, level):
+        """Commit ONLINE only after strict recovery verification succeeds."""
+        verified, reason = self._recovery_process_is_real(pkg)
+        if not verified:
+            log.warning(f"[RECOVERY L{level}] {pkg} strict verification failed: {reason}")
+            return False
+
+        new_pid = get_pid(pkg)
+        if not new_pid:
+            log.warning(f"[RECOVERY L{level}] {pkg} PID disappeared after verification.")
+            return False
+
+        current_time = time.time()
+        self.tracked_pids[pkg] = new_pid
+        self.stats[pkg]['pid'] = new_pid
+        self.stats[pkg]['status'] = 'ONLINE'
+        self.stats[pkg]['uptime_start'] = current_time
+        self.stats[pkg]['last_recovery_time'] = current_time
+        self.stats[pkg]['recovery_count'] += 1
+        self.stats[pkg]['consecutive_crashes'] = 0
+        log.info(f"[RECOVERY L{level}] {pkg} recovered successfully: {reason}")
+        return True
+
     def _launch_recovery_attempt(self, pkg, level):
         """Run one isolated recovery tier. Returns True only after a verified launch."""
         if level == 1:
@@ -334,17 +414,15 @@ class RecoveryManager:
                 pass
 
         if success:
-            new_pid = get_pid(pkg)
-            current_time = time.time()
-            self.tracked_pids[pkg] = new_pid or ''
-            self.stats[pkg]['pid'] = new_pid if new_pid else '-'
-            self.stats[pkg]['status'] = 'ONLINE'
-            self.stats[pkg]['uptime_start'] = current_time
-            self.stats[pkg]['last_recovery_time'] = current_time
-            self.stats[pkg]['recovery_count'] += 1
-            self.stats[pkg]['consecutive_crashes'] = 0
-            log.info(f"[RECOVERY L{level}] {pkg} recovered successfully.")
-            return True
+            if self._commit_recovery_success(pkg, level):
+                return True
+            # The launcher returned success, but strict recovery verification
+            # rejected it. Keep the visible state in RECOVERY while the next
+            # tier is selected. Never expose a false Farming/ONLINE state.
+            self.stats[pkg]['status'] = 'RECOVERY'
+            self.stats[pkg]['pid'] = '-'
+            log.warning(f"[RECOVERY L{level}] launch succeeded weakly but strict verification failed; advancing tier.")
+            return False
 
         if self.stats[pkg]['status'] not in ['LOGIN FAILED', 'CAPTCHA']:
             self.stats[pkg]['status'] = 'FAILED'
@@ -362,11 +440,10 @@ class RecoveryManager:
                 # was preparing the next attempt. Do not relaunch unnecessarily.
                 existing_pid = get_pid(pkg)
                 if existing_pid:
-                    self.tracked_pids[pkg] = existing_pid
-                    self.stats[pkg]['pid'] = existing_pid
-                    self.stats[pkg]['status'] = 'ONLINE'
-                    log.info(f"[RECOVERY] {pkg} is already online before Tier {level}; stopping recovery chain.")
-                    return
+                    if self._commit_recovery_success(pkg, level):
+                        log.info(f"[RECOVERY] {pkg} was already healthy before Tier {level}; stopping recovery chain.")
+                        return
+                    log.info(f"[RECOVERY] {pkg} has a PID but strict verification failed; continuing Tier {level}.")
 
                 if self._launch_recovery_attempt(pkg, level):
                     return

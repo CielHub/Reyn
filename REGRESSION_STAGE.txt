@@ -1,22 +1,22 @@
-REGRESSION STAGE 4 - TIERED RECOVERY
+REGRESSION STAGE 4R1 - TIERED RECOVERY STRICT SUCCESS VERIFICATION
 
-Inherited: Stage 3B (Startup Full Terminal Reset + Smart Join Verification)
+Inherited: Stage 4 - Tiered Recovery
 
-Added ONLY:
-- Single-package tiered recovery in core/recovery_manager.py
-- hard_force_stop() helper in core/process_manager.py
+Changed ONLY recovery success validation:
+- A recovery attempt is NOT considered successful from PID existence alone.
+- The PID must remain stable for 4 seconds.
+- Android must expose the target package in dumpsys window/activity output.
+- ONLINE/Farming is committed only after strict verification passes.
+- A false/weak launch result advances to the next recovery tier.
+- Existing-PID shortcut now uses the same strict verification.
 
-Recovery tiers:
-1. Tier 1: Relaunch only (no cache cleanup, no hard reset)
-2. Tier 2: Clean package cache, then relaunch
-3. Tier 3: Android hard force-stop, clean package cache, then relaunch
-
-Behavior:
-- A successful tier ends the recovery chain immediately.
-- A failed tier advances to the next tier.
-- Existing 15-second crash wait is preserved.
-- Existing Smart Join Verification remains active through launch_and_wait().
-- Global recovery behavior is unchanged in this stage.
-- No dashboard renderer changes.
-- No terminal reset/clear changes.
-- No anti-loop/cooldown changes beyond the inherited watchdog behavior.
+Unchanged:
+- Dashboard renderer
+- Startup full terminal reset
+- Target Resolver
+- Join State Machine
+- Smart Join Verification
+- Tier 1/2/3 structure
+- Global recovery
+- Anti-loop/cooldown
+- Health Check

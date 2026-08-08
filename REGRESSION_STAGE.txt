@@ -1,6 +1,7 @@
 CARRERA-HUB REGRESSION STAGE 4R6
 ================================
 Name: Stable Package Process Identity
+Revision: 4R6.1 - Import Graph Hotfix
 
 Parent baseline: Stage 4R5 - Concurrent Recovery Synchronization / Race Hardening
 
@@ -37,3 +38,7 @@ Primary regression test:
 4. Keep them running across multiple watchdog cycles.
 5. Confirm neither clone re-enters Recovery only because `pidof` reports
    multiple PIDs in a different order.
+
+Hotfix 4R6.1:
+- core/tester.py imports get_pid from core.process_manager (canonical source), not core.monitor.
+- Runtime import smoke test added to release validation.

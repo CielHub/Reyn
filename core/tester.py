@@ -9,7 +9,7 @@ from core.config import load_config
 from core.deeplink import get_intent_url
 from core.scanner import get_roblox_packages
 from core.launcher import launch_and_wait
-from core.process_manager import get_pid
+from core.monitor import get_pid
 
 from core.ui import console, reset_terminal, draw_header, show_transition, draw_footer, LAYOUT_WIDTH
 from rich.prompt import Prompt

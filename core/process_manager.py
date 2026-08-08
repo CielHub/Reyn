@@ -9,52 +9,12 @@ Tanggung Jawab:
 import subprocess
 import time
 
-def get_package_pids(pkg_name):
-    """Return a deterministic set-like list of numeric PIDs for one package.
-
-    Android may report more than one PID for a package and may change their
-    output order between calls.  Callers that care about process identity must
-    therefore use membership checks, not positional equality.
-    """
-    try:
-        result = subprocess.run(
-            ['pidof', pkg_name], capture_output=True, text=True, timeout=2
-        )
-        pids = {pid for pid in result.stdout.strip().split() if pid.isdigit()}
-        return sorted(pids, key=int)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
-
-
-def package_has_pid(pkg_name, pid):
-    """Return True when *pid* is still owned/reported by *pkg_name*."""
-    if not pid:
-        return False
-    return str(pid) in get_package_pids(pkg_name)
-
-
-def choose_package_pid(pkg_name, preferred_pid='', exclude_pid=''):
-    """Choose a deterministic PID without depending on `pidof` output order.
-
-    If a previously verified PID is still present, it wins. Otherwise the
-    first deterministic non-excluded PID is returned.
-    """
-    pids = get_package_pids(pkg_name)
-    preferred_pid = str(preferred_pid or '')
-    exclude_pid = str(exclude_pid or '')
-
-    if preferred_pid and preferred_pid in pids:
-        return preferred_pid
-
-    for pid in pids:
-        if pid != exclude_pid:
-            return pid
-    return ''
-
-
 def get_pid(pkg_name):
-    """Compatibility helper returning one deterministic package PID."""
-    return choose_package_pid(pkg_name)
+    try:
+        result = subprocess.run(['pidof', pkg_name], capture_output=True, text=True)
+        return result.stdout.strip()
+    except FileNotFoundError:
+        return ""
 
 def pid_exists(pid):
     result = subprocess.run(

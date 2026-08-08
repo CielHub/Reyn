@@ -7,16 +7,25 @@ exists or because an Android command returned success.
 import subprocess
 import time
 
-from core.process_manager import choose_package_pid, get_package_pids
+
+def get_package_pids(pkg):
+    if not pkg:
+        return []
+    try:
+        result = subprocess.run(
+            ["pidof", pkg],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return [p for p in result.stdout.strip().split() if p.isdigit()]
+    except Exception:
+        return []
 
 
-def _select_recovery_pid(pkg, preferred_pid='', baseline_pid=''):
-    """Select a candidate independent of `pidof` ordering."""
-    return choose_package_pid(
-        pkg,
-        preferred_pid=preferred_pid,
-        exclude_pid=baseline_pid,
-    )
+def get_single_pid(pkg):
+    pids = get_package_pids(pkg)
+    return pids[0] if pids else ""
 
 
 def _dump(cmd):
@@ -84,27 +93,23 @@ def verify_recovery(pkg, baseline_pid="", stable_seconds=4.0):
 
     Returns (ok, reason, pid).
     """
-    baseline_pid = str(baseline_pid or '')
-    first_pid = _select_recovery_pid(pkg, baseline_pid=baseline_pid)
+    first_pid = get_single_pid(pkg)
     if not first_pid:
-        current_pids = get_package_pids(pkg)
-        if baseline_pid and baseline_pid in current_pids:
-            return False, "OLD_PID_STILL_PRESENT", baseline_pid
         return False, "TARGET_PROCESS_NOT_RUNNING", ""
 
-    # Stability means the verified candidate remains a member of the package
-    # PID set. Extra helper processes may appear/disappear or reorder without
-    # invalidating an otherwise healthy main process.
+    # A recovery should normally produce a fresh PID after force-close.  If a
+    # baseline PID is supplied and Android still reports the exact same PID,
+    # do not treat the old process as a successful relaunch.
+    if baseline_pid and first_pid == str(baseline_pid):
+        return False, "OLD_PID_STILL_PRESENT", first_pid
+
     deadline = time.time() + stable_seconds
     while time.time() < deadline:
-        current_pids = get_package_pids(pkg)
-        if first_pid not in current_pids:
-            replacement = _select_recovery_pid(
-                pkg, preferred_pid=first_pid, baseline_pid=baseline_pid
-            )
-            if replacement:
-                return False, "TARGET_PID_CHANGED", replacement
+        current_pid = get_single_pid(pkg)
+        if not current_pid:
             return False, "TARGET_PROCESS_DIED", ""
+        if current_pid != first_pid:
+            return False, "TARGET_PID_CHANGED", current_pid
         time.sleep(0.5)
 
     signals = _package_ui_signals(pkg)

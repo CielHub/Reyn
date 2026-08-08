@@ -1,44 +1,47 @@
-CARRERA-HUB REGRESSION STAGE 4R6
-================================
-Name: Stable Package Process Identity
-Revision: 4R6.1 - Import Graph Hotfix
+CARRERA-HUB REGRESSION STAGE 4R5-A
+==================================
+Name: Recovery Trigger Instrumentation
 
-Parent baseline: Stage 4R5 - Concurrent Recovery Synchronization / Race Hardening
+Baseline: Stage 4R4 - Dashboard Resize & Table Layout Hardening
+Parent experiment: Stage 4R4
 
 Purpose:
-- Stop false Farming -> Recovery -> Loading -> Farming loops caused by
-  nondeterministic multi-PID ordering from Android `pidof`.
-- Preserve Stage 4R4 dashboard invariants and Stage 4R5 concurrency hardening.
+- Diagnose the newly observed clienu recovery loop after simultaneous
+  force-close of multiple packages.
+- Determine whether the second recovery is caused by a false PID mismatch,
+  duplicate recovery worker, stale tracked PID, or a recovery-state timing race.
 
-Changes:
-1. Package PID discovery is now deterministic and explicitly set-aware.
-2. Watchdog no longer compares "first PID" values. A package stays healthy
-   when its previously verified/tracked PID is still present in the current
-   package PID set.
-3. Recovery verification locks onto one fresh candidate PID and verifies that
-   candidate by membership for the whole stability window. Extra/reordered
-   helper PIDs no longer cause TARGET_PID_CHANGED.
-4. Baseline PID exit checks use package-set membership, so they cannot falsely
-   pass merely because `pidof` reordered another PID to the first position.
-5. Pre-tier recovery detection selects a non-baseline PID explicitly instead
-   of relying on positional PID ordering.
+Behavioral policy:
+- NO recovery algorithm or timing change in this stage.
+- NO state-guard fix in this stage.
+- The existing 30-second minimum single-package recovery delay is preserved.
+- Dashboard rendering is untouched.
 
-Preserved:
-- Stage 4R5 per-package single-flight recovery and simultaneous crash batching
-- Stage 4R5 suppression of stale single recovery during global recovery
-- Stage 4R4 resize-safe Rich Live/manual refresh
-- One-time startup terminal reset and 60-column dashboard
-- Tier 1-3 recovery semantics and minimum 30-second single recovery delay
-- Strict package-specific UI/activity recovery verification
+Instrumentation added:
+1. Watchdog logs every recovery trigger with package, reason, expected PID,
+   observed PID, and current status.
+2. Each single recovery worker logs its thread identity and lifecycle.
+3. Recovery worker logs state/PID before and after the 30-second delay.
+4. Each recovery tier logs entry/exit context, current PID, tracked PID,
+   baseline PID, and visible state.
+5. Recovery success/failure is logged with worker identity so duplicate or
+   overlapping workers can be identified.
+6. Trigger requests are logged before a recovery worker is spawned.
 
-Primary regression test:
-1. Wait until both clones are Farming.
-2. Force-close both packages nearly simultaneously.
-3. Confirm both recover to Farming.
-4. Keep them running across multiple watchdog cycles.
-5. Confirm neither clone re-enters Recovery only because `pidof` reports
-   multiple PIDs in a different order.
+Test focus:
+1. Start 2 packages normally.
+2. Force-close clienu + clienv simultaneously.
+3. Wait until both reach Farming.
+4. Observe whether clienu produces another RECOVERY trigger without a genuine
+   process loss.
+5. Repeat with reversed order and with only one package interrupted.
+6. Inspect logs/latest.log for [WATCHDOG] and [RECOVERY-TRACE] entries.
+7. For 5-7 packages, verify no duplicate workers are created during one
+   recovery event.
 
-Hotfix 4R6.1:
-- core/tester.py imports get_pid from core.process_manager (canonical source), not core.monitor.
-- Runtime import smoke test added to release validation.
+Expected diagnostic result:
+- We should be able to identify the exact trigger and PID transition that
+  causes any unexpected Farming -> Recovery -> Loading -> Farming loop.
+
+Status:
+Experimental. NOT baseline until user testing passes.

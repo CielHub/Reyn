@@ -7,6 +7,7 @@ import time
 import datetime
 import select
 from core.logger import log
+from core.join_verifier import verify_join
 
 def get_pid_quick(pkg_name):
     try:
@@ -79,7 +80,13 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds):
     if not final_pid:
         log.error(f"LAUNCH FAILED: {pkg_name} gagal diluncurkan (Proses mati secara prematur).")
         return False
-        
+
+    verified, reason = verify_join(pkg_name)
+    if not verified:
+        log.error(f"VERIFY FAILED: {pkg_name} -> {reason}")
+        return False
+
+    log.info(f"VERIFY: {pkg_name} -> {reason}")
     log.info(f"SUCCESS: {pkg_name} selesai diproses.")
     return True
     

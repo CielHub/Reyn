@@ -7,25 +7,11 @@ exists or because an Android command returned success.
 import subprocess
 import time
 
-
-def get_package_pids(pkg):
-    if not pkg:
-        return []
-    try:
-        result = subprocess.run(
-            ["pidof", pkg],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        return [p for p in result.stdout.strip().split() if p.isdigit()]
-    except Exception:
-        return []
+from core.process_manager import get_pid
 
 
 def get_single_pid(pkg):
-    pids = get_package_pids(pkg)
-    return pids[0] if pids else ""
+    return get_pid(pkg)
 
 
 def _dump(cmd):

@@ -209,47 +209,57 @@ def start_monitoring(packages, intent_url, timeout_seconds, max_retries, cooldow
                             last_check_time = current_time
                             continue
 
+                        # Snapshot all packages before starting any recovery
+                        # worker so simultaneous force-closes share one tick.
+                        crash_batch = []
+                        healthy_batch = []
+
                         for pkg in packages:
                             if stats[pkg]['status'] in ['RECOVERY', 'LOGIN', 'LOADING', 'CAPTCHA']:
                                 continue
-                                
+
                             if stats[pkg]['cooldown_until'] > current_time:
                                 stats[pkg]['status'] = 'COOLDOWN'
                                 stats[pkg]['pid'] = '-'
                                 continue
-                                
+
                             current_pid = get_pid(pkg)
+                            expected_pid = tracked_pids.get(pkg, '')
 
-                            if not current_pid or current_pid != tracked_pids[pkg]:
-                                stats[pkg]['crash_count'] += 1
-                                stats[pkg]['consecutive_crashes'] += 1
-                                
-                                if stats[pkg]['consecutive_crashes'] > max_retries:
-                                    stats[pkg]['cooldown_until'] = current_time + cooldown_secs
-                                    stats[pkg]['status'] = 'COOLDOWN'
-                                    stats[pkg]['pid'] = '-'
-                                    continue
-
-                                stats[pkg]['status'] = 'RECOVERY'
-                                stats[pkg]['pid'] = '-'
-                                tracked_pids[pkg] = ''
-
-                                # Panggil Watchdog Recovery via RecoveryManager (SINGLE MODE)
-                                trigger_recovery(pkg)
-                                
+                            if not current_pid or current_pid != expected_pid:
+                                crash_batch.append((pkg, current_pid, expected_pid))
                             else:
-                                stats[pkg]['pid'] = current_pid
-                                # A live PID alone is never recovery success.
-                                # RecoveryManager is the only component allowed
-                                # to promote a package to ONLINE/Farming.
-                                if stats[pkg]['status'] in ['FAILED', 'LOGIN FAILED', 'CAPTCHA']:
-                                    last_check_time = current_time
-                                    continue
-                                    
-                                if stats[pkg]['consecutive_crashes'] > 0:
-                                    if current_time - stats[pkg]['last_recovery_time'] > STABILITY_THRESHOLD:
-                                        stats[pkg]['consecutive_crashes'] = 0
-                        
+                                healthy_batch.append((pkg, current_pid))
+
+                        # Commit all crash states before any worker can run.
+                        for pkg, current_pid, expected_pid in crash_batch:
+                            stats[pkg]['crash_count'] += 1
+                            stats[pkg]['consecutive_crashes'] += 1
+
+                            if stats[pkg]['consecutive_crashes'] > max_retries:
+                                stats[pkg]['cooldown_until'] = current_time + cooldown_secs
+                                stats[pkg]['status'] = 'COOLDOWN'
+                                stats[pkg]['pid'] = '-'
+                                continue
+
+                            stats[pkg]['status'] = 'RECOVERY'
+                            stats[pkg]['pid'] = '-'
+                            tracked_pids[pkg] = ''
+
+                        # Spawn only after the complete batch is committed.
+                        for pkg, _, _ in crash_batch:
+                            if stats[pkg]['status'] == 'RECOVERY':
+                                trigger_recovery(pkg)
+
+                        for pkg, current_pid in healthy_batch:
+                            stats[pkg]['pid'] = current_pid
+                            if stats[pkg]['status'] in ['FAILED', 'LOGIN FAILED', 'CAPTCHA']:
+                                continue
+
+                            if stats[pkg]['consecutive_crashes'] > 0:
+                                if current_time - stats[pkg]['last_recovery_time'] > STABILITY_THRESHOLD:
+                                    stats[pkg]['consecutive_crashes'] = 0
+
                         last_check_time = current_time
 
                     # Dashboard refresh only. A terminal resize gets a clean

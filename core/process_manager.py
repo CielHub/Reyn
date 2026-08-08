@@ -9,12 +9,21 @@ Tanggung Jawab:
 import subprocess
 import time
 
-def get_pid(pkg_name):
+def get_package_pids(pkg_name):
+    """Return normalized numeric PIDs reported for one Android package."""
     try:
-        result = subprocess.run(['pidof', pkg_name], capture_output=True, text=True)
-        return result.stdout.strip()
-    except FileNotFoundError:
-        return ""
+        result = subprocess.run(
+            ['pidof', pkg_name], capture_output=True, text=True, timeout=2
+        )
+        return [pid for pid in result.stdout.strip().split() if pid.isdigit()]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+
+def get_pid(pkg_name):
+    """Return one canonical PID for watchdog/recovery comparisons."""
+    pids = get_package_pids(pkg_name)
+    return pids[0] if pids else ""
 
 def pid_exists(pid):
     result = subprocess.run(

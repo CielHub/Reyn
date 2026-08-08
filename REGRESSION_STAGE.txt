@@ -1,53 +1,19 @@
-CARRERA-HUB REGRESSION STAGE 4R4
+CARRERA-HUB REGRESSION STAGE 4R5
 ================================
-Name: Dashboard Resize & Table Layout Hardening
+Name: Concurrent Recovery Synchronization / Race Hardening
+Parent baseline: Stage 4R4 - Dashboard Resize & Table Layout Hardening
 
-Baseline: Stage 3B - Startup Full Terminal Reset
-Parent experiment: Stage 4R3
+Fixes:
+- Canonical single numeric PID shared by watchdog and strict verifier.
+- Per-package single-flight recovery; duplicate workers are rejected.
+- Single recovery yields when global recovery owns the packages.
+- Watchdog snapshots all packages first, commits crash states second, then
+  starts recovery workers, preventing interleaving during simultaneous crash.
 
-Purpose:
-- Fix the dashboard visual corruption that can occur when Android/Termux
-  changes terminal geometry while the keyboard is opened and then closed.
-- Tighten the dashboard table so PACKAGE/PID spacing no longer pushes the
-  rightmost columns outside the 60-column dashboard rule.
+Stage 4R4 invariants remain unchanged: resize-safe manual Rich Live refresh,
+one-time startup terminal reset, 60-column dashboard, tier 1-3 semantics,
+30-second minimum recovery delay, and strict package-isolated verification.
 
-Changes:
-1. Dashboard renderer uses deterministic/manual Rich Live refreshes
-   (`auto_refresh=False`) so terminal writes are controlled by the dashboard
-   loop instead of a background refresh thread.
-2. Added a non-throwing SIGWINCH watcher for the dashboard lifecycle.
-   Resize events are recorded and consumed by the next dashboard refresh.
-3. When a resize is detected, Rich's cached previous frame shape is invalidated,
-   the visible terminal is cleared, and the current dashboard frame is drawn
-   from a clean cursor position.
-4. The resize recovery uses a visual `clear` only. It does NOT call the full
-   terminal `reset` and does not alter the Stage 3B startup-reset rule.
-5. Applied the same resize-safe Live renderer to both the initial auto-rejoiner
-   dashboard and the long-running monitoring dashboard.
-6. Dashboard table widths were tightened to fit exactly inside the 60-column
-   rule while retaining one-cell horizontal padding:
-   ID=3, PACKAGE=11, PID=6, STATUS=10, UPTIME=8, L=2, R=2, C=2.
-
-Intentionally unchanged:
-- Recovery manager / Tier 1-3 recovery logic
-- Package-isolated recovery verification
-- 30-second minimum single-package recovery delay
-- Target resolver / join state machine
-- Launcher / PID tracking
-- Memory guard / global recovery behavior
-- One-time startup full terminal `reset`
-
-Test focus:
-1. Start dashboard normally and verify one CARRERA logo only.
-2. Open Android keyboard while dashboard is running.
-3. Leave keyboard open long enough for at least one dashboard refresh.
-4. Close keyboard and verify the dashboard redraws cleanly.
-5. Repeat keyboard open/close multiple times.
-6. Repeat with the keyboard opened and closed quickly, testing SIGWINCH handling.
-7. Verify no duplicated/overlapping ASCII logo remains.
-8. Verify the table's rightmost C/R/L columns stay inside the 60-column rule.
-9. Verify 2 packages, then 5-7 packages, without changing recovery behavior.
-10. Verify force-close/recovery behavior remains identical to Stage 4R3.
-
-Status:
-Experimental. NOT baseline until user testing passes.
+Regression test:
+Force-close both clones together. Both should recover to Farming and remain
+stable for multiple watchdog cycles unless a real package process loss occurs.

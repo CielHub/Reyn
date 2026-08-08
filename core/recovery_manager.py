@@ -44,8 +44,10 @@ class RecoveryManager:
         self.global_status = None
         self.global_countdown = 0
         
-        # Lock untuk memastikan anti duplicate recovery
+        # Global lock + package-local single-flight recovery ownership.
         self.recovery_lock = threading.Lock()
+        self.single_recovery_lock = threading.RLock()
+        self.single_recovery_inflight = set()
 
     def configure(self, packages, stats, tracked_pids, intent_url, timeout_seconds, config_data):
         self.packages = packages
@@ -396,12 +398,39 @@ class RecoveryManager:
         log.warning(f"[RECOVERY L{level}] {pkg} recovery attempt failed.")
         return False
 
+    def request_single_recovery(self, pkg):
+        """Start at most one single-recovery worker per package."""
+        with self.single_recovery_lock:
+            if self.global_recovery or pkg in self.single_recovery_inflight:
+                log.info(f"[RECOVERY] Duplicate/overlapping trigger ignored for {pkg}.")
+                return False
+            self.single_recovery_inflight.add(pkg)
+
+        threading.Thread(
+            target=self._single_recovery_entry,
+            args=(pkg,),
+            daemon=True,
+            name=f"SingleRecovery:{pkg}",
+        ).start()
+        return True
+
+    def _single_recovery_entry(self, pkg):
+        try:
+            self.single_recovery_worker(pkg)
+        finally:
+            with self.single_recovery_lock:
+                self.single_recovery_inflight.discard(pkg)
+
     def single_recovery_worker(self, pkg):
         """Single-package tiered recovery with package-isolated diagnostics."""
         try:
             recovery_delay = max(30, int(self.config_data.get("RECOVERY_DELAY_SECONDS", 30)))
             log.info(f"[SINGLE] Crash detected for {pkg}. Waiting {recovery_delay} seconds...")
             time.sleep(recovery_delay)
+
+            if self.global_recovery:
+                log.info(f"[SINGLE] {pkg} cancelled because global recovery took ownership.")
+                return
 
             baseline_pid = self.recovery_baseline_pids.get(pkg, '')
             log.info(f"[RECOVERY] TARGET={pkg} BASELINE_PID={baseline_pid or '-'}")
@@ -415,6 +444,10 @@ class RecoveryManager:
                 levels = (1, 2, 3)
 
             for level in levels:
+                if self.global_recovery:
+                    log.info(f"[SINGLE] {pkg} cancelled before Tier {level}: global recovery active.")
+                    return
+
                 existing_pid = get_pid(pkg)
                 if existing_pid and existing_pid != baseline_pid:
                     ok, reason, _ = self._recovery_process_is_real(
@@ -448,11 +481,7 @@ def stop_recovery_manager():
     _manager.stop()
 
 def trigger_recovery(pkg):
-    threading.Thread(
-        target=_manager.single_recovery_worker,
-        args=(pkg,),
-        daemon=True
-    ).start()
+    return _manager.request_single_recovery(pkg)
 
 def is_global_recovery():
     return _manager.watchdog_paused()

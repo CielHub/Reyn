@@ -32,6 +32,7 @@ def load_config(config_path="config.conf"):
         "PRIVATE_SERVER_LINK": "",
         "GLOBAL_PLACE_ID": "",
         "TIMEOUT_SECONDS": 45,
+        "RECOVERY_DELAY_SECONDS": 30,
         "DELAY_SECONDS": 3,
         "MAX_RETRIES": 3,
         "COOLDOWN_SECONDS": 300,
@@ -61,7 +62,7 @@ def load_config(config_path="config.conf"):
                 
                 if key in ["PRIVATE_SERVER_LINK", "GLOBAL_PLACE_ID"]:
                     config[key] = val
-                elif key in ["TIMEOUT_SECONDS", "DELAY_SECONDS", "MAX_RETRIES", "COOLDOWN_SECONDS", 
+                elif key in ["TIMEOUT_SECONDS", "RECOVERY_DELAY_SECONDS", "DELAY_SECONDS", "MAX_RETRIES", "COOLDOWN_SECONDS", 
                              "GRID_ENABLED", "GRID_COLS", "GRID_CELL_W", "GRID_CELL_H", 
                              "GRID_MARGIN", "GRID_OFFSET_Y", "CLEAR_CACHE_MINUTES"]:
                     try: 

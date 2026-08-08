@@ -399,8 +399,9 @@ class RecoveryManager:
     def single_recovery_worker(self, pkg):
         """Single-package tiered recovery with package-isolated diagnostics."""
         try:
-            log.info(f"[SINGLE] Crash detected for {pkg}. Waiting 15 seconds...")
-            time.sleep(15)
+            recovery_delay = max(30, int(self.config_data.get("RECOVERY_DELAY_SECONDS", 30)))
+            log.info(f"[SINGLE] Crash detected for {pkg}. Waiting {recovery_delay} seconds...")
+            time.sleep(recovery_delay)
 
             baseline_pid = self.recovery_baseline_pids.get(pkg, '')
             log.info(f"[RECOVERY] TARGET={pkg} BASELINE_PID={baseline_pid or '-'}")

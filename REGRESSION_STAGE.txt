@@ -1,27 +1,25 @@
-CARRERA-HUB REGRESSION STAGE 4R2
+CARRERA-HUB REGRESSION STAGE 4R3
 ================================
-Name: Package-Isolated Recovery Diagnostics + Strict Failure State
+Name: Recovery Delay Hardening (30s Minimum)
 
 Baseline: Stage 3B - Startup Full Terminal Reset
-Parent experiment: Stage 4R1
+Parent experiment: Stage 4R2
 
 Changes:
-- Recovery verification is isolated to the exact target package.
-- The pre-recovery PID is captured and cannot be reused as recovery success.
-- The crashed target gets a short package-local PID-release window.
-- If the old PID remains, recovery skips straight to the hard-stop tier.
-- Strong Android UI/activity signals are required for that same package.
-- Recovery logs package, baseline PID and resolved intent for diagnosis.
-- `am start` return code/output is captured instead of being discarded.
-- A live PID alone can never promote FAILED/LOGIN FAILED/CAPTCHA to ONLINE.
+- Preserves all Stage 4R2 package-isolated recovery behavior.
+- Adds configurable `RECOVERY_DELAY_SECONDS`, defaulting to 30 seconds.
+- Enforces a hard minimum of 30 seconds even if configuration is lower.
+- Single-package recovery waits the full delay after crash/force-close detection before starting recovery tiers.
+- The existing package-local PID-release check remains after the delay.
+- Global recovery delay behavior is unchanged.
 - Dashboard rendering and the one-time startup full terminal reset are unchanged.
 
 Test focus:
-1. Force-close clienu while clienv remains healthy.
-2. Force-close clienv while clienu remains healthy.
-3. Reverse the order.
-4. Repeat with 5-7 packages.
-5. Verify a failed target remains RECOVER/FAILED and never becomes Farming.
-6. Compare per-package recovery logs if a target fails.
+1. Confirm a single-package force close waits at least 30 seconds before recovery launch.
+2. Force-close clienu while clienv remains healthy.
+3. Force-close clienv while clienu remains healthy.
+4. Force-close both packages and confirm each respects its own 30-second delay.
+5. Repeat with 5-7 packages and confirm no recovery stampede.
+6. Verify a failed target remains RECOVER/FAILED and never becomes Farming.
 
 This stage is experimental and is NOT the baseline until user testing passes.

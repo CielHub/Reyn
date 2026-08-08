@@ -51,3 +51,10 @@ Test focus:
 
 Status:
 Experimental. NOT baseline until user testing passes.
+
+
+STAGE 4R4-AUTO-CLEAR-UI
+- Auto-clear terminal at main.py startup.
+- Clear terminal at menu-selection boundaries and menu entry.
+- show_transition clears before/after transitions.
+- No changes to recovery, monitoring, launcher, resolver, or state-machine logic.

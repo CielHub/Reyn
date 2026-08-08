@@ -10,6 +10,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(SCRIPT_DIR)
 
 from core.logger import log
+from core.ui import clear_screen
 from core.menu import show_main_menu
 
 def ensure_root():
@@ -36,7 +37,16 @@ def ensure_root():
 def main():
     """Fungsi Orkestrasi Utama."""
     os.chdir(SCRIPT_DIR)
+
+    # Always start from a clean terminal before doing any startup work.
+    # The root-relaunched child process will clear again, so no parent output
+    # can leak into the interactive UI.
+    clear_screen()
     ensure_root()
+
+    # Clear once more after privilege escalation so the actual interactive
+    # process starts with a completely clean screen.
+    clear_screen()
     
     log.info("STARTUP: Menginisialisasi CARRERA-HUB Menu Utama...")
     

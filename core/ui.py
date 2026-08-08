@@ -90,8 +90,24 @@ def safe_console_input(text):
         _restore_sigwinch_handler(old)
 # ---------------------------------------------
 
+def clear_screen():
+    """Clear the visible terminal screen for menu/UI transitions.
+
+    This is intentionally a visual clear only. It does not reinitialize the
+    terminal like ``full_terminal_reset()`` and must never be used by the
+    dashboard resize path or recovery logic.
+    """
+    command = 'clear' if os.name == 'posix' else 'cls'
+    os.system(command)
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def reset_terminal():
-    os.system('clear' if os.name == 'posix' else 'cls')
+    """Backward-compatible alias for the menu/UI clear operation."""
+    clear_screen()
 
 def full_terminal_reset():
     """Perform a full terminal reset once before the monitoring dashboard starts."""
@@ -135,9 +151,13 @@ def draw_header(subtitle="MENU"):
     console.print("[dim cyan]" + "─" * line_width + "[/]")
 
 def show_transition(message="Loading..."):
+    # Clear before the transition so the previous menu cannot remain visible
+    # while the next menu is being selected. Clear again after the spinner so
+    # the destination screen always starts from a clean frame.
+    clear_screen()
     with console.status(f"[dim cyan]{message}[/]", spinner="dots"):
-        time.sleep(0.4) 
-    reset_terminal()
+        time.sleep(0.4)
+    clear_screen()
 
 def draw_footer(text="CTRL+C  Dashboard    CTRL+Z  Exit"):
     console.print(f"\n[dim white]{text}[/]")

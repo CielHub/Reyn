@@ -24,7 +24,7 @@ from core.monitor import (
     get_dashboard_terminal_size,
 )
 from core.ui import (
-    console, reset_terminal, full_terminal_reset, draw_header, show_transition,
+    console, clear_screen, reset_terminal, full_terminal_reset, draw_header, show_transition,
     draw_footer, safe_prompt_ask, safe_console_input,
     start_dashboard_resize_watcher, stop_dashboard_resize_watcher,
 )
@@ -42,6 +42,7 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 def show_auto_login_menu():
+    clear_screen()
     while True:
         reset_terminal()
         draw_header("AUTO LOGIN ROBLOX")
@@ -116,6 +117,7 @@ def resolve_join_intent(config_data, pkg):
 
 
 def show_map_manager(config_data):
+    clear_screen()
     all_packages = get_roblox_packages()
     if not all_packages:
         console.print("\n[bold red][!] Tidak ada package Roblox terdeteksi.[/]")
@@ -177,6 +179,7 @@ def show_map_manager(config_data):
 
 
 def show_link_manager(config_data):
+    clear_screen()
     all_packages = get_roblox_packages()
     if not all_packages:
         console.print("\n[bold red][!] Tidak ada package Roblox terdeteksi.[/]")
@@ -231,7 +234,7 @@ def show_link_manager(config_data):
                 time.sleep(1)
 
 def run_auto_rejoiner():
-    reset_terminal()
+    clear_screen()
     draw_header("INITIALIZING AUTO REJOINER")
     
     config_data = load_config("config.conf")
@@ -410,6 +413,7 @@ def run_auto_rejoiner():
     start_monitoring(packages, intent_dict, timeout_seconds, max_retries, cooldown_secs, stats, config_data)
 
 def show_settings():
+    clear_screen()
     config_data = load_config("config.conf")
     
     while True:
@@ -559,6 +563,7 @@ def run_updater():
         time.sleep(1)
 
 def show_main_menu():
+    clear_screen()
     while True:
         reset_terminal()
         draw_header("MENU UTAMA")
@@ -586,6 +591,11 @@ def show_main_menu():
         # BUG FIX: Deteksi event resize, ulangi loop untuk render ulang layar
         if choice == "RESIZE_EVENT": 
             continue
+
+        # A menu selection is a UI boundary: remove the previous menu before
+        # entering the selected screen. The destination menu may clear again
+        # on entry; that is intentional and keeps every screen self-contained.
+        clear_screen()
         
         if choice == '1':
             show_transition("Starting Engine...")

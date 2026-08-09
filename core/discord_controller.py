@@ -1,8 +1,7 @@
-"""CARRERA-HUB D3R1: integrated Discord Controller settings/runtime.
+"""CARRERA-HUB D3R2: integrated Discord monitoring panel.
 
-The Discord bot is optional. It runs only on the designated Controller Device,
-reads the local D2-L controller status, and exposes the read-only /status
-command. It never controls Roblox or the recovery engine in D3R1.
+D3R2 is read-only.  It adds an interactive Discord control panel on top of
+D3R1's local Controller Hub.  No Roblox/recovery command is exposed yet.
 """
 import asyncio
 import json
@@ -39,7 +38,6 @@ def validate_guild_id(value):
 
 
 def test_discord_token(token, timeout=8):
-    """Validate a bot token without logging or returning the token."""
     token = str(token or "").strip()
     if not token:
         return False, "Bot token kosong."
@@ -48,7 +46,7 @@ def test_discord_token(token, timeout=8):
         headers={
             "Accept": "application/json",
             "Authorization": f"Bot {token}",
-            "User-Agent": "CARRERA-HUB-D3R1/1",
+            "User-Agent": "CARRERA-HUB-D3R2/1",
         },
         method="GET",
     )
@@ -74,7 +72,7 @@ def _fetch_status(base_url, token, timeout=8):
         headers={
             "Accept": "application/json",
             "Authorization": f"Bearer {token}",
-            "User-Agent": "CARRERA-HUB-D3R1/1",
+            "User-Agent": "CARRERA-HUB-D3R2/1",
         },
         method="GET",
     )
@@ -100,7 +98,7 @@ def test_controller_connection(config_data):
         return False, f"Controller tidak dapat dihubungi: {str(exc)[:120]}"
 
 
-def _status_embed(data):
+def _status_embed(data, title="🌐 CARRERA-HUB GLOBAL STATUS"):
     if discord is None:
         return None
     online = int(data.get("devices_online", 0) or 0)
@@ -108,8 +106,11 @@ def _status_embed(data):
     accounts_online = int(data.get("accounts_online", 0) or 0)
     accounts_total = int(data.get("accounts_total", 0) or 0)
     embed = discord.Embed(
-        title="🌐 CARRERA-HUB GLOBAL STATUS",
-        description=f"🟢 **{online}** online  •  🔴 **{offline}** offline\n👤 Active Accounts: **{accounts_online}/{accounts_total}**",
+        title=title,
+        description=(
+            f"🟢 **{online}** online  •  🔴 **{offline}** offline\n"
+            f"👤 Active Accounts: **{accounts_online}/{accounts_total}**"
+        ),
     )
     devices = data.get("devices", []) or []
     if devices:
@@ -133,8 +134,145 @@ def _status_embed(data):
     return embed
 
 
+def _device_embed(device):
+    if discord is None:
+        return None
+    name = str(device.get("device_name") or device.get("device_id") or "Unknown")
+    status = str(device.get("status", "OFFLINE")).upper()
+    icon = "🟢" if status == "ONLINE" else "🔴"
+    active = int(device.get("accounts_online", 0) or 0)
+    total = int(device.get("accounts_total", 0) or 0)
+    age = device.get("age_seconds")
+    age_text = f"{int(age)}s ago" if age is not None else "never"
+    embed = discord.Embed(title=f"📱 {name}")
+    embed.add_field(name="Status", value=f"{icon} **{status}**", inline=True)
+    embed.add_field(name="Accounts", value=f"**{active}/{total}** active", inline=True)
+    embed.add_field(name="Heartbeat", value=age_text, inline=True)
+    uptime = int(device.get("uptime_seconds", 0) or 0)
+    embed.add_field(name="Uptime", value=_format_uptime(uptime), inline=True)
+    platform = str(device.get("platform") or "unknown")
+    embed.add_field(name="Platform", value=platform, inline=True)
+    accounts = device.get("accounts", []) or []
+    if accounts:
+        lines = []
+        for account in accounts[:25]:
+            pkg = str(account.get("package") or account.get("pkg") or "unknown")
+            state = str(account.get("status") or "UNKNOWN").upper()
+            pid = account.get("pid")
+            pid_text = str(pid) if pid not in (None, "", "-") else "-"
+            icon2 = "🟢" if state in {"FARMING", "ONLINE", "RUNNING"} else ("🟡" if state in {"LOADING", "RECOVERY", "RECOVER"} else "🔴")
+            lines.append(f"{icon2} `{pkg}` • `{state}` • PID `{pid_text}`")
+        if len(accounts) > 25:
+            lines.append(f"… +{len(accounts) - 25} more")
+        embed.add_field(name="Accounts", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="Accounts", value="No account data.", inline=False)
+    return embed
+
+
+def _format_uptime(seconds):
+    seconds = max(0, int(seconds or 0))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    if days:
+        return f"{days}d {hours:02d}h {minutes:02d}m"
+    return f"{hours:02d}h {minutes:02d}m {seconds:02d}s"
+
+
+class _PanelView(discord.ui.View if discord else object):
+    def __init__(self, controller, timeout=1800):
+        if discord:
+            super().__init__(timeout=timeout)
+        self.controller = controller
+
+    async def _status(self, interaction):
+        try:
+            data = await asyncio.to_thread(self.controller.fetch_status)
+            await interaction.response.edit_message(embed=_status_embed(data), view=_PanelView(self.controller))
+        except Exception as exc:
+            await interaction.response.send_message(f"❌ Controller status tidak tersedia: `{str(exc)[:180]}`", ephemeral=True)
+
+    if discord:
+        @discord.ui.button(label="Status", emoji="📊", style=discord.ButtonStyle.primary, custom_id="carrera:panel:status")
+        async def status(self, interaction, button):
+            await self._status(interaction)
+
+        @discord.ui.button(label="Devices", emoji="📱", style=discord.ButtonStyle.secondary, custom_id="carrera:panel:devices")
+        async def devices(self, interaction, button):
+            try:
+                data = await asyncio.to_thread(self.controller.fetch_status)
+                view = _DeviceSelectView(self.controller, data.get("devices", []) or [])
+                await interaction.response.send_message(embed=_status_embed(data, "📱 CARRERA-HUB DEVICES"), view=view, ephemeral=True)
+            except Exception as exc:
+                await interaction.response.send_message(f"❌ Gagal membaca devices: `{str(exc)[:180]}`", ephemeral=True)
+
+        @discord.ui.button(label="Issues", emoji="⚠️", style=discord.ButtonStyle.secondary, custom_id="carrera:panel:issues")
+        async def issues(self, interaction, button):
+            try:
+                data = await asyncio.to_thread(self.controller.fetch_status)
+                devices = data.get("devices", []) or []
+                issues = []
+                for device in devices:
+                    name = str(device.get("device_name") or device.get("device_id") or "Unknown")
+                    status = str(device.get("status", "OFFLINE")).upper()
+                    if status != "ONLINE":
+                        issues.append(f"🔴 **{name}** is **{status}**")
+                    for account in device.get("accounts", []) or []:
+                        state = str(account.get("status") or "UNKNOWN").upper()
+                        if state in {"OFFLINE", "FAILED", "ERROR", "RECOVERY", "RECOVER"}:
+                            pkg = str(account.get("package") or account.get("pkg") or "unknown")
+                            issues.append(f"🟡 **{name}** • `{pkg}` → **{state}**")
+                embed = discord.Embed(title="⚠️ CARRERA-HUB ISSUES")
+                embed.description = "\n".join(issues[:30]) if issues else "🟢 No current issues detected."
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+            except Exception as exc:
+                await interaction.response.send_message(f"❌ Gagal membaca issues: `{str(exc)[:180]}`", ephemeral=True)
+
+        @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.success, custom_id="carrera:panel:refresh")
+        async def refresh(self, interaction, button):
+            await self._status(interaction)
+
+
+class _DeviceSelect(discord.ui.Select if discord else object):
+    def __init__(self, controller, devices):
+        self.controller = controller
+        options = []
+        for device in devices[:25]:
+            device_id = str(device.get("device_id") or "")
+            name = str(device.get("device_name") or device_id or "Unknown")
+            status = str(device.get("status", "OFFLINE")).upper()
+            active = int(device.get("accounts_online", 0) or 0)
+            total = int(device.get("accounts_total", 0) or 0)
+            options.append(discord.SelectOption(label=name[:100], value=device_id[:100], description=f"{status} • {active}/{total} active"[:100]))
+        if not options:
+            options = [discord.SelectOption(label="No devices", value="__none__", description="No registered devices")]
+        super().__init__(placeholder="Pilih device...", min_values=1, max_values=1, options=options, custom_id="carrera:devices:select")
+
+    async def callback(self, interaction):
+        device_id = self.values[0]
+        if device_id == "__none__":
+            await interaction.response.send_message("Tidak ada device terdaftar.", ephemeral=True)
+            return
+        try:
+            data = await asyncio.to_thread(self.controller.fetch_status)
+            device = next((d for d in data.get("devices", []) if str(d.get("device_id")) == device_id), None)
+            if not device:
+                await interaction.response.send_message("❌ Device sudah tidak tersedia.", ephemeral=True)
+                return
+            await interaction.response.send_message(embed=_device_embed(device), ephemeral=True)
+        except Exception as exc:
+            await interaction.response.send_message(f"❌ Gagal membaca device: `{str(exc)[:180]}`", ephemeral=True)
+
+
+class _DeviceSelectView(discord.ui.View if discord else object):
+    def __init__(self, controller, devices, timeout=300):
+        super().__init__(timeout=timeout)
+        self.add_item(_DeviceSelect(controller, devices))
+
+
 class DiscordController:
-    """Optional read-only Discord bot runtime for the Controller Device."""
+    """Optional read-only Discord monitoring bot for the Controller Device."""
 
     def __init__(self, config_data):
         self.config = config_data
@@ -148,9 +286,12 @@ class DiscordController:
         self._loop = None
         self._bot = None
 
+    def fetch_status(self):
+        return _fetch_status(self.controller_url, self.status_token, self.timeout)
+
     def start(self):
         if not self.enabled:
-            log.info("DISCORD: D3R1 disabled (DISCORD_BOT_ENABLED=0).")
+            log.info("DISCORD: D3R2 disabled (DISCORD_BOT_ENABLED=0).")
             return False
         if discord is None or commands is None:
             log.warning("DISCORD: discord.py belum terpasang; bot tidak dijalankan.")
@@ -164,6 +305,7 @@ class DiscordController:
         intents = discord.Intents.none()
         bot = commands.Bot(command_prefix="!", intents=intents)
         self._bot = bot
+        controller = self
 
         @bot.event
         async def on_ready():
@@ -174,7 +316,7 @@ class DiscordController:
                     await bot.tree.sync(guild=guild)
                 else:
                     await bot.tree.sync()
-                log.info("DISCORD: Bot online dan /status siap digunakan.")
+                log.info("DISCORD: Bot online dan /status + /panel siap digunakan.")
             except Exception as exc:
                 log.warning(f"DISCORD: Gagal sync slash command: {str(exc)[:120]}")
 
@@ -182,11 +324,19 @@ class DiscordController:
         async def status_command(interaction):
             await interaction.response.defer(ephemeral=False)
             try:
-                data = await asyncio.to_thread(_fetch_status, self.controller_url, self.status_token, self.timeout)
-                embed = _status_embed(data)
-                await interaction.followup.send(embed=embed)
+                data = await asyncio.to_thread(controller.fetch_status)
+                await interaction.followup.send(embed=_status_embed(data))
             except Exception as exc:
                 await interaction.followup.send(f"❌ Controller status tidak tersedia: `{str(exc)[:180]}`")
+
+        @bot.tree.command(name="panel", description="Buka panel monitoring CARRERA-HUB.")
+        async def panel_command(interaction):
+            await interaction.response.defer(ephemeral=False)
+            try:
+                data = await asyncio.to_thread(controller.fetch_status)
+                await interaction.followup.send(embed=_status_embed(data, "🎛️ CARRERA-HUB CONTROL PANEL"), view=_PanelView(controller))
+            except Exception as exc:
+                await interaction.followup.send(f"❌ Panel tidak dapat memuat status: `{str(exc)[:180]}`")
 
         def runner():
             self._loop = asyncio.new_event_loop()

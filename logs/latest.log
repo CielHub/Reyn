@@ -1,7 +1,0 @@
-[2026-08-08 22:42:15] [INFO] DEVICE: Identity baru dibuat: device-2a13ba6f062d
-[2026-08-08 22:42:15] [INFO] CONTROLLER: D2-L aktif di 127.0.0.1:18876.
-[2026-08-08 22:42:16] [INFO] CONTROLLER: "POST /api/v1/devices/register HTTP/1.1" 200 -
-[2026-08-08 22:42:16] [INFO] CONTROLLER: "POST /api/v1/devices/heartbeat HTTP/1.1" 200 -
-[2026-08-08 22:42:16] [INFO] CONTROLLER: "GET /api/v1/controller/status HTTP/1.1" 200 -
-[2026-08-08 22:42:16] [INFO] CONTROLLER: "GET /api/v1/controller/status HTTP/1.1" 401 -
-[2026-08-08 23:13:54] [INFO] CONFIG: Konfigurasi berhasil dimuat dengan aman.

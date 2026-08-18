@@ -225,12 +225,28 @@ class RecoveryManager:
             time.sleep(0.1)
 
     def launch_all_packages(self):
-        for pkg in self.packages:
+        delay_seconds = self.config_data.get("DELAY_SECONDS", 3)
+        total = len(self.packages)
+
+        for idx, pkg in enumerate(self.packages, 1):
             self.launch_single_package(pkg)
+
+            # Beri jeda sebelum package berikutnya dimulai, kecuali ini yang
+            # terakhir. Tanpa ini semua package langsung nyala berbarengan
+            # (hanya diserialisasi oleh waktu Smart Wait), yang berat untuk
+            # sistem saat GLOBAL recovery menyalakan banyak package sekaligus.
+            if idx < total and delay_seconds > 0:
+                self.global_status = "LAUNCH_DELAY"
+                for sec in range(delay_seconds, 0, -1):
+                    self.global_countdown = sec
+                    log.info(f"[GLOBAL] Delay Package: {sec}s sebelum meluncurkan package berikutnya...")
+                    time.sleep(1)
+                self.global_status = None
+                self.global_countdown = 0
 
     def launch_single_package(self, pkg):
         try:
-            log.info(f"LAUNCH: Memulai {pkg} tanpa delay tambahan...")
+            log.info(f"LAUNCH: Memulai {pkg}...")
             clean_package_cache(pkg)
             self.stats[pkg]['status'] = 'LOADING'
             

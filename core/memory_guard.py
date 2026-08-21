@@ -120,4 +120,13 @@ def get_memory_event():
         return _memory_event_queue.get_nowait()
     except queue.Empty:
         return None
+
+def drain_memory_events():
+    """Buang sisa memory-event yang masih menumpuk di queue (lihat
+    drain_events() di error_detector.py untuk alasan yang sama)."""
+    while True:
+        try:
+            _memory_event_queue.get_nowait()
+        except queue.Empty:
+            break
       

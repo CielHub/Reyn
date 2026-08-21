@@ -151,4 +151,20 @@ def get_event():
         return _event_queue.get_nowait()
     except queue.Empty:
         return None
+
+def drain_events():
+    """Buang semua event yang masih menumpuk di queue.
+
+    Dipakai sesaat setelah GLOBAL recovery mulai: event lain yang sudah
+    ada di queue pada saat itu berasal dari insiden yang sama (mis. WiFi
+    putus kena ke banyak package sekaligus) dan sudah tercakup oleh
+    siklus recovery yang baru saja dimulai. Tanpa ini, event-event lama
+    tsb diproses satu per satu setelahnya dan masing-masing memicu
+    siklus GLOBAL recovery baru secara beruntun.
+    """
+    while True:
+        try:
+            _event_queue.get_nowait()
+        except queue.Empty:
+            break
         

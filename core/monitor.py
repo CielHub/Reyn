@@ -112,7 +112,7 @@ def draw_dashboard(stats, current_time, pkg_count, include_header=True):
             renderables.extend([header_render, rule])
 
     running = sum(1 for s in stats.values() if s['status'] == 'ONLINE')
-    recover = sum(1 for s in stats.values() if s['status'] in ['RECOVERY', 'LOGIN', 'LOADING'])
+    recover = sum(1 for s in stats.values() if s['status'] in ['RECOVERY', 'LOGIN', 'LOADING', 'CACHE CLEAN'])
     offline = sum(1 for s in stats.values() if s['status'] in ['FAILED', 'COOLDOWN', 'LOGIN FAILED', 'CAPTCHA'])
     
     summary_text = f"Clones {running}/{pkg_count}   |   [bold yellow]● Recover {recover}[/]   |   [bold red]● Offline {offline}[/]"
@@ -145,6 +145,7 @@ def draw_dashboard(stats, current_time, pkg_count, include_header=True):
         elif s['status'] == 'LOGIN': stat_fmt = "[bold magenta]● Login[/]"
         elif s['status'] == 'LOGIN FAILED': stat_fmt = "[bold red]● Log Fail[/]"
         elif s['status'] == 'CAPTCHA': stat_fmt = "[bold red]● Captcha[/]"
+        elif s['status'] == 'CACHE CLEAN': stat_fmt = "[bold cyan]● ClrCache[/]"
         else: stat_fmt = f"[white]● {s['status'][:8]}[/]"
             
         table.add_row(
@@ -210,7 +211,7 @@ def start_monitoring(packages, intent_url, timeout_seconds, max_retries, cooldow
                             continue
 
                         for pkg in packages:
-                            if stats[pkg]['status'] in ['RECOVERY', 'LOGIN', 'LOADING', 'CAPTCHA']:
+                            if stats[pkg]['status'] in ['RECOVERY', 'LOGIN', 'LOADING', 'CAPTCHA', 'CACHE CLEAN']:
                                 continue
                                 
                             if stats[pkg]['cooldown_until'] > current_time:

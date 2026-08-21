@@ -12,9 +12,9 @@ import time
 import subprocess
 from enum import Enum
 
-from core.error_detector import has_event, get_event
-from core.memory_guard import has_memory_event, get_memory_event, reset_memory_guard
-from core.process_manager import graceful_kill, get_pid, hard_force_stop
+from core.error_detector import has_event, get_event, drain_events
+from core.memory_guard import has_memory_event, get_memory_event, reset_memory_guard, drain_memory_events
+from core.process_manager import graceful_kill, get_pid, hard_force_stop, wait_until_process_dead
 from core.cache_cleaner import clean_package_cache
 from core.launcher import launch_and_wait
 from core.logger import log
@@ -43,6 +43,10 @@ class RecoveryManager:
         
         self.global_status = None
         self.global_countdown = 0
+
+        # Jadwal Auto Clear Cache (independen dari recovery, lihat CLEAR_CACHE_MINUTES)
+        self._next_cache_clean_at = None
+        self._last_cache_interval = None
         
         # Lock untuk memastikan anti duplicate recovery
         self.recovery_lock = threading.Lock()
@@ -147,7 +151,13 @@ class RecoveryManager:
 
                 try:
                     self.enter_global_recovery()
-                    
+
+                    # Buang event lain yang sudah menumpuk (dari insiden yang
+                    # sama) supaya tidak memicu siklus GLOBAL recovery
+                    # berulang setelah yang ini selesai.
+                    drain_memory_events()
+                    drain_events()
+
                     avail = event['available_mb']
                     thresh = self.config_data.get("MEMORY_THRESHOLD_MB", 200)
                     is_emerg = event.get('is_emergency', False)
@@ -201,7 +211,13 @@ class RecoveryManager:
 
                     try:
                         self.enter_global_recovery()
-                        
+
+                        # Buang event lain yang sudah menumpuk (dari insiden
+                        # yang sama) supaya tidak memicu siklus GLOBAL
+                        # recovery berulang setelah yang ini selesai.
+                        drain_events()
+                        drain_memory_events()
+
                         log.info(f"[ERROR{reason}] Detected on PID {event.get('pid')}. Initiating Global Recovery.")
                         log.info(f"[GLOBAL] Killing {len(self.packages)} Packages...")
                         self.kill_all_packages()
@@ -222,7 +238,69 @@ class RecoveryManager:
                         self.exit_global_recovery()
                         self.recovery_lock.release()
 
+            # ==================================================
+            # 3. SCHEDULED: AUTO CLEAR CACHE (CLEAR_CACHE_MINUTES)
+            # ==================================================
+            interval_minutes = self.config_data.get("CLEAR_CACHE_MINUTES", 30)
+
+            if interval_minutes <= 0:
+                self._next_cache_clean_at = None
+                self._last_cache_interval = interval_minutes
+            elif (self._next_cache_clean_at is None
+                    or self._last_cache_interval != interval_minutes):
+                # Baru diaktifkan, baru start, atau intervalnya baru diubah
+                # lewat menu Settings -> jadwalkan ulang dari sekarang.
+                self._next_cache_clean_at = time.time() + (interval_minutes * 60)
+                self._last_cache_interval = interval_minutes
+            elif time.time() >= self._next_cache_clean_at and not self.is_global_recovery():
+                self._run_scheduled_cache_clean()
+                self._next_cache_clean_at = time.time() + (interval_minutes * 60)
+
             time.sleep(0.1)
+
+    def _run_scheduled_cache_clean(self):
+        """Bersihkan cache tiap package secara bergiliran di luar jalur recovery.
+
+        Dipicu berdasarkan waktu (CLEAR_CACHE_MINUTES di Settings), bukan
+        oleh crash/error. Package tetap diberhentikan dulu sebelum cache-nya
+        dibersihkan (persyaratan clean_package_cache), lalu langsung
+        diluncurkan lagi -- satu package per satu, dikasih jeda DELAY_SECONDS
+        di antaranya, supaya tidak sama seperti kill_all_packages yang
+        mematikan semuanya sekaligus. Package yang statusnya lagi bukan
+        ONLINE (LOADING/LOGIN/RECOVERY/dll) dilewati di giliran ini karena
+        kemungkinan sedang ditangani oleh proses recovery lain.
+        """
+        total = len(self.packages)
+        delay_seconds = self.config_data.get("DELAY_SECONDS", 3)
+
+        log.info("[CACHE] Jadwal Auto Clear Cache dimulai...")
+
+        for idx, pkg in enumerate(self.packages, 1):
+            if self.is_global_recovery():
+                log.info("[CACHE] GLOBAL recovery aktif, jadwal Auto Clear Cache dihentikan sementara.")
+                break
+
+            if self.stats.get(pkg, {}).get('status') != 'ONLINE':
+                log.info(f"[CACHE] Lewati {pkg} (bukan status ONLINE saat ini).")
+                continue
+
+            log.info(f"[CACHE] Membersihkan cache {pkg}...")
+            self.stats[pkg]['status'] = 'CACHE CLEAN'
+
+            pid = self.stats[pkg].get('pid')
+            if pid and pid != '-':
+                graceful_kill(pid, pkg)
+                wait_until_process_dead(pid, timeout=10)
+
+            self.stats[pkg]['pid'] = '-'
+            self.tracked_pids[pkg] = ''
+
+            self.launch_single_package(pkg)
+
+            if idx < total and delay_seconds > 0:
+                time.sleep(delay_seconds)
+
+        log.info("[CACHE] Jadwal Auto Clear Cache selesai.")
 
     def launch_all_packages(self):
         delay_seconds = self.config_data.get("DELAY_SECONDS", 3)

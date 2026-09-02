@@ -27,6 +27,18 @@ def get_pid_quick(pkg_name):
 
 def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=False):
     """
+    FIX (Lobby-trigger tidak sampai ke app): `am start` di bawah SELALU
+    memakai `--activity-single-top`. Tanpa flag ini, kalau activity package
+    kebetulan SUDAH di posisi paling atas (mis. package masih di tengah
+    game saat di-trigger balik ke Lobby), Android hanya membalas "brought
+    to the front" TANPA pernah mengirim intent-nya ke app (onNewIntent()
+    tidak terpanggil) -- akibatnya Roblox tidak pernah tahu ada perintah
+    `roblox://` baru dan tetap diam di layar lama, padahal verify_join()
+    (cuma cek proses hidup + foreground) tetap melaporkan sukses (false
+    positive). Dengan flag ini, intent TETAP dikirim lewat onNewIntent()
+    walau activity sudah di atas, sekaligus tidak mengubah perilaku kalau
+    activity BELUM di atas (start normal seperti biasa).
+
     require_join_signal (LIFECYCLE REVISION, default False -- PERILAKU LAMA
     TIDAK BERUBAH untuk semua pemanggil existing yang tidak mengisi argumen
     ini: core/menu.py, core/tester.py, core/recovery_manager.py, dan
@@ -78,7 +90,17 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     start_time_str = datetime.datetime.now().strftime('%m-%d %H:%M:%S.000')
     
     launch_result = subprocess.run(
-        ['am', 'start', '-p', pkg_name, '-a', 'android.intent.action.VIEW', '-d', intent_url],
+        # --activity-single-top: WAJIB supaya intent ini TETAP dikirim ke
+        # activity yang sudah berjalan lewat onNewIntent() walau activity
+        # tsb kebetulan sudah di posisi paling atas/foreground (skenario
+        # persis "trigger balik ke Lobby" pada package yang masih hidup di
+        # tengah game -- tanpa flag ini, Android hanya membalas "brought to
+        # the front" TANPA benar-benar mengirim data intent-nya ke app,
+        # sehingga Roblox tidak pernah tahu ada perintah roblox:// baru dan
+        # tetap diam di layar game lama walau proses/foreground check kita
+        # tetap lolos/false-positive).
+        ['am', 'start', '--activity-single-top', '-p', pkg_name,
+         '-a', 'android.intent.action.VIEW', '-d', intent_url],
         capture_output=True,
         text=True,
         errors='replace',

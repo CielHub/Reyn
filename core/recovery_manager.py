@@ -1,0 +1,556 @@
+"""
+Modul : recovery_manager.py
+Tanggung Jawab:
+- Mengatur keseluruhan alur recovery Error267 dan Low Memory (GLOBAL MODE).
+- Mengatur alur Crash Biasa (SINGLE MODE).
+- Mengeksekusi kill pada target dan melakukan peluncuran ulang.
+- Pause Watchdog saat Global Recovery aktif.
+"""
+
+import threading
+import time
+import subprocess
+from enum import Enum
+
+from core.error_detector import has_event, get_event, drain_events
+from core.memory_guard import has_memory_event, get_memory_event, reset_memory_guard, drain_memory_events
+from core.process_manager import graceful_kill, get_pid, hard_force_stop, wait_until_process_dead
+from core.cache_cleaner import clean_package_cache
+from core.launcher import launch_and_wait
+from core.logger import log
+from core.recovery_verifier import verify_recovery
+
+class RecoveryMode(Enum):
+    SINGLE = 0
+    GLOBAL = 1
+
+class RecoveryManager:
+
+    def __init__(self):
+        self._running = False
+        self._thread = None
+        
+        self.packages = []
+        self.stats = {}
+        self.tracked_pids = {}
+        self.recovery_baseline_pids = {}
+        self.intent_url = None
+        self.timeout_seconds = 60
+        self.config_data = {}
+        
+        self.recovery_mode = RecoveryMode.SINGLE
+        self.global_recovery = False
+        
+        self.global_status = None
+        self.global_countdown = 0
+
+        # Jadwal Auto Clear Cache (independen dari recovery, lihat CLEAR_CACHE_MINUTES)
+        self._next_cache_clean_at = None
+        self._last_cache_interval = None
+        
+        # Lock untuk memastikan anti duplicate recovery
+        self.recovery_lock = threading.Lock()
+
+    def configure(self, packages, stats, tracked_pids, intent_url, timeout_seconds, config_data):
+        self.packages = packages
+        self.stats = stats
+        self.tracked_pids = tracked_pids
+        self.recovery_baseline_pids = {pkg: tracked_pids.get(pkg, "") for pkg in packages}
+        self.intent_url = intent_url
+        self.timeout_seconds = timeout_seconds
+        self.config_data = config_data if config_data else {}
+
+    def start(self):
+        if self._running:
+            return
+
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._worker,
+            daemon=True,
+            name="RecoveryManager"
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def enter_global_recovery(self):
+        self.recovery_mode = RecoveryMode.GLOBAL
+        self.global_recovery = True
+
+    def exit_global_recovery(self):
+        self.recovery_mode = RecoveryMode.SINGLE
+        self.global_recovery = False
+
+    def is_global_recovery(self):
+        return self.global_recovery
+
+    def watchdog_paused(self):
+        return self.global_recovery
+
+    def kill_all_packages(self):
+        for pkg in self.packages:
+            pid = self.stats[pkg]["pid"]
+
+            if not pid or pid == "-":
+                continue
+
+            graceful_kill(pid, pkg)
+
+            self.stats[pkg]["status"] = "RECOVERY"
+            self.stats[pkg]["pid"] = "-"
+            self.tracked_pids[pkg] = ""
+
+    def wait_all_dead(self, timeout=15):
+        start = time.time()
+        while time.time() - start < timeout:
+            all_dead = True
+            for pkg in self.packages:
+                pid = self.stats[pkg]["pid"]
+                if pid and pid != "-":
+                    all_dead = False
+                    break
+            
+            if all_dead:
+                return True
+                
+            time.sleep(0.2)
+            
+        return False
+
+    def global_delay(self, delay_seconds):
+        self.global_status = "WAITING"
+        for sec in range(delay_seconds, 0, -1):
+            self.global_countdown = sec
+            time.sleep(1)
+            
+        self.global_status = None
+        self.global_countdown = 0
+
+    def get_global_state(self):
+        return self.global_status, self.global_countdown
+
+    def _worker(self):
+        while self._running:
+            
+            # ==================================================
+            # 1. EVENT: MEMORY GUARD (RAM RENDAH)
+            # ==================================================
+            while has_memory_event():
+                event = get_memory_event()
+                
+                if event is None:
+                    break
+
+                if self.is_global_recovery():
+                    continue
+
+                if not self.recovery_lock.acquire(blocking=False):
+                    continue
+
+                try:
+                    self.enter_global_recovery()
+
+                    # Buang event lain yang sudah menumpuk (dari insiden yang
+                    # sama) supaya tidak memicu siklus GLOBAL recovery
+                    # berulang setelah yang ini selesai.
+                    drain_memory_events()
+                    drain_events()
+
+                    avail = event['available_mb']
+                    thresh = self.config_data.get("MEMORY_THRESHOLD_MB", 200)
+                    is_emerg = event.get('is_emergency', False)
+                    
+                    log.info(f"[MEMORY] Available RAM : {avail}MB (Threshold : {thresh}MB)")
+                    if is_emerg:
+                        log.warning("[MEMORY] EMERGENCY LEVEL DETECTED!")
+                        
+                    log.info(f"[GLOBAL] Killing {len(self.packages)} Packages...")
+                    self.kill_all_packages()
+
+                    if not self.wait_all_dead():
+                        log.warning("[GLOBAL] Beberapa package lambat di-kill. Melanjutkan eksekusi...")
+
+                    # Delay darurat 5 detik, delay normal sesuai config
+                    delay = 5 if is_emerg else self.config_data.get("GLOBAL_RECOVERY_DELAY", 30)
+                    
+                    log.info(f"[GLOBAL] Waiting {delay} Seconds...")
+                    self.global_delay(delay)
+
+                    log.info("[GLOBAL] Launching Packages...")
+                    self.launch_all_packages()
+
+                    log.info("[GLOBAL] Recovery Completed. Resuming watchdog.")
+                finally:
+                    self.exit_global_recovery()
+                    self.recovery_lock.release()
+                    reset_memory_guard()
+
+            # ==================================================
+            # 2. EVENT: ERROR 267 DLL (IN-GAME)
+            # ==================================================
+            while has_event():
+                event = get_event()
+                
+                if event is None:
+                    break
+                
+                reason = event.get("reason")
+                
+                if reason in (266, 267, 277, 279, 280):
+                    is_enabled = self.config_data.get("GLOBAL_RECOVERY_ENABLED", True)
+                    if not is_enabled:
+                        continue
+                        
+                    if self.is_global_recovery():
+                        continue
+                        
+                    if not self.recovery_lock.acquire(blocking=False):
+                        continue
+
+                    try:
+                        self.enter_global_recovery()
+
+                        # Buang event lain yang sudah menumpuk (dari insiden
+                        # yang sama) supaya tidak memicu siklus GLOBAL
+                        # recovery berulang setelah yang ini selesai.
+                        drain_events()
+                        drain_memory_events()
+
+                        log.info(f"[ERROR{reason}] Detected on PID {event.get('pid')}. Initiating Global Recovery.")
+                        log.info(f"[GLOBAL] Killing {len(self.packages)} Packages...")
+                        self.kill_all_packages()
+                        
+                        if not self.wait_all_dead():
+                            log.warning("[GLOBAL] Beberapa package lambat di-kill. Melanjutkan eksekusi...")
+                            
+                        delay = self.config_data.get("GLOBAL_RECOVERY_DELAY", 30)
+                        
+                        log.info(f"[GLOBAL] Waiting {delay} Seconds...")
+                        self.global_delay(delay)
+                        
+                        log.info("[GLOBAL] Launching Packages...")
+                        self.launch_all_packages()
+                        
+                        log.info("[GLOBAL] Recovery Completed. Resuming watchdog.")
+                    finally:
+                        self.exit_global_recovery()
+                        self.recovery_lock.release()
+
+            # ==================================================
+            # 3. SCHEDULED: AUTO CLEAR CACHE (CLEAR_CACHE_MINUTES)
+            # ==================================================
+            interval_minutes = self.config_data.get("CLEAR_CACHE_MINUTES", 30)
+
+            if interval_minutes <= 0:
+                self._next_cache_clean_at = None
+                self._last_cache_interval = interval_minutes
+            elif (self._next_cache_clean_at is None
+                    or self._last_cache_interval != interval_minutes):
+                # Baru diaktifkan, baru start, atau intervalnya baru diubah
+                # lewat menu Settings -> jadwalkan ulang dari sekarang.
+                self._next_cache_clean_at = time.time() + (interval_minutes * 60)
+                self._last_cache_interval = interval_minutes
+            elif time.time() >= self._next_cache_clean_at and not self.is_global_recovery():
+                self._run_scheduled_cache_clean()
+                self._next_cache_clean_at = time.time() + (interval_minutes * 60)
+
+            time.sleep(0.1)
+
+    def _run_scheduled_cache_clean(self):
+        """Bersihkan cache tiap package secara bergiliran di luar jalur recovery.
+
+        Dipicu berdasarkan waktu (CLEAR_CACHE_MINUTES di Settings), bukan
+        oleh crash/error. Package tetap diberhentikan dulu sebelum cache-nya
+        dibersihkan (persyaratan clean_package_cache), lalu langsung
+        diluncurkan lagi -- satu package per satu, dikasih jeda DELAY_SECONDS
+        di antaranya, supaya tidak sama seperti kill_all_packages yang
+        mematikan semuanya sekaligus. Package yang statusnya lagi bukan
+        ONLINE (LOADING/LOGIN/RECOVERY/dll) dilewati di giliran ini karena
+        kemungkinan sedang ditangani oleh proses recovery lain.
+        """
+        total = len(self.packages)
+        delay_seconds = self.config_data.get("DELAY_SECONDS", 3)
+
+        log.info("[CACHE] Jadwal Auto Clear Cache dimulai...")
+
+        for idx, pkg in enumerate(self.packages, 1):
+            if self.is_global_recovery():
+                log.info("[CACHE] GLOBAL recovery aktif, jadwal Auto Clear Cache dihentikan sementara.")
+                break
+
+            if self.stats.get(pkg, {}).get('status') != 'ONLINE':
+                log.info(f"[CACHE] Lewati {pkg} (bukan status ONLINE saat ini).")
+                continue
+
+            log.info(f"[CACHE] Membersihkan cache {pkg}...")
+            self.stats[pkg]['status'] = 'CACHE CLEAN'
+
+            pid = self.stats[pkg].get('pid')
+            if pid and pid != '-':
+                graceful_kill(pid, pkg)
+                wait_until_process_dead(pid, timeout=10)
+
+            self.stats[pkg]['pid'] = '-'
+            self.tracked_pids[pkg] = ''
+
+            self.launch_single_package(pkg)
+
+            if idx < total and delay_seconds > 0:
+                time.sleep(delay_seconds)
+
+        log.info("[CACHE] Jadwal Auto Clear Cache selesai.")
+
+    def launch_all_packages(self):
+        delay_seconds = self.config_data.get("DELAY_SECONDS", 3)
+        total = len(self.packages)
+
+        for idx, pkg in enumerate(self.packages, 1):
+            self.launch_single_package(pkg)
+
+            # Beri jeda sebelum package berikutnya dimulai, kecuali ini yang
+            # terakhir. Tanpa ini semua package langsung nyala berbarengan
+            # (hanya diserialisasi oleh waktu Smart Wait), yang berat untuk
+            # sistem saat GLOBAL recovery menyalakan banyak package sekaligus.
+            if idx < total and delay_seconds > 0:
+                self.global_status = "LAUNCH_DELAY"
+                for sec in range(delay_seconds, 0, -1):
+                    self.global_countdown = sec
+                    log.info(f"[GLOBAL] Delay Package: {sec}s sebelum meluncurkan package berikutnya...")
+                    time.sleep(1)
+                self.global_status = None
+                self.global_countdown = 0
+
+    def launch_single_package(self, pkg):
+        try:
+            log.info(f"LAUNCH: Memulai {pkg}...")
+            clean_package_cache(pkg)
+            self.stats[pkg]['status'] = 'LOADING'
+            
+            pkg_intent = self.intent_url[pkg] if isinstance(self.intent_url, dict) else self.intent_url
+            success = launch_and_wait(pkg, pkg_intent, self.timeout_seconds)
+            
+            if not success:
+                try:
+                    from core.autologin import run as run_autologin
+                    self.stats[pkg]['status'] = 'LOGIN'
+                    
+                    login_status = run_autologin(pkg)
+                    
+                    if login_status in ["SUCCESS", "ALREADY_LOGGED_IN"]:
+                        self.stats[pkg]['status'] = 'LOADING'
+                        success = launch_and_wait(pkg, pkg_intent, self.timeout_seconds)
+                    elif login_status == "CAPTCHA":
+                        self.stats[pkg]['status'] = 'CAPTCHA'
+                        return
+                    else:
+                        self.stats[pkg]['status'] = 'LOGIN FAILED'
+                        return
+                except ImportError:
+                    pass
+
+            current_time = time.time()
+            
+            if success:
+                new_pid = get_pid(pkg)
+                self.tracked_pids[pkg] = new_pid
+                self.stats[pkg]['pid'] = new_pid if new_pid else '-'
+                self.stats[pkg]['recovery_count'] += 1
+                self.stats[pkg]['status'] = 'ONLINE'
+                self.stats[pkg]['uptime_start'] = current_time
+                self.stats[pkg]['last_recovery_time'] = current_time
+                self.stats[pkg]['consecutive_crashes'] = 0
+                
+                if self.config_data and self.config_data.get('GRID_ENABLED'):
+                    try:
+                        from core import gridlayout
+                        gridlayout.apply_grid_single(
+                            pkg, self.packages,
+                            cell_w=self.config_data.get('GRID_CELL_W') or None,
+                            cell_h=self.config_data.get('GRID_CELL_H') or None,
+                            cols=self.config_data.get('GRID_COLS') or None,
+                            margin=self.config_data.get('GRID_MARGIN', 10),
+                            offset_y=self.config_data.get('GRID_OFFSET_Y', 60),
+                        )
+                    except ImportError:
+                        pass
+            else:
+                if self.stats[pkg]['status'] not in ['LOGIN FAILED', 'CAPTCHA']:
+                    self.stats[pkg]['status'] = 'FAILED'
+        except Exception as e:
+            log.error(f"LAUNCH FATAL: {str(e)}")
+            self.stats[pkg]['status'] = 'FAILED'
+
+
+    def _recovery_process_is_real(self, pkg, stable_seconds=4.0, baseline_pid=""):
+        """Verify only the requested package after a recovery launch."""
+        return verify_recovery(
+            pkg,
+            baseline_pid=baseline_pid,
+            stable_seconds=stable_seconds,
+        )
+
+    def _commit_recovery_success(self, pkg, level, baseline_pid=""):
+        """Commit ONLINE only after package-isolated strict verification."""
+        verified, reason, new_pid = self._recovery_process_is_real(
+            pkg, baseline_pid=baseline_pid
+        )
+        if not verified:
+            log.warning(f"[RECOVERY L{level}] {pkg} strict verification failed: {reason}")
+            return False
+
+        current_time = time.time()
+        self.tracked_pids[pkg] = new_pid
+        self.stats[pkg]['pid'] = new_pid
+        self.stats[pkg]['status'] = 'ONLINE'
+        self.stats[pkg]['uptime_start'] = current_time
+        self.stats[pkg]['last_recovery_time'] = current_time
+        self.stats[pkg]['recovery_count'] += 1
+        self.stats[pkg]['consecutive_crashes'] = 0
+        self.recovery_baseline_pids[pkg] = new_pid
+        log.info(f"[RECOVERY L{level}] {pkg} recovered successfully: {reason} (PID {new_pid})")
+        return True
+
+    def _wait_for_baseline_pid_to_exit(self, pkg, baseline_pid, timeout=5.0):
+        if not baseline_pid:
+            return True
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            current = get_pid(pkg)
+            if not current or current != baseline_pid:
+                return True
+            time.sleep(0.25)
+        return False
+
+    def _launch_recovery_attempt(self, pkg, level):
+        """Run one isolated recovery tier. Returns True only after a verified launch."""
+        if level == 1:
+            # Tier 1: relaunch only. No cache cleanup and no hard reset.
+            log.info(f"[RECOVERY L1] Relaunching {pkg} without cache cleanup...")
+
+        elif level == 2:
+            # Tier 2: clean package cache, then relaunch.
+            log.info(f"[RECOVERY L2] Cleaning cache for {pkg}, then relaunching...")
+            clean_package_cache(pkg)
+
+        elif level == 3:
+            # Tier 3: hard-stop through Android package manager, clean cache, relaunch.
+            log.info(f"[RECOVERY L3] Hard-stopping {pkg} + cache cleanup before relaunch...")
+            hard_force_stop(pkg)
+            time.sleep(1)
+            clean_package_cache(pkg)
+
+        else:
+            return False
+
+        self.stats[pkg]['status'] = 'LOADING'
+        pkg_intent = self.intent_url[pkg] if isinstance(self.intent_url, dict) else self.intent_url
+        baseline_pid = self.recovery_baseline_pids.get(pkg, '')
+        log.info(f"[RECOVERY L{level}] TARGET={pkg} BASELINE_PID={baseline_pid or '-'} INTENT={pkg_intent}")
+        if not pkg_intent:
+            log.error(f"[RECOVERY L{level}] {pkg} has no valid Intent URL.")
+            return False
+
+        success = launch_and_wait(pkg, pkg_intent, self.timeout_seconds)
+
+        # Preserve the existing auto-login fallback, but keep it inside the
+        # current tier so a failed attempt can advance to the next tier.
+        if not success:
+            try:
+                from core.autologin import run as run_autologin
+                self.stats[pkg]['status'] = 'LOGIN'
+                login_status = run_autologin(pkg)
+
+                if login_status in ["SUCCESS", "ALREADY_LOGGED_IN"]:
+                    self.stats[pkg]['status'] = 'LOADING'
+                    success = launch_and_wait(pkg, pkg_intent, self.timeout_seconds)
+                elif login_status == "CAPTCHA":
+                    self.stats[pkg]['status'] = 'CAPTCHA'
+                    return False
+                else:
+                    self.stats[pkg]['status'] = 'LOGIN FAILED'
+                    return False
+            except ImportError:
+                pass
+
+        if success:
+            if self._commit_recovery_success(pkg, level, baseline_pid=baseline_pid):
+                return True
+            # The launcher returned success, but strict recovery verification
+            # rejected it. Keep the visible state in RECOVERY while the next
+            # tier is selected. Never expose a false Farming/ONLINE state.
+            self.stats[pkg]['status'] = 'RECOVERY'
+            self.stats[pkg]['pid'] = '-'
+            log.warning(f"[RECOVERY L{level}] launch succeeded weakly but strict verification failed; advancing tier.")
+            return False
+
+        if self.stats[pkg]['status'] not in ['LOGIN FAILED', 'CAPTCHA']:
+            self.stats[pkg]['status'] = 'FAILED'
+        log.warning(f"[RECOVERY L{level}] {pkg} recovery attempt failed.")
+        return False
+
+    def single_recovery_worker(self, pkg):
+        """Single-package tiered recovery with package-isolated diagnostics."""
+        try:
+            recovery_delay = max(30, int(self.config_data.get("RECOVERY_DELAY_SECONDS", 30)))
+            log.info(f"[SINGLE] Crash detected for {pkg}. Waiting {recovery_delay} seconds...")
+            time.sleep(recovery_delay)
+
+            baseline_pid = self.recovery_baseline_pids.get(pkg, '')
+            log.info(f"[RECOVERY] TARGET={pkg} BASELINE_PID={baseline_pid or '-'}")
+
+            # Give Android a short window to fully release the crashed target.
+            # This is package-local and does not inspect any other clone.
+            if baseline_pid and not self._wait_for_baseline_pid_to_exit(pkg, baseline_pid, timeout=5.0):
+                log.warning(f"[RECOVERY] {pkg} baseline PID {baseline_pid} did not exit; skipping directly to hard-stop tier.")
+                levels = (3,)
+            else:
+                levels = (1, 2, 3)
+
+            for level in levels:
+                existing_pid = get_pid(pkg)
+                if existing_pid and existing_pid != baseline_pid:
+                    ok, reason, _ = self._recovery_process_is_real(
+                        pkg, baseline_pid=baseline_pid, stable_seconds=2.0
+                    )
+                    if ok and self._commit_recovery_success(pkg, level, baseline_pid=baseline_pid):
+                        log.info(f"[RECOVERY] {pkg} recovered before Tier {level}; stopping chain.")
+                        return
+                    log.info(f"[RECOVERY] {pkg} target PID exists but is not verified: {reason}")
+
+                if self._launch_recovery_attempt(pkg, level):
+                    return
+
+                if level < 3:
+                    log.warning(f"[RECOVERY] {pkg} advancing from Tier {level} to Tier {level + 1}.")
+                    time.sleep(2)
+
+            log.error(f"[RECOVERY] {pkg} failed after all 3 recovery tiers.")
+            self.stats[pkg]['status'] = 'FAILED'
+        except Exception as e:
+            log.error(f"SINGLE RECOVERY FATAL [{pkg}]: {str(e)}")
+            self.stats[pkg]['status'] = 'FAILED'
+
+_manager = RecoveryManager()
+
+def start_recovery_manager(packages, stats, tracked_pids, intent_url, timeout_seconds, config_data):
+    _manager.configure(packages, stats, tracked_pids, intent_url, timeout_seconds, config_data)
+    _manager.start()
+
+def stop_recovery_manager():
+    _manager.stop()
+
+def trigger_recovery(pkg):
+    threading.Thread(
+        target=_manager.single_recovery_worker,
+        args=(pkg,),
+        daemon=True
+    ).start()
+
+def is_global_recovery():
+    return _manager.watchdog_paused()
+
+def get_global_state():
+    return _manager.get_global_state()
+        

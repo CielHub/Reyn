@@ -102,8 +102,8 @@ async def _emit_status(local_device_id: str, session_id: str, pkg: str, order_id
     begitu device reconnect).
 
     SENGAJA TIDAK menyentuh SESSIONS[pkg]['status'] -- itu field INTERNAL
-    yang dipakai _headless_watchdog_loop (cuma kenal 'ACTIVE'/'STOPPING'/
-    'STOPPED'/'FAILED', lihat modul itu) dan HARUS dikontrol eksplisit oleh
+    yang dipakai _headless_watchdog_loop (cuma kenal 'ACTIVE'/'STOPPED'/
+    'FAILED', lihat modul itu) dan HARUS dikontrol eksplisit oleh
     caller (_run_start_flow/handle_stop_session), supaya nilai protokol
     bertingkat (PREPARING/WAITING_LOGIN/.../RUNNING) yang dikirim ke bot
     tidak bentrok/menimpa status internal watchdog secara tidak sengaja."""
@@ -129,24 +129,17 @@ async def _emit_status(local_device_id: str, session_id: str, pkg: str, order_id
 USERNAME_SCAN_INTERVAL_SECONDS = 60
 
 # package_name -> info sesi yang sedang dikelola agent (bukan menu manual).
-# status: STARTING | ACTIVE | FAILED | STOPPING | STOPPED
+# status: STARTING | ACTIVE | FAILED | STOPPED
 SESSIONS: dict = {}
 
-# [RESTART] Masalah #2: setelah proses package dipastikan mati (graceful_kill
-# di handle_stop_session), verifikasi TAMBAHAN ini dipakai _restart_finished_
-# package sebelum relaunch -- jaga-jaga terhadap kemungkinan proses sempat
-# respawn di antara kill selesai dan task async ini benar-benar jalan
-# (asyncio.create_task tidak instan). SENGAJA pendek (graceful_kill sudah
-# melakukan verifikasi utama, ini cuma pengaman kedua).
-RESET_PROCESS_DEAD_TIMEOUT_SECONDS = 5
-
-# [RESTART] LOGIC BARU: package pasca-Finish TIDAK di-clear datanya lagi
-# (lihat _restart_finished_package) -- jeda ini sekarang murni jeda singkat
-# setelah proses dipastikan mati, sebelum ActivityManager diminta start
-# ulang package tsb. Verifikasi proses hidup TETAP dilakukan oleh
-# launch_and_wait() setelahnya (bukan fixed-delay-only) -- angka ini hanya
-# jeda minimum sebelum mencoba.
-RESET_RESTART_DELAY_SECONDS = 1.5
+# [LOBBY] LOGIC BARU: STOP_SESSION TIDAK PERNAH lagi melakukan kill/
+# force-stop terhadap package (pendekatan lama terbukti bisa memicu efek
+# visual ke package/session LAIN lewat broadcast Activity Manager dari `am
+# force-stop`, lihat catatan [WINDOW] versi lama -- SUDAH DIHAPUS). Package
+# yang baru Finish sekarang CUKUP di-trigger balik ke Lobby lewat deep link
+# SAMBIL proses tetap hidup apa adanya -- tidak ada lagi verifikasi
+# proses-mati maupun jeda pasca-kill, karena memang tidak ada kill sama
+# sekali di alur ini.
 
 # package_name -> asyncio.Task watchdog yang sedang berjalan untuk package itu.
 _watchdog_tasks: dict = {}
@@ -467,100 +460,91 @@ async def _username_scanner_loop(pkg: str) -> None:
         username_scanner.forget(pkg)
 
 
-async def _restart_finished_package(local_device_id: str, session_id: str, pkg: str, order_id) -> None:
-    """[RESTART] LOGIC BARU: dipanggil (fire-and-forget lewat asyncio.create_task)
-    HANYA dari handle_stop_session, SETELAH kill terkonfirmasi dan
-    SESSIONS[pkg] sudah di-pop untuk session ini.
+async def _send_package_to_lobby(local_device_id: str, session_id: str, pkg: str, order_id) -> None:
+    """[LOBBY] LOGIC BARU: dipanggil (fire-and-forget lewat asyncio.create_task)
+    HANYA dari handle_stop_session, SETELAH SESSIONS[pkg] di-pop untuk
+    session ini.
 
-    Tujuan: package yang baru selesai (Finish) CUKUP di-restart apa adanya --
-    TIDAK ada clear-data sama sekali (akun/login/progress/cache package tetap
-    utuh, data TIDAK dihapus) dan TIDAK dimasukkan lagi ke Place ID / Private
-    Server manapun (package TIDAK di-join-kan ke map/game apa pun) -- package
-    hanya dibuka ulang ke Menu/Home Roblox (get_lobby_intent()), lalu
-    dibiarkan di sana. SEPENUHNYA terpisah dari COMMAND_RESULT STOP_SESSION
-    (yang sudah dibalas duluan di handle_stop_session, tidak menunggu restart
-    ini) supaya bot/staff tidak tertahan menunggu restart ini selesai.
+    Tujuan: package yang baru Finish (timer habis ATAU tombol Selesai
+    manual) TIDAK PERNAH dikill/di-force-stop. Sebagai gantinya, package
+    di-trigger lewat deep link Menu/Home Roblox (`roblox://`, get_lobby_
+    intent() -- SAMA seperti tahap lobby _run_start_flow) SAMBIL proses
+    dibiarkan hidup apa adanya. Intent ini yang membuat Roblox (di dalam
+    proses yang SAMA, bukan proses baru) keluar dari map/game yang sedang
+    aktif dan kembali ke Lobby, lalu package dibiarkan idle/standby di
+    sana -- TIDAK ADA rejoin ke target/game sebelumnya. Data package sama
+    sekali tidak disentuh (tidak ada clear-data, tidak ada kill).
 
-    ISOLASI (WAJIB): fungsi ini TIDAK PERNAH menyentuh package lain -- semua
-    operasi di sini (get_pid/launch_and_wait) exact-scoped ke `pkg` yang sama
-    seperti yang baru di-Finish. Tidak ada watchdog/username-scanner yang
-    dibuat untuk pkg di sini (package ini sudah tidak punya session aktif).
+    ISOLASI (WAJIB): `am start -p pkg` (dipakai launch_and_wait di bawah)
+    HANYA menyentuh package ini secara eksak -- berbeda dari `am
+    force-stop` yang memicu broadcast Activity Manager lebih luas, itulah
+    sebabnya force-stop/kill TIDAK PERNAH dipakai lagi di alur ini.
+    Package/session lain (SESSIONS ataupun yang dipantau menu manual)
+    TIDAK disentuh oleh baris manapun di fungsi ini.
 
     GUARD race condition (staff assign order BARU ke package yang sama
-    SEBELUM restart ini selesai): dicek ulang di setiap tahap (sebelum
-    verifikasi mati, sebelum relaunch) -- begitu SESSIONS[pkg] terisi lagi
-    (oleh handle_start_session untuk session_id BARU), restart ini berhenti
-    diam-diam supaya tidak menimpa/mengganggu start flow sesi baru tsb.
+    SEBELUM trigger ini jalan): dicek SEBELUM trigger -- begitu
+    SESSIONS[pkg] terisi lagi (oleh handle_start_session untuk session_id
+    BARU), trigger ini berhenti diam-diam supaya tidak menimpa/mengganggu
+    start flow sesi baru tsb.
     """
-    log.info(f"[RESTART] session={session_id} package={pkg} -- mulai restart pasca-Finish "
-             f"(tanpa clear-data, tidak join map/game).")
+    log.info(f"[LOBBY] session={session_id} package={pkg} -- trigger balik ke Lobby (tanpa kill, "
+             f"tanpa clear-data, tanpa rejoin)...")
 
     if pkg in SESSIONS:
-        log.info(f"[RESTART] session={session_id} package={pkg} dibatalkan -- package sudah "
-                 f"diklaim session baru sebelum restart mulai.")
+        log.info(f"[LOBBY] session={session_id} package={pkg} dibatalkan -- package sudah "
+                 f"diklaim session baru sebelum trigger mulai.")
         return
 
-    # Verifikasi TAMBAHAN proses benar-benar mati (lihat konstanta di atas).
-    deadline = time.monotonic() + RESET_PROCESS_DEAD_TIMEOUT_SECONDS
-    still_alive = bool(process_manager.get_pid(pkg))
-    while still_alive and time.monotonic() < deadline:
-        await asyncio.sleep(0.3)
-        still_alive = bool(process_manager.get_pid(pkg))
-    if still_alive:
-        log.warning(f"[RESTART] session={session_id} package={pkg} masih terdeteksi proses "
-                    f"berjalan setelah verifikasi tambahan -- restart DIBATALKAN.")
-        return
-
-    if pkg in SESSIONS:
-        log.info(f"[RESTART] session={session_id} package={pkg} dibatalkan -- diklaim session "
-                 f"baru (guard sebelum jeda restart).")
-        return
-
-    await asyncio.sleep(RESET_RESTART_DELAY_SECONDS)
-
-    if pkg in SESSIONS:
-        log.info(f"[RESTART] session={session_id} package={pkg} dibatalkan -- diklaim session "
-                 f"baru (guard sebelum relaunch).")
-        return
-
-    log.info(f"[RESTART] session={session_id} package={pkg} restarting ke Menu/Home -- data "
-             f"package TIDAK dihapus, TIDAK di-join-kan ke map/game manapun...")
     try:
-        # require_join_signal=False (default) -- HANYA butuh proses hidup,
-        # TIDAK ada target/join sama sekali (package sengaja dikembalikan ke
-        # Menu/Home, bukan masuk map/game).
-        launched = await asyncio.to_thread(
+        # require_join_signal=False (default) -- HANYA butuh proses hidup
+        # (di Lobby), TIDAK ada target/join sama sekali. Proses TIDAK
+        # dikill lebih dulu di sini: kalau package masih hidup di tengah
+        # game, intent ini yang membawanya keluar ke Lobby; kalau ternyata
+        # package sudah mati duluan (mis. crash sebelum STOP_SESSION
+        # datang), `am start` di sini cukup menyalakannya langsung ke
+        # Lobby (bukan ke game lama).
+        reached_lobby = await asyncio.to_thread(
             launch_and_wait, pkg, get_lobby_intent(), LOBBY_TIMEOUT_SECONDS,
         )
     except Exception:
-        log.error(f"[RESTART] exception saat restart {pkg} pasca-Finish.", exc_info=True)
-        launched = False
+        log.error(f"[LOBBY] exception saat trigger {pkg} ke Lobby.", exc_info=True)
+        reached_lobby = False
 
-    if not launched:
-        log.error(f"[RESTART] session={session_id} package={pkg} gagal restart pasca-Finish -- "
-                  f"package tertinggal dalam kondisi tidak jalan, staff perlu cek manual.")
+    if not reached_lobby:
+        log.error(f"[LOBBY] session={session_id} package={pkg} gagal dipastikan balik ke Lobby -- "
+                  f"staff perlu cek manual.")
         return
 
-    log.info(f"[RESTART] session={session_id} package={pkg} package hidup kembali di Menu/Home "
-             f"(data utuh, tidak berada di map/game manapun).")
-    log.info(f"[WINDOW] session={session_id} package={pkg} -- restart scoped ke package ini saja, "
-             f"package/session lain tidak disentuh (lihat guard SESSIONS di atas).")
+    log.info(f"[LOBBY] session={session_id} package={pkg} berhasil balik ke Lobby, berhenti dalam "
+             f"kondisi idle/standby, tidak rejoin ke game manapun.")
 
 
 async def handle_stop_session(msg: dict, local_device_id: str, do_reset: bool = True) -> dict:
-    """PHASE 6/7: eksekusi STOP_SESSION. Return dict payload COMMAND_RESULT,
-    tidak pernah raise ke pemanggil (sama seperti handle_start_session).
+    """PHASE 6/7 (LOGIC BARU): eksekusi STOP_SESSION. Return dict payload
+    COMMAND_RESULT, tidak pernah raise ke pemanggil (sama seperti
+    handle_start_session).
 
-    Urutan WAJIB (lihat requirement PROJECT_CONTEXT.txt bag. 3):
-    1. Set status STOPPING SEBELUM kill -- ini yang bikin
-       _headless_watchdog_loop skip relaunch (anti-rejoin), supaya tidak ada
-       jendela waktu watchdog masih sempat menghidupkan ulang package yang
-       justru mau dimatikan.
-    2. Resolve PID TERBARU lewat process_manager.get_pid() -- JANGAN pernah
-       pakai info['pid'] yang tersimpan di SESSIONS (bisa basi kalau sempat
-       crash+relaunch sebelum STOP_SESSION datang).
-    3. graceful_kill HANYA pid+package itu -- package lain di device yang
-       sama (session/package lain di SESSIONS) TIDAK disentuh sama sekali.
+    PERUBAHAN PENTING: fungsi ini TIDAK PERNAH lagi melakukan kill/
+    force-stop terhadap package -- pendekatan kill/restart-setelah-kill
+    yang lama terbukti bisa membuat package/session LAIN ikut terdampak
+    secara visual (efek broadcast Activity Manager dari `am force-stop` di
+    host floating-window/cloud-phone). Package cukup ditandai selesai lalu
+    di-trigger balik ke Lobby SAMBIL proses dibiarkan hidup apa adanya --
+    lihat _send_package_to_lobby() untuk detail trigger-nya.
+
+    Urutan:
+    1. Set status STOPPED & hapus entry SESSIONS -- ini yang bikin
+       _headless_watchdog_loop skip relaunch-ke-game-lama (anti-rejoin),
+       supaya tidak ada jendela waktu watchdog masih sempat mengarahkan
+       proses balik ke target lama. TIDAK ADA status STOPPING transisi lagi
+       (dulu dipakai sebagai penanda "sedang menunggu kill selesai" -- kill
+       sudah tidak ada, jadi transisi ke selesai langsung sekali langkah).
+    2. Balas COMMAND_RESULT STOPPED SEGERA -- bot/staff tidak perlu
+       menunggu trigger-ke-lobby selesai.
+    3. Fire-and-forget: _send_package_to_lobby() men-trigger deep link
+       Lobby HANYA ke package ini -- package/session lain di SESSIONS
+       (atau yang dipantau menu manual) TIDAK disentuh sama sekali.
     """
     session_id = str(msg.get("session_id", "")).strip()
     pkg = str(msg.get("package_name", "")).strip()
@@ -574,8 +558,9 @@ async def handle_stop_session(msg: dict, local_device_id: str, do_reset: bool = 
     if info is None:
         # Tidak ada entry di memori (mis. agent baru restart, atau package ini
         # memang tidak pernah dikelola headless dari sini). Tidak ada apa pun
-        # buat di-kill dari sisi kita -- balas ok supaya bot tidak nyangkut
-        # nunggu; penyelarasan state penuh menyusul SYNC_SESSIONS (Phase 8).
+        # buat ditandai selesai dari sisi kita -- balas ok supaya bot tidak
+        # nyangkut nunggu; penyelarasan state penuh menyusul SYNC_SESSIONS
+        # (Phase 8).
         log.warning(f"SESSION_AGENT: STOP_SESSION untuk {pkg} (session {session_id}) tapi tidak "
                     f"ada entry SESSIONS di memori -- mungkin agent baru restart.")
         return {"type": "COMMAND_RESULT", "command": "STOP_SESSION", "device_id": local_device_id,
@@ -584,79 +569,42 @@ async def handle_stop_session(msg: dict, local_device_id: str, do_reset: bool = 
     if info.get("session_id") != session_id:
         # session_id tidak cocok session yang SEDANG dipegang SESSIONS[pkg] --
         # command basi (untuk session lama yang sudah tergantikan session baru
-        # di package yang sama). JANGAN kill apa pun -- itu bisa mematikan
+        # di package yang sama). JANGAN sentuh apa pun -- itu bisa mengganggu
         # session BARU yang sedang jalan, bukan yang diminta stop.
         log.warning(f"SESSION_AGENT: STOP_SESSION session_id '{session_id}' tidak cocok dengan "
                     f"session aktif '{info.get('session_id')}' di {pkg}, diabaikan (command basi).")
         return {"type": "COMMAND_RESULT", "command": "STOP_SESSION", "device_id": local_device_id,
                 "session_id": session_id, "ok": False, "reason": "STALE_SESSION_ID"}
 
-    # (1) Anti-rejoin: set SEBELUM kill. _headless_watchdog_loop cuma bertindak
-    # kalau status == "ACTIVE", jadi begitu ini berubah, watchdog otomatis skip
-    # package ini di siklus berikutnya (lihat loop di bawah).
-    info["status"] = "STOPPING"
-    log.info(f"[FINISH] session={session_id} package={pkg} -- STOP_SESSION diterima, status STOPPING.")
-
-    # (2) Resolve PID TERBARU -- bukan info['pid'] yang mungkin basi.
-    current_pid = process_manager.get_pid(pkg)
-    if not current_pid:
-        log.info(f"[FINISH] session={session_id} package={pkg} sudah tidak punya proses berjalan.")
-        killed, used_force_stop = True, False
-    else:
-        log.info(f"[FINISH] session={session_id} package={pkg} pid terbaru={current_pid} -- "
-                 f"exact package termination requested.")
-        # (3) graceful_kill blocking (subprocess+sleep) -- lewat asyncio.to_thread
-        # supaya tidak memblokir event loop (START_SESSION/STOP_SESSION package
-        # lain harus tetap bisa jalan paralel).
-        killed, used_force_stop = await asyncio.to_thread(
-            process_manager.graceful_kill, current_pid, pkg,
-        )
-
+    # (1) Anti-rejoin: set SEBELUM apa pun lainnya. _headless_watchdog_loop
+    # cuma bertindak kalau status == "ACTIVE", jadi begitu ini berubah,
+    # watchdog otomatis skip package ini di siklus berikutnya (lihat loop di
+    # bawah).
     info["status"] = "STOPPED"
     info["pid"] = "-"
-    # Hapus entry SETELAH status STOPPED ter-set -- supaya kalaupun watchdog
-    # sempat bangun tepat di titik ini, ia lihat status STOPPED dulu (bukan
-    # entry hilang tiba-tiba), lalu keluar dari loop-nya dengan bersih.
+    # (2) Hapus entry SETELAH status STOPPED ter-set -- supaya kalaupun
+    # watchdog sempat bangun tepat di titik ini, ia lihat status STOPPED
+    # dulu (bukan entry hilang tiba-tiba), lalu keluar dari loop-nya dengan
+    # bersih. TIDAK ADA kill/force-stop di jalur ini sama sekali -- proses
+    # package dibiarkan hidup, cukup di-trigger balik ke Lobby di background
+    # (lihat _send_package_to_lobby).
     SESSIONS.pop(pkg, None)
 
-    if not killed:
-        log.error(f"[FINISH] session={session_id} package={pkg} gagal dipastikan mati.")
-        return {"type": "COMMAND_RESULT", "command": "STOP_SESSION", "device_id": local_device_id,
-                "session_id": session_id, "ok": False, "reason": "KILL_FAILED"}
+    log.info(f"[FINISH] session={session_id} package={pkg} -- STOP_SESSION diterima, session "
+             f"selesai (TANPA kill/force-stop). Trigger balik ke Lobby berjalan di background, "
+             f"package/session lain tidak disentuh (isolasi per-package).")
 
-    log.info(f"[FINISH] session={session_id} package={pkg} terkonfirmasi mati, session selesai. "
-             f"preserving other active sessions (isolasi per-package, lihat handle_stop_session).")
-
-    # LIFECYCLE REVISION (Masalah #2): audit isolasi mengonfirmasi kill di
-    # atas HANYA menyentuh PID+package spesifik ini -- package/session lain
-    # di SESSIONS TIDAK disentuh sama sekali oleh baris manapun di atas.
-    # Kalau force-stop (langkah paling "luas" -- lihat process_manager.
-    # graceful_kill docstring) sampai terpakai, catat di sini supaya
-    # gangguan visual pada floating window package LAIN (kalau staff
-    # laporkan lagi) bisa dikorelasikan dengan kejadian ini -- ini limitasi
-    # host window manager di luar kendali kode ini, BUKAN cross-package
-    # kill. Tidak ada relaunch/restore paksa dilakukan dari sini.
-    if used_force_stop:
-        log.warning(f"[WINDOW] session={session_id} package={pkg} -- kill butuh eskalasi ke "
-                    f"'am force-stop' (SIGTERM/SIGKILL saja tidak cukup). Kalau ada floating "
-                    f"window PACKAGE LAIN ikut minimize/bubble setelah ini, kemungkinan besar "
-                    f"efek broadcast Activity Manager dari force-stop di host, bukan proses "
-                    f"package lain yang ikut mati (session/PID lain tidak disentuh).")
-        log.warning("[WINDOW] host environment does not expose reliable restore control -- "
-                    "preserving process/session; no destructive relaunch.")
-
-    # [RESTART] Masalah #2: fire-and-forget, TIDAK menunda COMMAND_RESULT di
-    # bawah ini -- bot/staff tetap dapat balasan STOPPED secepat sebelumnya,
-    # restart (TANPA clear-data, TANPA join map/game -- lihat docstring
-    # _restart_finished_package) berjalan di background dan sepenuhnya
-    # scoped ke `pkg` (lihat isolasi & guard di docstring
-    # _restart_finished_package). do_reset=False tersedia untuk pemanggil
-    # lain di masa depan yang butuh stop TANPA restart (tidak dipakai saat
-    # ini -- semua caller existing/reconcile_sync tetap dapat perilaku
-    # restart ini).
+    # (3) Fire-and-forget: TIDAK menunda COMMAND_RESULT di bawah ini --
+    # bot/staff tetap dapat balasan STOPPED secepat mungkin, trigger-ke-Lobby
+    # (TANPA kill, TANPA clear-data, TANPA rejoin -- lihat docstring
+    # _send_package_to_lobby) berjalan di background dan sepenuhnya scoped
+    # ke `pkg` (lihat isolasi & guard di docstring _send_package_to_lobby).
+    # do_reset=False tersedia untuk pemanggil lain di masa depan yang butuh
+    # stop TANPA trigger-ke-Lobby (tidak dipakai saat ini -- semua caller
+    # existing/reconcile_sync tetap dapat perilaku trigger ini).
     if do_reset:
         asyncio.create_task(
-            _restart_finished_package(local_device_id, session_id, pkg, info.get("order_id"))
+            _send_package_to_lobby(local_device_id, session_id, pkg, info.get("order_id"))
         )
 
     return {"type": "COMMAND_RESULT", "command": "STOP_SESSION", "device_id": local_device_id,
@@ -670,10 +618,11 @@ async def _headless_watchdog_loop(pkg: str) -> None:
 
     Anti-rejoin (PHASE 6/7, SUDAH AKTIF): loop ini HANYA bertindak kalau
     status == "ACTIVE" (lihat cek di bawah) -- begitu handle_stop_session()
-    mengubah status jadi STOPPING/STOPPED, watchdog otomatis skip package itu
-    di siklus berikutnya, tidak perlu logic tambahan. Loop berhenti sendiri
+    mengubah status jadi STOPPED, watchdog otomatis skip package itu di
+    siklus berikutnya, tidak perlu logic tambahan. Loop berhenti sendiri
     kalau entry package-nya dihapus dari SESSIONS (dilakukan handle_stop_session
-    setelah kill terkonfirmasi).
+    segera setelah Finish, TANPA menunggu kill -- STOP_SESSION versi ini
+    memang tidak pernah melakukan kill/force-stop sama sekali).
     """
     log.info(f"SESSION_AGENT: watchdog headless mulai untuk {pkg}.")
     try:
@@ -747,9 +696,9 @@ async def reconcile_sync(expected_sessions: list, local_device_id: str) -> dict:
     1. Package yang device SEDANG track (SESSIONS) tapi TIDAK disebut sama
        sekali di expected_sessions -> bot sudah anggap ini selesai/tidak
        tahu apa-apa lagi soal ini -> ORPHAN, WAJIB dihentikan. Reuse
-       handle_stop_session() apa adanya (bukan logic kill baru) supaya
-       urutan status STOPPING->resolve PID terbaru->kill->STOPPED PERSIS
-       sama seperti STOP_SESSION normal (anti-rejoin tetap terjaga).
+       handle_stop_session() apa adanya supaya perilakunya PERSIS sama
+       seperti STOP_SESSION normal (tanpa kill, trigger balik ke Lobby,
+       anti-rejoin tetap terjaga).
 
     2. Package yang bot minta status EXPIRING/STOPPING -> device WAJIB
        pastikan itu berhenti, SAMA seperti (1) -- ini menutup celah kalau

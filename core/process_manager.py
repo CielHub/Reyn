@@ -132,6 +132,76 @@ def graceful_kill(pid, package=None):
 
     return not pid_exists(pid), False
 
+def kill_pid_direct(pid, verify_timeout=3.0):
+    """[FINISH LOGIC BARU] Kill SATU PID target pakai `kill` biasa (BUKAN
+    `am force-stop`) -- dipakai session_agent.handle_stop_session sebagai
+    pengganti penuh alur lama yang tidak pernah kill sama sekali.
+
+    Kenapa bukan `am force-stop`: command itu operasi level Activity
+    Manager yang broadcast lebih luas dan (di host floating-window/
+    cloud-phone) bisa memicu efek visual ke package LAIN yang sama sekali
+    tidak disentuh proses/PID-nya. `kill <pid>` di sini HANYA menyentuh
+    proses tunggal pemilik PID tsb -- efek "package lain jadi
+    bubble/minimized" yang tetap mungkin terjadi adalah efek window
+    manager host terhadap floating window yang kosong, bukan hasil dari
+    proses/PID package lain ikut mati (lihat _finish_kill_and_restore_survivors
+    di session_agent.py untuk langkah pemulihannya).
+
+    Default TIDAK langsung "kill -9": kirim SIGTERM (`kill` polos) dulu,
+    baru eskalasi ke SIGKILL kalau target ternyata masih hidup setelah
+    verify_timeout -- sesuai instruksi supaya "kill -9" hanya jadi
+    fallback, bukan default.
+
+    Return True kalau PID target sudah dipastikan mati (lewat pid_exists()),
+    False kalau masih hidup setelah kedua percobaan.
+    """
+    if not pid:
+        return False
+
+    subprocess.run(
+        ["su", "-c", f"kill {pid}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if wait_until_process_dead(pid, timeout=verify_timeout):
+        return True
+
+    # Fallback: target masih hidup setelah `kill` polos -- eskalasi ke SIGKILL.
+    subprocess.run(
+        ["su", "-c", f"kill -9 {pid}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return wait_until_process_dead(pid, timeout=2.0)
+
+
+def restore_foreground(package):
+    """[FINISH LOGIC BARU] Bawa SATU package floating-window yang masih
+    hidup (survivor) kembali ke foreground pakai `monkey -p <package> 1`.
+
+    PENTING (hasil test manual, lihat instruksi FINISH LOGIC BARU): satu
+    command ini HANYA membawa `package` tsb ke foreground -- TIDAK ikut
+    membawa package lain, dan TIDAK membuat instance/session baru (proses
+    survivor yang sama tetap dipakai, bukan rejoin/restart). Caller WAJIB
+    memanggil fungsi ini SATU PER SATU untuk tiap surviving package kalau
+    ada lebih dari satu -- jangan berasumsi satu panggilan cukup untuk
+    semua survivor.
+
+    Return True kalau command monkey sukses dijalankan (returncode 0).
+    Ini bukan jaminan window benar-benar sudah tidak bubble secara visual,
+    hanya konfirmasi command-nya berhasil dieksekusi.
+    """
+    if not package:
+        return False
+
+    result = subprocess.run(
+        ["su", "-c", f"monkey -p {package} 1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
 def clear_package_data(package):
     """[RESET] `pm clear` SATU package spesifik lewat PackageManager.
 

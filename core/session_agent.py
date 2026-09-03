@@ -132,14 +132,13 @@ USERNAME_SCAN_INTERVAL_SECONDS = 60
 # status: STARTING | ACTIVE | FAILED | STOPPED
 SESSIONS: dict = {}
 
-# [LOBBY] LOGIC BARU: STOP_SESSION TIDAK PERNAH lagi melakukan kill/
-# force-stop terhadap package (pendekatan lama terbukti bisa memicu efek
-# visual ke package/session LAIN lewat broadcast Activity Manager dari `am
-# force-stop`, lihat catatan [WINDOW] versi lama -- SUDAH DIHAPUS). Package
-# yang baru Finish sekarang CUKUP di-trigger balik ke Lobby lewat deep link
-# SAMBIL proses tetap hidup apa adanya -- tidak ada lagi verifikasi
-# proses-mati maupun jeda pasca-kill, karena memang tidak ada kill sama
-# sekali di alur ini.
+# [FINISH] LOGIC BARU: STOP_SESSION kill target package lewat PID
+# (`kill <pid>`, BUKAN `am force-stop` -- broadcast Activity Manager dari
+# force-stop itulah yang dulu memicu efek visual ke package/session LAIN).
+# Survivor (package lain berstatus ACTIVE) yang mungkin ikut jadi
+# bubble/minimized secara visual TIDAK di-kill/restart -- cuma dikembalikan
+# ke foreground satu per satu lewat `monkey -p <package> 1`. Lihat
+# _finish_kill_and_restore_survivors() untuk detail lengkap alurnya.
 
 # package_name -> asyncio.Task watchdog yang sedang berjalan untuk package itu.
 _watchdog_tasks: dict = {}
@@ -460,91 +459,110 @@ async def _username_scanner_loop(pkg: str) -> None:
         username_scanner.forget(pkg)
 
 
-async def _send_package_to_lobby(local_device_id: str, session_id: str, pkg: str, order_id) -> None:
-    """[LOBBY] LOGIC BARU: dipanggil (fire-and-forget lewat asyncio.create_task)
-    HANYA dari handle_stop_session, SETELAH SESSIONS[pkg] di-pop untuk
-    session ini.
+# [FINISH] LOGIC BARU: jeda setelah target PID dipastikan mati, SEBELUM
+# mulai foreground-restore survivor -- berdasarkan hasil test manual
+# (~2-3 detik, lihat instruksi FINISH LOGIC BARU), supaya Android sempat
+# memproses perubahan window akibat target mati dulu sebelum di-monkey.
+_FINISH_RESTORE_DELAY_SECONDS = 2.5
 
-    Tujuan: package yang baru Finish (timer habis ATAU tombol Selesai
-    manual) TIDAK PERNAH dikill/di-force-stop. Sebagai gantinya, package
-    di-trigger lewat deep link Menu/Home Roblox (`roblox://`, get_lobby_
-    intent() -- SAMA seperti tahap lobby _run_start_flow) SAMBIL proses
-    dibiarkan hidup apa adanya. Intent ini yang membuat Roblox (di dalam
-    proses yang SAMA, bukan proses baru) keluar dari map/game yang sedang
-    aktif dan kembali ke Lobby, lalu package dibiarkan idle/standby di
-    sana -- TIDAK ADA rejoin ke target/game sebelumnya. Data package sama
-    sekali tidak disentuh (tidak ada clear-data, tidak ada kill).
+# Jeda antar panggilan `monkey` per surviving package -- SETIAP package
+# WAJIB dipanggil individual (satu "monkey" cuma membawa satu package),
+# jeda kecil ini cuma supaya panggilan beruntun tidak asal numpuk.
+_FINISH_RESTORE_STEP_DELAY_SECONDS = 0.3
 
-    ISOLASI (WAJIB): `am start -p pkg` (dipakai launch_and_wait di bawah)
-    HANYA menyentuh package ini secara eksak -- berbeda dari `am
-    force-stop` yang memicu broadcast Activity Manager lebih luas, itulah
-    sebabnya force-stop/kill TIDAK PERNAH dipakai lagi di alur ini.
-    Package/session lain (SESSIONS ataupun yang dipantau menu manual)
-    TIDAK disentuh oleh baris manapun di fungsi ini.
 
-    GUARD race condition (staff assign order BARU ke package yang sama
-    SEBELUM trigger ini jalan): dicek SEBELUM trigger -- begitu
-    SESSIONS[pkg] terisi lagi (oleh handle_start_session untuk session_id
-    BARU), trigger ini berhenti diam-diam supaya tidak menimpa/mengganggu
-    start flow sesi baru tsb.
+async def _finish_kill_and_restore_survivors(
+    local_device_id: str, session_id: str, pkg: str, pid: str,
+) -> None:
+    """[FINISH] LOGIC BARU (GANTI PENUH _send_package_to_lobby lama --
+    lama SENGAJA TIDAK ADA LAGI, tidak dipertahankan sebagai fallback):
+    dipanggil (fire-and-forget lewat asyncio.create_task) HANYA dari
+    handle_stop_session, SETELAH SESSIONS[pkg] di-pop untuk session ini.
+
+    Alur (lihat hasil test manual di instruksi FINISH LOGIC BARU):
+    STEP 1-2: kill PID target (`kill`, BUKAN `am force-stop`) lewat
+    process_manager.kill_pid_direct() -- HANYA menyentuh PID tunggal ini,
+    `kill -9` cuma fallback kalau `kill` polos belum berhasil.
+    STEP 3-4: package survivor lain (yang statusnya masih ACTIVE di
+    SESSIONS) kemungkinan berubah jadi bubble/minimized secara visual
+    akibat window manager host -- BUKAN berarti mati. Package-package ini
+    TIDAK PERNAH di-kill/force-stop/restart/rejoin di sini, cuma
+    dikembalikan ke foreground SATU PER SATU lewat
+    process_manager.restore_foreground() (`monkey -p <package> 1`).
+
+    ISOLASI (WAJIB): `kill <pid>` HANYA menyentuh proses tunggal target,
+    dan `monkey -p <package> 1` per survivor HANYA membawa package itu ke
+    foreground (bukan restart/rejoin) -- tidak ada baris di fungsi ini
+    yang mengubah state monitor/session package lain.
     """
-    log.info(f"[LOBBY] session={session_id} package={pkg} -- trigger balik ke Lobby (tanpa kill, "
-             f"tanpa clear-data, tanpa rejoin)...")
+    log.info(f"[FINISH] session={session_id} package={pkg} pid={pid} -- mulai kill PID target "
+             f"(kill biasa, bukan am force-stop)...")
 
-    if pkg in SESSIONS:
-        log.info(f"[LOBBY] session={session_id} package={pkg} dibatalkan -- package sudah "
-                 f"diklaim session baru sebelum trigger mulai.")
+    if pid and pid != "-":
+        killed = await asyncio.to_thread(process_manager.kill_pid_direct, pid)
+        if killed:
+            log.info(f"[FINISH] session={session_id} package={pkg} pid={pid} -- target dipastikan mati.")
+        else:
+            log.error(f"[FINISH] session={session_id} package={pkg} pid={pid} -- target GAGAL "
+                      f"dipastikan mati setelah kill+fallback, staff perlu cek manual.")
+    else:
+        log.warning(f"[FINISH] session={session_id} package={pkg} -- tidak ada PID tercatat untuk "
+                    f"di-kill (mungkin sudah mati duluan), lanjut ke foreground-restore survivor saja.")
+
+    # STEP 3-4: tunggu singkat (hasil test manual: ~2-3 detik) sebelum
+    # restore, supaya Android sempat memproses perubahan window dulu.
+    await asyncio.sleep(_FINISH_RESTORE_DELAY_SECONDS)
+
+    # Surviving package: ambil dari data session yang memang sudah
+    # dimonitor sistem (SESSIONS), bukan menebak dari daftar proses
+    # Android secara acak -- prioritas status ACTIVE/RUNNING saja.
+    survivors = [p for p, info in SESSIONS.items() if info.get("status") == "ACTIVE"]
+    if not survivors:
+        log.info(f"[FINISH] session={session_id} package={pkg} -- tidak ada surviving package lain, selesai.")
         return
 
-    try:
-        # require_join_signal=False (default) -- HANYA butuh proses hidup
-        # (di Lobby), TIDAK ada target/join sama sekali. Proses TIDAK
-        # dikill lebih dulu di sini: kalau package masih hidup di tengah
-        # game, intent ini yang membawanya keluar ke Lobby; kalau ternyata
-        # package sudah mati duluan (mis. crash sebelum STOP_SESSION
-        # datang), `am start` di sini cukup menyalakannya langsung ke
-        # Lobby (bukan ke game lama).
-        reached_lobby = await asyncio.to_thread(
-            launch_and_wait, pkg, get_lobby_intent(), LOBBY_TIMEOUT_SECONDS,
-        )
-    except Exception:
-        log.error(f"[LOBBY] exception saat trigger {pkg} ke Lobby.", exc_info=True)
-        reached_lobby = False
+    log.info(f"[FINISH] session={session_id} package={pkg} -- restore foreground {len(survivors)} "
+             f"surviving package satu per satu: {survivors}")
+    for survivor_pkg in survivors:
+        # Re-cek per iterasi (race condition): kalau survivor ini di-Finish
+        # atau diklaim session baru selagi loop restore ini masih jalan,
+        # jangan sentuh -- biarkan alurnya sendiri yang menangani.
+        if survivor_pkg not in SESSIONS or SESSIONS[survivor_pkg].get("status") != "ACTIVE":
+            continue
+        ok = await asyncio.to_thread(process_manager.restore_foreground, survivor_pkg)
+        log.info(f"[FINISH] session={session_id} restore foreground survivor {survivor_pkg}: "
+                 f"{'OK' if ok else 'GAGAL'}")
+        await asyncio.sleep(_FINISH_RESTORE_STEP_DELAY_SECONDS)
 
-    if not reached_lobby:
-        log.error(f"[LOBBY] session={session_id} package={pkg} gagal dipastikan balik ke Lobby -- "
-                  f"staff perlu cek manual.")
-        return
-
-    log.info(f"[LOBBY] session={session_id} package={pkg} berhasil balik ke Lobby, berhenti dalam "
-             f"kondisi idle/standby, tidak rejoin ke game manapun.")
+    log.info(f"[FINISH] session={session_id} package={pkg} -- proses restore foreground survivor selesai.")
 
 
 async def handle_stop_session(msg: dict, local_device_id: str, do_reset: bool = True) -> dict:
-    """PHASE 6/7 (LOGIC BARU): eksekusi STOP_SESSION. Return dict payload
-    COMMAND_RESULT, tidak pernah raise ke pemanggil (sama seperti
+    """PHASE 6/7 (FINISH LOGIC BARU): eksekusi STOP_SESSION. Return dict
+    payload COMMAND_RESULT, tidak pernah raise ke pemanggil (sama seperti
     handle_start_session).
 
-    PERUBAHAN PENTING: fungsi ini TIDAK PERNAH lagi melakukan kill/
-    force-stop terhadap package -- pendekatan kill/restart-setelah-kill
-    yang lama terbukti bisa membuat package/session LAIN ikut terdampak
-    secara visual (efek broadcast Activity Manager dari `am force-stop` di
-    host floating-window/cloud-phone). Package cukup ditandai selesai lalu
-    di-trigger balik ke Lobby SAMBIL proses dibiarkan hidup apa adanya --
-    lihat _send_package_to_lobby() untuk detail trigger-nya.
+    PERUBAHAN PENTING (GANTI PENUH pendekatan "tanpa kill" sebelumnya --
+    TIDAK dipertahankan sebagai fallback): target package di-kill lewat
+    PID (`kill <pid>`, BUKAN `am force-stop`), lalu surviving package lain
+    (status ACTIVE di SESSIONS) yang mungkin ikut berubah jadi
+    bubble/minimized secara visual (efek window manager host, BUKAN ikut
+    mati) dikembalikan ke foreground SATU PER SATU lewat `monkey -p
+    <package> 1` -- lihat _finish_kill_and_restore_survivors() untuk detail.
 
     Urutan:
     1. Set status STOPPED & hapus entry SESSIONS -- ini yang bikin
        _headless_watchdog_loop skip relaunch-ke-game-lama (anti-rejoin),
        supaya tidak ada jendela waktu watchdog masih sempat mengarahkan
-       proses balik ke target lama. TIDAK ADA status STOPPING transisi lagi
-       (dulu dipakai sebagai penanda "sedang menunggu kill selesai" -- kill
-       sudah tidak ada, jadi transisi ke selesai langsung sekali langkah).
+       proses balik ke target lama. PID target diambil SEBELUM entry
+       di-pop, supaya kill di background tetap punya PID yang benar.
     2. Balas COMMAND_RESULT STOPPED SEGERA -- bot/staff tidak perlu
-       menunggu trigger-ke-lobby selesai.
-    3. Fire-and-forget: _send_package_to_lobby() men-trigger deep link
-       Lobby HANYA ke package ini -- package/session lain di SESSIONS
-       (atau yang dipantau menu manual) TIDAK disentuh sama sekali.
+       menunggu kill+restore selesai.
+    3. Fire-and-forget: _finish_kill_and_restore_survivors() mengeksekusi
+       kill target + restore foreground survivor di background --
+       package/session lain di SESSIONS (atau yang dipantau menu manual)
+       TIDAK di-kill/force-stop/restart, cuma yang statusnya ACTIVE yang
+       dibawa balik ke foreground.
     """
     session_id = str(msg.get("session_id", "")).strip()
     pkg = str(msg.get("package_name", "")).strip()
@@ -580,31 +598,33 @@ async def handle_stop_session(msg: dict, local_device_id: str, do_reset: bool = 
     # cuma bertindak kalau status == "ACTIVE", jadi begitu ini berubah,
     # watchdog otomatis skip package ini di siklus berikutnya (lihat loop di
     # bawah).
+    # PID target diambil SEBELUM di-pop -- ini yang dipakai kill di
+    # background (STEP 1 FINISH LOGIC BARU: pakai PID yang sudah dimiliki
+    # session ini, jangan langsung `am force-stop`).
+    target_pid = info.get("pid", "-")
     info["status"] = "STOPPED"
     info["pid"] = "-"
     # (2) Hapus entry SETELAH status STOPPED ter-set -- supaya kalaupun
     # watchdog sempat bangun tepat di titik ini, ia lihat status STOPPED
     # dulu (bukan entry hilang tiba-tiba), lalu keluar dari loop-nya dengan
-    # bersih. TIDAK ADA kill/force-stop di jalur ini sama sekali -- proses
-    # package dibiarkan hidup, cukup di-trigger balik ke Lobby di background
-    # (lihat _send_package_to_lobby).
+    # bersih. Pop JUGA dilakukan SEBELUM kill di background dijalankan,
+    # supaya loop restore-survivor (_finish_kill_and_restore_survivors)
+    # tidak pernah menganggap package ini sendiri sebagai survivor.
     SESSIONS.pop(pkg, None)
 
-    log.info(f"[FINISH] session={session_id} package={pkg} -- STOP_SESSION diterima, session "
-             f"selesai (TANPA kill/force-stop). Trigger balik ke Lobby berjalan di background, "
-             f"package/session lain tidak disentuh (isolasi per-package).")
+    log.info(f"[FINISH] session={session_id} package={pkg} pid={target_pid} -- STOP_SESSION "
+             f"diterima, kill target + restore-foreground survivor berjalan di background.")
 
     # (3) Fire-and-forget: TIDAK menunda COMMAND_RESULT di bawah ini --
-    # bot/staff tetap dapat balasan STOPPED secepat mungkin, trigger-ke-Lobby
-    # (TANPA kill, TANPA clear-data, TANPA rejoin -- lihat docstring
-    # _send_package_to_lobby) berjalan di background dan sepenuhnya scoped
-    # ke `pkg` (lihat isolasi & guard di docstring _send_package_to_lobby).
+    # bot/staff tetap dapat balasan STOPPED secepat mungkin, kill target +
+    # restore-foreground survivor (lihat docstring
+    # _finish_kill_and_restore_survivors) berjalan di background.
     # do_reset=False tersedia untuk pemanggil lain di masa depan yang butuh
-    # stop TANPA trigger-ke-Lobby (tidak dipakai saat ini -- semua caller
-    # existing/reconcile_sync tetap dapat perilaku trigger ini).
+    # stop TANPA kill+restore (tidak dipakai saat ini -- semua caller
+    # existing/reconcile_sync tetap dapat perilaku ini).
     if do_reset:
         asyncio.create_task(
-            _send_package_to_lobby(local_device_id, session_id, pkg, info.get("order_id"))
+            _finish_kill_and_restore_survivors(local_device_id, session_id, pkg, target_pid)
         )
 
     return {"type": "COMMAND_RESULT", "command": "STOP_SESSION", "device_id": local_device_id,
@@ -621,8 +641,10 @@ async def _headless_watchdog_loop(pkg: str) -> None:
     mengubah status jadi STOPPED, watchdog otomatis skip package itu di
     siklus berikutnya, tidak perlu logic tambahan. Loop berhenti sendiri
     kalau entry package-nya dihapus dari SESSIONS (dilakukan handle_stop_session
-    segera setelah Finish, TANPA menunggu kill -- STOP_SESSION versi ini
-    memang tidak pernah melakukan kill/force-stop sama sekali).
+    segera, SEBELUM kill target PID di background dijalankan lewat
+    _finish_kill_and_restore_survivors -- watchdog package ini sendiri
+    tidak perlu ikut menunggu kill selesai, karena entry-nya sudah tidak
+    ada di SESSIONS begitu Finish diterima).
     """
     log.info(f"SESSION_AGENT: watchdog headless mulai untuk {pkg}.")
     try:

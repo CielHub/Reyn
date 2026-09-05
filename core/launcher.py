@@ -255,7 +255,7 @@ def _debug_dump_task_state(pkg_name, task_id):
         log.warning(f"FREEFORM DEBUG: gagal dump state ({str(e)}).")
 
 
-def _apply_freeform_grid(pkg_name):
+def _apply_freeform_grid(pkg_name, max_wait_seconds=3.0, poll_interval=0.3):
     """
     Resize/reposisi window pkg_name sesuai slot grid otomatisnya lewat
     `am task resize`. Dipanggil HANYA setelah am start dengan windowingMode
@@ -263,17 +263,49 @@ def _apply_freeform_grid(pkg_name):
     windowingMode benar-benar diterapkan OS -- lihat _debug_dump_task_state().
     Kegagalan resize di sini cuma di-log, tidak pernah bikin launch_and_wait
     gagal gara-gara ini.
+
+    FIX (race condition cold-launch, lihat laporan bug "freeform tapi
+    window tidak muncul"): pada cold launch dari deep link, Roblox lewat
+    activity proxy sementara (ActivityProtocolLaunch, translucent, task
+    short-lived) SEBELUM pindah ke task final (ActivityNativeMain).
+    sleep(0.5) tetap lalu langsung ambil taskId pertama yang ketemu bisa
+    kena task proxy itu -- resize "sukses" tapi ke task yang sebentar
+    lagi mati, sementara task final (yang benar-benar dilihat user) tidak
+    pernah dapat `am task resize` sama sekali. Ini konsisten dengan temuan
+    manual: kalau Roblox sudah stabil di 1 task (dibuka+login manual
+    duluan), tidak ada transisi task lagi saat di-assign -> resize
+    langsung kena task yang benar.
+
+    Ganti jadi polling singkat sampai taskId STABIL (2x baca berturut-turut
+    identik) sebelum resize, alih-alih asal ambil bacaan pertama.
+
+    Return taskId yang di-resize (atau None) supaya caller bisa
+    re-verify setelah Smart Wait selesai (lihat _reverify_freeform_window).
     """
     try:
         slot = _assign_slot(pkg_name)
         bounds = _compute_grid_bounds(slot)
-        time.sleep(0.5)  # beri jeda kecil supaya taskId sempat terdaftar di activity stack
-        task_id = _get_task_id(pkg_name)
+
+        previous_task_id = None
+        stable_task_id = None
+        deadline = time.time() + max_wait_seconds
+        while time.time() < deadline:
+            time.sleep(poll_interval)
+            current = _get_task_id(pkg_name)
+            if current and current == previous_task_id:
+                stable_task_id = current
+                break
+            previous_task_id = current
+        task_id = stable_task_id or previous_task_id
+
         if not task_id:
             log.warning(f"FREEFORM RESIZE: taskId untuk {pkg_name} tidak ditemukan, skip resize "
                         f"(window tetap freeform ukuran default).")
             _debug_dump_task_state(pkg_name, None)
-            return
+            return None
+        if not stable_task_id:
+            log.warning(f"FREEFORM RESIZE: taskId {pkg_name} belum stabil dalam {max_wait_seconds}s "
+                        f"(masih transisi), pakai bacaan terakhir taskId={task_id} -- akan di-reverify setelah Smart Wait.")
         left, top, right, bottom = bounds
         result = _shell_with_fallback(['am', 'task', 'resize', task_id,
                                         str(left), str(top), str(right), str(bottom)])
@@ -283,8 +315,46 @@ def _apply_freeform_grid(pkg_name):
         else:
             log.info(f"FREEFORM RESIZE: {pkg_name} (slot {slot}) taskId={task_id} -> {bounds}")
         _debug_dump_task_state(pkg_name, task_id)
+        return task_id
     except Exception as e:
         log.warning(f"FREEFORM RESIZE: error tak terduga untuk {pkg_name} ({str(e)}), lanjut tanpa resize.")
+        return None
+
+
+def _reverify_freeform_window(pkg_name, applied_task_id):
+    """
+    Dipanggil SETELAH Smart Wait selesai (proses dianggap hidup/join
+    selesai diproses). Cek ulang apakah taskId aktif Roblox SEKARANG
+    masih sama dengan taskId yang kita resize tadi di _apply_freeform_grid.
+
+    Kalau berbeda, artinya Roblox sempat berpindah task (transisi internal
+    ActivityProtocolLaunch -> ActivityNativeMain yang belum kelar saat
+    resize pertama dilakukan) -- taskId lama itu sudah tidak relevan, dan
+    task barunya TIDAK PERNAH kena `am task resize`. Ini akar bug "mode=
+    freeform, visible=true di dumpsys, tapi window tidak muncul di layar".
+
+    Fix minimal: kalau taskId berubah, panggil ulang _apply_freeform_grid
+    sekali untuk taskId baru itu. Tidak mengubah apa pun di alur Smart
+    Wait/logcat/verify_join -- murni langkah verifikasi+koreksi tambahan
+    di akhir, dan gagal di sini cuma di-log (tidak pernah bikin
+    launch_and_wait gagal gara-gara ini).
+    """
+    if not applied_task_id:
+        return
+    try:
+        current_task_id = _get_task_id(pkg_name)
+        if not current_task_id:
+            return
+        if current_task_id != applied_task_id:
+            log.warning(f"FREEFORM RE-VERIFY: {pkg_name} pindah task ({applied_task_id} -> {current_task_id}) "
+                        f"setelah resize pertama -- kemungkinan transisi ActivityProtocolLaunch->NativeMain "
+                        f"belum selesai saat resize awal. Resize ulang ke taskId baru.")
+            _apply_freeform_grid(pkg_name)
+        else:
+            log.info(f"FREEFORM RE-VERIFY: {pkg_name} taskId tetap {current_task_id} (tidak ada transisi lanjutan).")
+            _debug_dump_task_state(pkg_name, current_task_id)
+    except Exception as e:
+        log.warning(f"FREEFORM RE-VERIFY: error tak terduga untuk {pkg_name} ({str(e)}), lewati.")
 
 def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=False):
     """
@@ -405,8 +475,9 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
         log.error(f"LAUNCH COMMAND FAILED [{pkg_name}]: rc={launch_result.returncode}")
         return ("FAILED", "LAUNCH_COMMAND_FAILED") if require_join_signal else False
 
+    freeform_task_id = None
     if freeform_applied:
-        _apply_freeform_grid(pkg_name)
+        freeform_task_id = _apply_freeform_grid(pkg_name)
 
     log.info(f"Smart Wait: Menunggu {pkg_name} terhubung ({timeout_seconds} detik)...")
     
@@ -481,6 +552,13 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
         except subprocess.TimeoutExpired:
             process.kill() 
         
+    # FIX (race condition freeform, lihat _reverify_freeform_window): pastikan
+    # taskId yang kita resize di awal masih taskId yang sama dengan taskId
+    # aktif Roblox SEKARANG (setelah Smart Wait) -- kalau sempat berpindah
+    # karena transisi internal, resize ulang ke taskId barunya di sini.
+    if freeform_applied:
+        _reverify_freeform_window(pkg_name, freeform_task_id)
+
     final_pid = get_pid_quick(pkg_name)
     if not final_pid:
         log.error(f"LAUNCH FAILED: {pkg_name} gagal diluncurkan (Proses mati secara prematur).")

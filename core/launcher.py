@@ -203,24 +203,66 @@ def _compute_grid_bounds(slot_index, total_slots=_FREEFORM_MAX_SLOTS):
 
 
 def _get_task_id(pkg_name):
-    """Cari taskId aktif untuk pkg_name lewat `dumpsys activity activities`."""
+    """
+    Cari taskId aktif untuk pkg_name lewat `dumpsys activity activities`.
+
+    FIX: regex lama (`taskId=(\\d+)`) SELALU gagal match di device manapun --
+    output asli dumpsys tidak pernah literally menulis string "taskId=".
+    Format yang benar-benar dipakai (stabil dari Android lama sampai baru)
+    ada di baris ActivityRecord: "<pkg>/<Activity> t<id>}" -- ini yang
+    dicari duluan. Fallback ke pola Task{...} lama ("#<id>") kalau baris
+    ActivityRecord tidak ketemu (mis. beda locale/format vendor).
+    """
     result = _shell_with_fallback(['dumpsys', 'activity', 'activities'])
     out = result.stdout or ''
     for line in out.splitlines():
-        if pkg_name in line and 'taskId' in line:
-            match = re.search(r'taskId=(\d+)', line)
-            if match:
-                return match.group(1)
+        if pkg_name not in line:
+            continue
+        # Format ActivityRecord: "...com.roblox.client/.MainActivity t1234}"
+        match = re.search(rf'{re.escape(pkg_name)}/\S*\s+t(\d+)\b', line)
+        if match:
+            return match.group(1)
+    for line in out.splitlines():
+        if pkg_name not in line:
+            continue
+        # Fallback format Task{...}/TaskRecord{...}: "...#1234..."
+        match = re.search(r'[Tt]ask(?:Record)?\{[^}]*#(\d+)', line)
+        if match:
+            return match.group(1)
     return None
+
+
+def _debug_dump_task_state(pkg_name, task_id):
+    """
+    Diagnostik: setelah launch+resize freeform, log baris mentah dumpsys
+    yang menyebut pkg_name/task_id ini -- supaya kalau window masih
+    fullscreen padahal am start 'sukses', ada data konkret (bukan tebakan)
+    buat cek apakah windowingMode beneran diterapkan OS atau cuma
+    di-ignore diam-diam (rc=0 dari am start TIDAK menjamin freeform benar2
+    aktif -- banyak ROM/build silently ignore flag ini di layar utama HP
+    biasa, beda dari tablet/Chromebook/DeX).
+    """
+    try:
+        result = _shell_with_fallback(['dumpsys', 'activity', 'activities'])
+        out = result.stdout or ''
+        relevant = [ln.strip() for ln in out.splitlines()
+                    if pkg_name in ln or (task_id and f'#{task_id}' in ln) or (task_id and f't{task_id}' in ln)]
+        if relevant:
+            log.info(f"FREEFORM DEBUG [{pkg_name}]: " + " | ".join(relevant[:6]))
+        else:
+            log.info(f"FREEFORM DEBUG [{pkg_name}]: tidak ada baris relevan ditemukan di dumpsys.")
+    except Exception as e:
+        log.warning(f"FREEFORM DEBUG: gagal dump state ({str(e)}).")
 
 
 def _apply_freeform_grid(pkg_name):
     """
     Resize/reposisi window pkg_name sesuai slot grid otomatisnya lewat
     `am task resize`. Dipanggil HANYA setelah am start dengan windowingMode
-    freeform sukses. Kegagalan di sini cuma di-log (window tetap freeform,
-    hanya ukuran/posisi default yang tidak berubah) -- tidak pernah bikin
-    launch_and_wait gagal gara-gara ini.
+    freeform sukses (rc=0). CATATAN: rc=0 dari am start TIDAK MENJAMIN
+    windowingMode benar-benar diterapkan OS -- lihat _debug_dump_task_state().
+    Kegagalan resize di sini cuma di-log, tidak pernah bikin launch_and_wait
+    gagal gara-gara ini.
     """
     try:
         slot = _assign_slot(pkg_name)
@@ -228,8 +270,9 @@ def _apply_freeform_grid(pkg_name):
         time.sleep(0.5)  # beri jeda kecil supaya taskId sempat terdaftar di activity stack
         task_id = _get_task_id(pkg_name)
         if not task_id:
-            log.warning(f"FREEFORM RESIZE: taskId {pkg_name} tidak ditemukan, skip resize "
+            log.warning(f"FREEFORM RESIZE: taskId untuk {pkg_name} tidak ditemukan, skip resize "
                         f"(window tetap freeform ukuran default).")
+            _debug_dump_task_state(pkg_name, None)
             return
         left, top, right, bottom = bounds
         result = _shell_with_fallback(['am', 'task', 'resize', task_id,
@@ -239,6 +282,7 @@ def _apply_freeform_grid(pkg_name):
                         f"{(result.stderr or result.stdout or '').strip()}")
         else:
             log.info(f"FREEFORM RESIZE: {pkg_name} (slot {slot}) taskId={task_id} -> {bounds}")
+        _debug_dump_task_state(pkg_name, task_id)
     except Exception as e:
         log.warning(f"FREEFORM RESIZE: error tak terduga untuk {pkg_name} ({str(e)}), lanjut tanpa resize.")
 

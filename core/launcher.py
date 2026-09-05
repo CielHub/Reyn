@@ -255,6 +255,97 @@ def _debug_dump_task_state(pkg_name, task_id):
         log.warning(f"FREEFORM DEBUG: gagal dump state ({str(e)}).")
 
 
+def _get_current_activity_component(pkg_name, max_wait_seconds=3.0, poll_interval=0.25):
+    """Cari component Activity yang sedang benar-benar resume untuk package.
+
+    Dipakai oleh activate_freeform() untuk mengirim ulang Activity yang sama
+    dengan --windowingMode 5 SETELAH launch normal selesai. Ini penting karena
+    `am task resize` hanya mengubah bounds; ia tidak memindahkan task fullscreen
+    menjadi FREEFORM.
+    """
+    deadline = time.time() + max_wait_seconds
+    last_component = None
+    while time.time() < deadline:
+        result = _shell_with_fallback(['dumpsys', 'activity', 'activities'])
+        out = result.stdout or ''
+        for line in out.splitlines():
+            if pkg_name not in line:
+                continue
+            # Umum pada Android 11/12: mResumedActivity: ActivityRecord{... pkg/.Activity ...}
+            if 'mResumedActivity' in line or 'ResumedActivity' in line or 'topResumedActivity' in line:
+                match = re.search(rf'({re.escape(pkg_name)}/[^\s}}]+)', line)
+                if match:
+                    last_component = match.group(1).rstrip('}')
+                    return last_component
+        time.sleep(poll_interval)
+    return last_component
+
+
+def _switch_task_to_freeform(pkg_name, task_id=None, max_attempts=3):
+    """Ubah task yang SUDAH aktif dari fullscreen -> freeform.
+
+    `am task resize` TIDAK melakukan perubahan windowing mode. Android AOSP
+    sendiri menggunakan launch dengan `WINDOWING_MODE_FREEFORM` / mode 5 untuk
+    masuk ke freeform. Karena Roblox sudah hidup, kita ulangi Activity yang
+    sedang aktif dengan --windowingMode 5 + --activity-single-top agar tidak
+    membuat instance baru dan tidak mengirim deeplink target/lobby lagi.
+    """
+    if not is_android12():
+        return False
+
+    component = _get_current_activity_component(pkg_name)
+    if not component:
+        log.warning(f"FREEFORM MODE: Activity aktif untuk {pkg_name} tidak ditemukan.")
+        return False
+
+    _ensure_freeform_settings_once()
+    args = ['am', 'start', '--windowingMode', '5', '--activity-single-top', '-n', component]
+
+    for attempt in range(1, max_attempts + 1):
+        result = _shell_with_fallback(args)
+        output = ((result.stdout or '') + '\n' + (result.stderr or '')).strip()
+        if result.returncode == 0 and 'error' not in output.lower():
+            log.info(f"FREEFORM MODE: {pkg_name} taskId={task_id or '-'} -> windowingMode=5 "
+                     f"via {component} (attempt {attempt}/{max_attempts}).")
+            # Beri WM kesempatan menyelesaikan transition sebelum resize.
+            time.sleep(0.35)
+            return True
+        log.warning(f"FREEFORM MODE: percobaan {attempt}/{max_attempts} gagal untuk {pkg_name}: "
+                    f"{output[-500:]}")
+        time.sleep(0.5)
+    return False
+
+
+def _task_is_freeform(pkg_name, task_id):
+    """Best-effort verifikasi windowingMode=FREEFORM (5) pada task/package."""
+    if not task_id:
+        return False, ''
+    result = _shell_with_fallback(['dumpsys', 'activity', 'activities'])
+    out = result.stdout or ''
+    lines = out.splitlines()
+    relevant = []
+    in_task = False
+    depth = 0
+    for line in lines:
+        if f'#{task_id}' in line or f't{task_id}' in line:
+            in_task = True
+            depth = 0
+        if in_task:
+            relevant.append(line)
+            depth += 1
+            # Task blocks in Android dumpsys are usually compact. Stop after
+            # enough lines once package + windowingMode have been observed.
+            if len(relevant) >= 40:
+                break
+    if not relevant:
+        relevant = [line for line in lines if pkg_name in line][:40]
+    text = '\n'.join(relevant)
+    low = text.lower().replace(' ', '')
+    # Accept common dumpsys spellings: windowingMode=5 / mWindowingMode=5.
+    ok = bool(re.search(r'(?:m?windowingmode|windowingmode)[:=]5\b', low))
+    return ok, text
+
+
 def _apply_freeform_grid(pkg_name, max_wait_seconds=3.0, poll_interval=0.3):
     """
     Resize/reposisi window pkg_name sesuai slot grid otomatisnya lewat
@@ -409,7 +500,7 @@ def _window_appears_onscreen(pkg_name, task_id):
     relevant_text = ""
     for block in blocks:
         block_text = "\n".join(block)
-        if pkg_name in block_text and (not task_id or f't{task_id}' in block_text or f'#{task_id}' in block_text or True):
+        if pkg_name in block_text and (not task_id or f't{task_id}' in block_text or f'#{task_id}' in block_text):
             relevant_text += block_text + "\n"
 
     if not relevant_text:
@@ -423,53 +514,73 @@ def _window_appears_onscreen(pkg_name, task_id):
 
 
 def activate_freeform(pkg_name):
-    """
-    Titik masuk EKSPLISIT untuk mengubah pkg_name (yang SUDAH dipastikan
-    aktif/ready oleh caller lewat launch_and_wait(..., defer_freeform=True))
-    menjadi Freeform, dan MEMASTIKAN window-nya benar-benar tampil di layar
-    (bukan cuma task/activity metadata bilang "freeform"/"visible").
+    """Aktifkan Freeform SETELAH Roblox sudah ready.
 
-    Urutan sesuai permintaan: LAUNCH ROBLOX (sudah selesai sebelum fungsi ini
-    dipanggil) -> WAIT ROBLOX READY (sudah selesai) -> UBAH KE FREEFORM ->
-    VERIFY WINDOW BENAR-BENAR MUNCUL -> baru caller lanjut proses berikutnya.
+    Urutan penting:
+      1) ambil task/activity yang sudah stabil;
+      2) benar-benar pindahkan task ke windowingMode 5 melalui `am start` pada
+         Activity yang sama (bukan sekadar resize);
+      3) baru apply bounds/grid;
+      4) verifikasi mode + surface.
 
-    Return (ok: bool, task_id: str|None). ok=False TIDAK berarti proses
-    joki gagal -- ini murni status kosmetik freeform, caller (session_agent)
-    tetap melanjutkan sesi seperti biasa kalau ok=False, cuma window-nya
-    kemungkinan tetap di mode/posisi lama.
-
-    No-op (return False, None) kalau bukan Android 12 -- gerbang sama
-    seperti launch_and_wait, tidak ada risiko ke device lain.
+    Freeform tetap kosmetik. Gagal di sini tidak menggagalkan session.
     """
     if not is_android12():
         return False, None
 
     _ensure_freeform_settings_once()
 
-    task_id = None
+    last_task_id = None
     for attempt in range(1, _FREEFORM_VERIFY_ATTEMPTS + 1):
-        task_id = _apply_freeform_grid(pkg_name)
+        task_id = _get_task_id(pkg_name)
         if not task_id:
-            log.warning(f"FREEFORM ACTIVATE: {pkg_name} percobaan {attempt}/{_FREEFORM_VERIFY_ATTEMPTS} -- "
-                        f"taskId tidak ditemukan, tidak bisa resize.")
+            log.warning(f"FREEFORM ACTIVATE: {pkg_name} taskId belum ditemukan "
+                        f"(percobaan {attempt}/{_FREEFORM_VERIFY_ATTEMPTS}).")
+            time.sleep(_FREEFORM_VERIFY_RETRY_DELAY_SECONDS)
+            continue
+        last_task_id = task_id
+
+        # KUNCI FIX: resize saja tidak mengubah fullscreen -> freeform.
+        mode_changed = _switch_task_to_freeform(pkg_name, task_id)
+        if not mode_changed:
+            log.warning(f"FREEFORM ACTIVATE: {pkg_name} gagal mengirim transition ke windowingMode=5 "
+                        f"(attempt {attempt}/{_FREEFORM_VERIFY_ATTEMPTS}).")
             time.sleep(_FREEFORM_VERIFY_RETRY_DELAY_SECONDS)
             continue
 
-        onscreen, evidence = _window_appears_onscreen(pkg_name, task_id)
-        if onscreen:
-            log.info(f"FREEFORM ACTIVATE: {pkg_name} taskId={task_id} TERKONFIRMASI tampil di layar "
-                     f"(percobaan {attempt}/{_FREEFORM_VERIFY_ATTEMPTS}).")
-            return True, task_id
+        # Activity launch dengan mode 5 dapat membuat/menukar task. Ambil task
+        # terbaru setelah transition, lalu resize task FINAL, bukan task proxy.
+        time.sleep(0.25)
+        final_task_id = _get_task_id(pkg_name) or task_id
+        last_task_id = final_task_id
+        _apply_freeform_grid(pkg_name, max_wait_seconds=2.0, poll_interval=0.2)
 
-        log.warning(f"FREEFORM ACTIVATE: {pkg_name} taskId={task_id} sudah di-resize tapi BELUM "
-                    f"terkonfirmasi tampil di layar (percobaan {attempt}/{_FREEFORM_VERIFY_ATTEMPTS})"
-                    + (f" -- window dump: {evidence.strip()[:400]!r}" if evidence else " -- tidak ada window dump ditemukan untuk pkg ini."))
+        # Verifikasi mode terlebih dahulu. Jangan menganggap rc=0 dari am start
+        # sebagai bukti freeform.
+        is_freeform, mode_evidence = _task_is_freeform(pkg_name, final_task_id)
+        if not is_freeform:
+            log.warning(f"FREEFORM ACTIVATE: {pkg_name} taskId={final_task_id} masih BELUM "
+                        f"terkonfirmasi windowingMode=5 (attempt {attempt}/{_FREEFORM_VERIFY_ATTEMPTS}).")
+            if mode_evidence:
+                log.info(f"FREEFORM MODE DEBUG [{pkg_name}]: {mode_evidence[:1200].replace(chr(10), ' | ')}")
+            time.sleep(_FREEFORM_VERIFY_RETRY_DELAY_SECONDS)
+            continue
+
+        onscreen, evidence = _window_appears_onscreen(pkg_name, final_task_id)
+        if onscreen:
+            log.info(f"FREEFORM ACTIVATE: {pkg_name} taskId={final_task_id} TERKONFIRMASI "
+                     f"FREEFORM + tampil di layar (attempt {attempt}/{_FREEFORM_VERIFY_ATTEMPTS}).")
+            return True, final_task_id
+
+        log.warning(f"FREEFORM ACTIVATE: {pkg_name} mode=FREEFORM sudah terdeteksi tetapi surface "
+                    f"belum terkonfirmasi tampil (attempt {attempt}/{_FREEFORM_VERIFY_ATTEMPTS}).")
+        if evidence:
+            log.info(f"FREEFORM WINDOW DEBUG [{pkg_name}]: {evidence[:1000].replace(chr(10), ' | ')}")
         time.sleep(_FREEFORM_VERIFY_RETRY_DELAY_SECONDS)
 
-    log.error(f"FREEFORM ACTIVATE: {pkg_name} GAGAL dipastikan tampil di layar setelah "
-              f"{_FREEFORM_VERIFY_ATTEMPTS}x percobaan (taskId terakhir={task_id}). "
-              f"Lanjut tanpa freeform terverifikasi -- sesi TIDAK dihentikan gara-gara ini.")
-    return False, task_id
+    log.error(f"FREEFORM ACTIVATE: {pkg_name} gagal setelah {_FREEFORM_VERIFY_ATTEMPTS} percobaan "
+              f"(taskId terakhir={last_task_id}). Session tetap dilanjutkan tanpa freeform terverifikasi.")
+    return False, last_task_id
 
 
 def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=False, defer_freeform=False):

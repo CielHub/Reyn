@@ -11,10 +11,11 @@ import asyncio
 import time
 
 from core.logger import log
-from core.deeplink import get_place_intent
+from core.deeplink import get_place_intent, get_lobby_intent
 from core.launcher import launch_and_wait, activate_freeform, get_pid_quick
 from core import process_manager
 from core import session_agent
+from core.join_verifier import has_recent_disconnect_signal
 
 # Current Steal An Egg (and Collect Rare Pets), verified Sep 2026.
 STEAL_AN_EGG_PLACE_ID = "107778070777162"
@@ -83,7 +84,7 @@ async def _snapshot(test: dict) -> dict:
         "type": "TEST_AFK_STATUS",
         "device_id": test["device_id"],
         "test_id": test["test_id"],
-        "elapsed_seconds": int(max(0, now - test["started_at"])),
+        "elapsed_seconds": int(max(0, now - test.get("afk_started_at", test["started_at"]))),
         "alive": alive,
         "total": len(test["packages"]),
         "peak_alive": test.get("peak_alive", alive),
@@ -91,30 +92,51 @@ async def _snapshot(test: dict) -> dict:
     }
 
 
+async def _activate_test_freeform_and_restore(test: dict, pkg: str) -> None:
+    """Mirror the normal CARRERA Freeform step, but keep state isolated from SESSIONS."""
+    try:
+        ok, task_id = await asyncio.to_thread(activate_freeform, pkg)
+    except Exception:
+        ok, task_id = False, None
+        log.warning(f"TEST_AGENT: Freeform exception {pkg}.", exc_info=True)
+
+    info = test["packages"][pkg]
+    info["freeform"] = bool(ok)
+    info["task_id"] = task_id
+
+    if not ok:
+        return
+
+    # Same idea as session_agent sibling restore, but ONLY for packages in this test.
+    for sibling, sibling_info in test["packages"].items():
+        if sibling == pkg or sibling_info.get("state") != "ALIVE":
+            continue
+        try:
+            await asyncio.to_thread(process_manager.restore_foreground, sibling)
+        except Exception:
+            log.warning(f"TEST_AGENT: gagal restore sibling {sibling} setelah Freeform {pkg}.", exc_info=True)
+
+
 async def _launch_one(test: dict, pkg: str) -> None:
+    """Full staged CARRERA launch flow, without creating a joki session."""
     info = test["packages"][pkg]
     if test["stop_event"].is_set():
         info["state"] = "CANCELLED"
         return
 
+    # 1) LOBBY: launch NORMAL, Smart Wait, baru Freeform.
     try:
-        intent_url = get_place_intent(STEAL_AN_EGG_PLACE_ID)
-        result = await asyncio.to_thread(
-            launch_and_wait,
-            pkg,
-            intent_url,
-            TEST_TIMEOUT_SECONDS,
-            False,
-            True,  # launch normal dulu; Freeform setelah Roblox ready
+        lobby_ok = await asyncio.to_thread(
+            launch_and_wait, pkg, get_lobby_intent(), TEST_TIMEOUT_SECONDS,
+            False, True,
         )
     except Exception as exc:
         info["state"] = "FAILED"
-        info["reason"] = f"LAUNCH_EXCEPTION: {exc}"
-        log.error(f"TEST_AGENT: launch exception {pkg}.", exc_info=True)
+        info["reason"] = f"LOBBY_EXCEPTION: {exc}"
+        log.error(f"TEST_AGENT: lobby exception {pkg}.", exc_info=True)
         return
 
     if test["stop_event"].is_set():
-        # Jangan meninggalkan Roblox yang sempat hidup setelah operator stop.
         pid = get_pid_quick(pkg)
         if pid:
             await asyncio.to_thread(process_manager.kill_pid_direct, pid)
@@ -122,44 +144,115 @@ async def _launch_one(test: dict, pkg: str) -> None:
         info["pid"] = "-"
         return
 
-    if not result:
+    if not lobby_ok:
         info["state"] = "FAILED"
-        info["reason"] = "LAUNCH_FAILED"
+        info["reason"] = "LOBBY_LAUNCH_FAILED"
         return
 
     info["launch_ok"] = True
     info["pid"] = get_pid_quick(pkg) or "-"
+    await _activate_test_freeform_and_restore(test, pkg)
 
-    # Freeform adalah bagian setup test, bukan syarat survival.
-    try:
-        freeform_ok, task_id = await asyncio.to_thread(activate_freeform, pkg)
-        info["freeform"] = bool(freeform_ok)
-        info["task_id"] = task_id
-    except Exception:
-        info["freeform"] = False
-        info["task_id"] = None
-        log.warning(f"TEST_AGENT: Freeform exception {pkg}.", exc_info=True)
-
-    if get_pid_quick(pkg):
-        info["state"] = "ALIVE"
-    else:
+    if not get_pid_quick(pkg):
         info["state"] = "DEAD"
+        info["reason"] = "PROCESS_DIED_AFTER_LOBBY"
+        return
+
+    # 2) TARGET: launch normally, require join signal, then Freeform re-verify.
+    try:
+        join_status, join_reason = await asyncio.to_thread(
+            launch_and_wait,
+            pkg,
+            get_place_intent(STEAL_AN_EGG_PLACE_ID),
+            TEST_TIMEOUT_SECONDS,
+            True,
+            True,
+        )
+    except Exception as exc:
+        info["state"] = "FAILED"
+        info["reason"] = f"JOIN_EXCEPTION: {exc}"
+        log.error(f"TEST_AGENT: target join exception {pkg}.", exc_info=True)
+        return
+
+    if test["stop_event"].is_set():
+        pid = get_pid_quick(pkg)
+        if pid:
+            await asyncio.to_thread(process_manager.kill_pid_direct, pid)
+        info["state"] = "CANCELLED"
+        info["pid"] = "-"
+        return
+
+    if join_status == "FAILED":
+        info["state"] = "FAILED"
+        info["reason"] = f"JOIN_FAILED:{join_reason}"
+        return
+
+    if join_status == "UNCERTAIN":
+        # Same short grace-check concept as normal CARRERA, but no SESSIONS mutation.
+        grace_start = time.strftime('%m-%d %H:%M:%S.000')
+        await asyncio.sleep(2)
+        if not get_pid_quick(pkg):
+            info["state"] = "FAILED"
+            info["reason"] = "PROCESS_DIED_DURING_VERIFY"
+            return
+        try:
+            has_failure, failure_code = await asyncio.to_thread(
+                has_recent_disconnect_signal, pkg, grace_start,
+            )
+        except Exception:
+            has_failure, failure_code = False, None
+        if has_failure:
+            info["state"] = "FAILED"
+            info["reason"] = f"JOIN_ERROR_SIGNAL_{failure_code}"
+            return
+
+    await _activate_test_freeform_and_restore(test, pkg)
+    info["pid"] = get_pid_quick(pkg) or "-"
+    info["state"] = "ALIVE" if info["pid"] != "-" else "DEAD"
+    if info["state"] == "DEAD":
+        info["reason"] = "PROCESS_DIED_AFTER_TARGET"
 
 
 async def _monitor_loop(test_id: str) -> None:
     test = TESTS[test_id]
-    launch_tasks = [asyncio.create_task(_launch_one(test, pkg)) for pkg in test["packages"]]
-    test["launch_tasks"] = launch_tasks
 
-    # Kirim progress awal saat semua launch masih berlangsung.
+    # TEST AFK WAJIB launch SEQUENTIAL, mengikuti pola launch normal CARRERA:
+    # 1 package -> tunggu Roblox aktif -> aktifkan Freeform -> baru lanjut
+    # package berikutnya. Android 12/Freeform butuh task package sebelumnya
+    # sudah stabil sebelum package lain dibuka. Jangan gunakan asyncio.gather
+    # untuk launch package di sini.
     await _send(await _snapshot(test))
 
-    # Jangan menunggu launch sequential. Semua package diluncurkan paralel.
-    await asyncio.gather(*launch_tasks, return_exceptions=True)
+    for pkg in test["packages"]:
+        if test["stop_event"].is_set():
+            break
+
+        task = asyncio.create_task(_launch_one(test, pkg))
+        test["launch_tasks"] = [task]
+        try:
+            await task
+        except Exception:
+            # _launch_one sudah menangani exception internal, tetapi guard ini
+            # memastikan satu package gagal tidak mematikan seluruh test.
+            log.error(f"TEST_AGENT: launch task exception {pkg}.", exc_info=True)
+            test["packages"][pkg]["state"] = "FAILED"
+            test["packages"][pkg]["reason"] = "LAUNCH_TASK_EXCEPTION"
+        finally:
+            test["launch_tasks"] = []
+
+        if test["stop_event"].is_set():
+            break
+
+        # Update setelah SETIAP package selesai launch + Freeform. Jadi staff
+        # bisa melihat package pertama sudah ALIVE/FREEFORM sebelum package
+        # kedua dibuka.
+        await _send(await _snapshot(test))
+
     if test["stop_event"].is_set():
         return
-    await _send(await _snapshot(test))
 
+    # Semua package sudah dicoba. Mulai fase AFK monitoring murni. Package
+    # yang mati TIDAK direlaunch.
     while not test["stop_event"].is_set():
         await asyncio.sleep(STATUS_INTERVAL_SECONDS)
         if test["stop_event"].is_set():

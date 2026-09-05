@@ -3,6 +3,7 @@ Modul: launcher.py
 Tanggung Jawab: Membuka package Roblox dan menjalankan fungsi Smart Wait dengan aman.
 """
 import re
+import math
 import subprocess
 import time
 import datetime
@@ -24,6 +25,222 @@ def get_pid_quick(pkg_name):
         return pids[0] if pids else ""
     except Exception:
         return ""
+
+
+# =============================================================================
+# AUTO FREEFORM/FLOATING WINDOW -- KHUSUS ANDROID 12 (SDK 31/32)
+# =============================================================================
+# Semua state di bawah ini di-cache di LEVEL MODUL (bukan di-reset tiap
+# panggilan launch_and_wait) supaya deteksi versi Android, aktivasi setting
+# freeform, dan ukuran layar CUMA dibaca SEKALI per proses/device -- bukan
+# tiap kali sebuah package di-launch. Karena tiap device menjalankan proses
+# CARRERA-HUB-nya sendiri (root-relaunch di main.py), "sekali per device"
+# di sini = sekali per lifetime proses ini berjalan di device tsb.
+#
+# Device selain Android 12 TIDAK PERNAH kena command freeform sama sekali:
+# is_android12() jadi satu-satunya syarat gerbang (if) sebelum command
+# windowingMode dipanggil di launch_and_wait(). Kalau False, am start jalan
+# PERSIS seperti sebelum fitur ini ada (tidak ada argumen tambahan apa pun).
+_ANDROID_SDK_CACHE = None          # int SDK level, di-cache sekali
+_FREEFORM_SETTINGS_APPLIED = None  # None=belum dicoba, True/False=sudah
+_FREEFORM_SCREEN_SIZE = None       # (width, height) hasil 'wm size', di-cache
+_FREEFORM_SLOT_MAP = {}            # pkg_name -> slot grid (0..4), konsisten selama proses hidup
+_FREEFORM_MAX_SLOTS = 5
+_FREEFORM_RETRY_ATTEMPTS = 3       # sesuai keputusan: coba paksa dulu beberapa kali sebelum fallback normal
+
+
+def _run_shell(args, use_su=False, timeout=10):
+    """Jalankan satu command shell, opsional lewat `su -c "..."` (device sudah root)."""
+    try:
+        if use_su:
+            joined = " ".join(args)
+            return subprocess.run(['su', '-c', joined], capture_output=True, text=True,
+                                   errors='replace', timeout=timeout)
+        return subprocess.run(args, capture_output=True, text=True, errors='replace', timeout=timeout)
+    except Exception as e:
+        class _FailResult:
+            returncode = 1
+            stdout = ""
+            stderr = str(e)
+        return _FailResult()
+
+
+def _shell_with_fallback(args, timeout=10):
+    """
+    Coba shell plain dulu; kalau gagal/permission denied, retry lewat
+    `su -c` (device sudah di-root, jadi semua command boleh lewat sini
+    kalau plain command kena permission denied -- sesuai arahan tugas).
+    """
+    result = _run_shell(args, use_su=False, timeout=timeout)
+    combined = ((result.stdout or '') + (result.stderr or '')).lower()
+    if result.returncode != 0 or 'permission denial' in combined or 'permission denied' in combined:
+        result = _run_shell(args, use_su=True, timeout=timeout)
+    return result
+
+
+def detect_android_sdk():
+    """
+    Baca ro.build.version.sdk SEKALI per proses (di-cache di _ANDROID_SDK_CACHE).
+    Android 12 = SDK 31, Android 12L = SDK 32. Kalau baca gagal/tidak
+    dikenali, dianggap 0 (aman -- artinya is_android12() otomatis False,
+    device TIDAK kena logic freeform sama sekali, tidak ada risiko crash
+    gara-gara flag yang tidak relevan).
+    """
+    global _ANDROID_SDK_CACHE
+    if _ANDROID_SDK_CACHE is not None:
+        return _ANDROID_SDK_CACHE
+
+    sdk = 0
+    release = "?"
+    try:
+        result = subprocess.run(['getprop', 'ro.build.version.sdk'],
+                                 capture_output=True, text=True, errors='replace', timeout=5)
+        raw = (result.stdout or '').strip()
+        if raw.isdigit():
+            sdk = int(raw)
+    except Exception as e:
+        log.warning(f"DEVICE DETECT: Gagal baca ro.build.version.sdk ({str(e)}) -- anggap non-Android12.")
+
+    try:
+        rel_result = subprocess.run(['getprop', 'ro.build.version.release'],
+                                     capture_output=True, text=True, errors='replace', timeout=5)
+        release = (rel_result.stdout or '').strip() or "?"
+    except Exception:
+        pass
+
+    _ANDROID_SDK_CACHE = sdk
+    log.info(f"DEVICE DETECT: Android release={release} (SDK={sdk}) -- terdeteksi sekali, di-cache untuk proses ini.")
+    return _ANDROID_SDK_CACHE
+
+
+def is_android12():
+    """True HANYA untuk Android 12 / 12L (SDK 31 atau 32). Ini gerbang WAJIB sebelum command freeform apa pun."""
+    return detect_android_sdk() in (31, 32)
+
+
+def _ensure_freeform_settings_once():
+    """
+    Aktifkan enable_freeform_support & force_resizable_activities SEKALI
+    per proses, HANYA kalau device Android 12 (sudah dijamin oleh caller).
+    Aman dipanggil berkali-kali -- no-op setelah percobaan pertama.
+    """
+    global _FREEFORM_SETTINGS_APPLIED
+    if _FREEFORM_SETTINGS_APPLIED is not None:
+        return _FREEFORM_SETTINGS_APPLIED
+
+    all_ok = True
+    for setting_args in (
+        ['settings', 'put', 'global', 'enable_freeform_support', '1'],
+        ['settings', 'put', 'global', 'force_resizable_activities', '1'],
+    ):
+        result = _shell_with_fallback(setting_args)
+        if result.returncode != 0:
+            all_ok = False
+            log.warning(f"FREEFORM SETUP: '{' '.join(setting_args)}' gagal (rc={result.returncode}): "
+                        f"{(result.stderr or result.stdout or '').strip()}")
+
+    _FREEFORM_SETTINGS_APPLIED = all_ok
+    log.info(f"FREEFORM SETUP: enable_freeform_support/force_resizable_activities di-set "
+             f"(Android 12 terdeteksi, ok={all_ok}).")
+    return all_ok
+
+
+def _get_screen_size():
+    """Baca resolusi layar SEKALI per proses lewat `wm size` (dipakai untuk hitung grid)."""
+    global _FREEFORM_SCREEN_SIZE
+    if _FREEFORM_SCREEN_SIZE is not None:
+        return _FREEFORM_SCREEN_SIZE
+
+    width, height = 1080, 1920  # fallback default kalau parsing gagal
+    try:
+        result = _shell_with_fallback(['wm', 'size'])
+        out = (result.stdout or '') + (result.stderr or '')
+        match = re.search(r'(\d+)\s*x\s*(\d+)', out)
+        if match:
+            width, height = int(match.group(1)), int(match.group(2))
+        else:
+            log.warning(f"FREEFORM GRID: Tidak bisa parse 'wm size' ({out.strip()!r}), pakai default {width}x{height}.")
+    except Exception as e:
+        log.warning(f"FREEFORM GRID: Gagal baca 'wm size' ({str(e)}), pakai default {width}x{height}.")
+
+    _FREEFORM_SCREEN_SIZE = (width, height)
+    return _FREEFORM_SCREEN_SIZE
+
+
+def _assign_slot(pkg_name):
+    """
+    Assign slot grid (0.._FREEFORM_MAX_SLOTS-1) untuk pkg_name. Package yang
+    sama selalu dapat slot yang sama selama proses ini hidup (konsisten,
+    tidak query ulang), slot baru dikasih urut ke package yang belum pernah
+    dilihat, lalu wrap kalau lebih dari _FREEFORM_MAX_SLOTS package aktif.
+    """
+    if pkg_name in _FREEFORM_SLOT_MAP:
+        return _FREEFORM_SLOT_MAP[pkg_name]
+    slot = len(_FREEFORM_SLOT_MAP) % _FREEFORM_MAX_SLOTS
+    _FREEFORM_SLOT_MAP[pkg_name] = slot
+    return slot
+
+
+def _compute_grid_bounds(slot_index, total_slots=_FREEFORM_MAX_SLOTS):
+    """
+    Bagi layar jadi grid serata mungkin secara otomatis berdasarkan resolusi
+    layar device saat ini (mis. 5 slot -> grid 3 kolom x 2 baris, 1 cell
+    sisa dibiarkan kosong). Return (left, top, right, bottom) buat
+    `am task resize`.
+    """
+    width, height = _get_screen_size()
+    cols = max(1, math.ceil(math.sqrt(total_slots)))
+    rows = max(1, math.ceil(total_slots / cols))
+    cell_w = width // cols
+    cell_h = height // rows
+    row = slot_index // cols
+    col = slot_index % cols
+    left = col * cell_w
+    top = row * cell_h
+    right = left + cell_w
+    bottom = top + cell_h
+    return left, top, right, bottom
+
+
+def _get_task_id(pkg_name):
+    """Cari taskId aktif untuk pkg_name lewat `dumpsys activity activities`."""
+    result = _shell_with_fallback(['dumpsys', 'activity', 'activities'])
+    out = result.stdout or ''
+    for line in out.splitlines():
+        if pkg_name in line and 'taskId' in line:
+            match = re.search(r'taskId=(\d+)', line)
+            if match:
+                return match.group(1)
+    return None
+
+
+def _apply_freeform_grid(pkg_name):
+    """
+    Resize/reposisi window pkg_name sesuai slot grid otomatisnya lewat
+    `am task resize`. Dipanggil HANYA setelah am start dengan windowingMode
+    freeform sukses. Kegagalan di sini cuma di-log (window tetap freeform,
+    hanya ukuran/posisi default yang tidak berubah) -- tidak pernah bikin
+    launch_and_wait gagal gara-gara ini.
+    """
+    try:
+        slot = _assign_slot(pkg_name)
+        bounds = _compute_grid_bounds(slot)
+        time.sleep(0.5)  # beri jeda kecil supaya taskId sempat terdaftar di activity stack
+        task_id = _get_task_id(pkg_name)
+        if not task_id:
+            log.warning(f"FREEFORM RESIZE: taskId {pkg_name} tidak ditemukan, skip resize "
+                        f"(window tetap freeform ukuran default).")
+            return
+        left, top, right, bottom = bounds
+        result = _shell_with_fallback(['am', 'task', 'resize', task_id,
+                                        str(left), str(top), str(right), str(bottom)])
+        if result.returncode != 0:
+            log.warning(f"FREEFORM RESIZE: gagal resize taskId={task_id} {pkg_name} -> {bounds}: "
+                        f"{(result.stderr or result.stdout or '').strip()}")
+        else:
+            log.info(f"FREEFORM RESIZE: {pkg_name} (slot {slot}) taskId={task_id} -> {bounds}")
+    except Exception as e:
+        log.warning(f"FREEFORM RESIZE: error tak terduga untuk {pkg_name} ({str(e)}), lanjut tanpa resize.")
 
 def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=False):
     """
@@ -88,30 +305,65 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     log.info(f"LAUNCH: Membuka {pkg_name}...")
     
     start_time_str = datetime.datetime.now().strftime('%m-%d %H:%M:%S.000')
-    
-    launch_result = subprocess.run(
-        # --activity-single-top: WAJIB supaya intent ini TETAP dikirim ke
-        # activity yang sudah berjalan lewat onNewIntent() walau activity
-        # tsb kebetulan sudah di posisi paling atas/foreground (skenario
-        # persis "trigger balik ke Lobby" pada package yang masih hidup di
-        # tengah game -- tanpa flag ini, Android hanya membalas "brought to
-        # the front" TANPA benar-benar mengirim data intent-nya ke app,
-        # sehingga Roblox tidak pernah tahu ada perintah roblox:// baru dan
-        # tetap diam di layar game lama walau proses/foreground check kita
-        # tetap lolos/false-positive).
-        ['am', 'start', '--activity-single-top', '-p', pkg_name,
-         '-a', 'android.intent.action.VIEW', '-d', intent_url],
-        capture_output=True,
-        text=True,
-        errors='replace',
-    )
+
+    # --activity-single-top: WAJIB supaya intent ini TETAP dikirim ke
+    # activity yang sudah berjalan lewat onNewIntent() walau activity
+    # tsb kebetulan sudah di posisi paling atas/foreground (skenario
+    # persis "trigger balik ke Lobby" pada package yang masih hidup di
+    # tengah game -- tanpa flag ini, Android hanya membalas "brought to
+    # the front" TANPA benar-benar mengirim data intent-nya ke app,
+    # sehingga Roblox tidak pernah tahu ada perintah roblox:// baru dan
+    # tetap diam di layar game lama walau proses/foreground check kita
+    # tetap lolos/false-positive).
+    base_am_args = ['am', 'start', '--activity-single-top', '-p', pkg_name,
+                     '-a', 'android.intent.action.VIEW', '-d', intent_url]
+
+    # === AUTO FREEFORM/FLOATING WINDOW -- KHUSUS ANDROID 12 (SDK 31/32) ===
+    # is_android12() adalah SATU-SATUNYA gerbang: device selain Android 12
+    # jatuh langsung ke else di bawah dan menjalankan am start PERSIS seperti
+    # sebelum fitur ini ada -- tidak ada argumen tambahan, tidak ada risiko
+    # error/crash gara-gara flag windowingMode yang tidak relevan di versi
+    # itu. Deteksi SDK & aktivasi setting freeform sendiri sudah di-cache
+    # sekali per proses (lihat detect_android_sdk()/_ensure_freeform_settings_once()),
+    # jadi baris di bawah ini TIDAK melakukan query ulang tiap launch.
+    use_freeform = is_android12()
+    freeform_applied = False
+    launch_result = None
+
+    if use_freeform:
+        _ensure_freeform_settings_once()
+        freeform_am_args = ['am', 'start', '--windowingMode', '5', '--activity-single-top',
+                             '-p', pkg_name, '-a', 'android.intent.action.VIEW', '-d', intent_url]
+
+        for attempt in range(1, _FREEFORM_RETRY_ATTEMPTS + 1):
+            candidate = _shell_with_fallback(freeform_am_args)
+            candidate_out = ((candidate.stdout or '') + (candidate.stderr or '')).lower()
+            if candidate.returncode == 0 and 'error' not in candidate_out:
+                launch_result = candidate
+                freeform_applied = True
+                break
+            log.warning(f"FREEFORM LAUNCH: percobaan {attempt}/{_FREEFORM_RETRY_ATTEMPTS} gagal untuk "
+                        f"{pkg_name} (windowingMode 5 mungkin tidak didukung ROM/vendor ini): "
+                        f"{(candidate.stderr or candidate.stdout or '').strip()}")
+            time.sleep(1)
+
+        if not freeform_applied:
+            log.warning(f"FREEFORM LAUNCH: {pkg_name} fallback ke launch NORMAL (tanpa windowingMode) "
+                        f"setelah {_FREEFORM_RETRY_ATTEMPTS}x percobaan freeform gagal.")
+
+    if launch_result is None:
+        launch_result = subprocess.run(base_am_args, capture_output=True, text=True, errors='replace')
+
     launch_output = ((launch_result.stdout or '') + '\n' + (launch_result.stderr or '')).strip()
     if launch_output:
         log.info(f"LAUNCH RESULT [{pkg_name}]: {launch_output.replace(chr(10), ' | ')}")
     if launch_result.returncode != 0:
         log.error(f"LAUNCH COMMAND FAILED [{pkg_name}]: rc={launch_result.returncode}")
         return ("FAILED", "LAUNCH_COMMAND_FAILED") if require_join_signal else False
-    
+
+    if freeform_applied:
+        _apply_freeform_grid(pkg_name)
+
     log.info(f"Smart Wait: Menunggu {pkg_name} terhubung ({timeout_seconds} detik)...")
     
     logcat_cmd = ['logcat', '-T', start_time_str, '-v', 'time']

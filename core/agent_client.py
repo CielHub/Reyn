@@ -51,6 +51,7 @@ except ImportError:
 
 from core.logger import log
 from core import session_agent
+from core import test_agent
 from core import username_scanner
 from core import package_inventory
 
@@ -144,6 +145,8 @@ _COMMAND_HANDLERS = {
     "START_SESSION": session_agent.handle_start_session,
     "STOP_SESSION": session_agent.handle_stop_session,
     "SYNC_SESSIONS": session_agent.handle_sync_sessions,
+    "TEST_AFK_DEVICE": test_agent.handle_test_afk,
+    "STOP_TEST_AFK": test_agent.handle_stop_test_afk,
 }
 
 
@@ -201,6 +204,9 @@ async def _run_agent(device_id: str, token: str, ws_url: str) -> None:
                     await ws.send(json.dumps(payload))
 
                 session_agent.register_sender(_session_status_sender)
+                # Test AFK memakai callback WS yang sama, tetapi state test
+                # tetap terpisah total dari session/order.
+                test_agent.register_sender(_session_status_sender)
 
                 # PHASE 4: heartbeat & terima-command jalan BERSAMAAN dalam 1
                 # koneksi. Kalau salah satu gagal (mis. koneksi putus saat

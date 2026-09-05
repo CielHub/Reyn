@@ -133,16 +133,25 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     found_failure = False
     failure_code = None
     start_time = time.time()
-    
+    # Improve poin 3 (percepat deteksi join): keyword logcat di atas hampir
+    # tidak pernah muncul di client modifikasi (mis. Delta Lite), jadi
+    # loop ini SELALU habis nunggu sampai timeout_seconds sebelum sadar
+    # prosesnya sudah mati. Sekarang dicek tiap PID_CHECK_INTERVAL_SECONDS
+    # supaya proses yang KETAHUAN mati bisa langsung dilaporkan gagal tanpa
+    # nunggu sisa timeout habis dulu -- tidak mengubah cara SUCCESS/UNCERTAIN
+    # diputuskan sama sekali, cuma mempercepat jalur proses mati.
+    PID_CHECK_INTERVAL_SECONDS = 3
+    last_pid_check = start_time
+
     try:
         while True:
             elapsed = time.time() - start_time
             if elapsed >= timeout_seconds:
                 log.warning(f"FALLBACK: Logcat timeout. Menggunakan Dumb Wait untuk {pkg_name}.")
                 break
-                
+
             ready, _, _ = select.select([process.stdout], [], [], 1.0)
-            
+
             if ready:
                 line = process.stdout.readline()
                 if not line:
@@ -163,6 +172,12 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
                         found_failure = True
                         failure_code = match.group(1)
                         break
+            elif time.time() - last_pid_check >= PID_CHECK_INTERVAL_SECONDS:
+                last_pid_check = time.time()
+                if not get_pid_quick(pkg_name):
+                    log.warning(f"[FAST-FAIL] {pkg_name}: PID hilang sebelum timeout habis "
+                                f"(elapsed={elapsed:.1f}s) -- berhenti nunggu lebih awal.")
+                    break
     finally:
         process.terminate()
         try:

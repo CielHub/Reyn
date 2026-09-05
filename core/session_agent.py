@@ -48,8 +48,11 @@ WATCHDOG_INTERVAL_SECONDS = 15
 # per sekian detik -- SENGAJA lebih rapat dari USERNAME_SCAN_INTERVAL_SECONDS
 # biasa (yang cuma untuk tampilan heartbeat) karena di sini hasilnya
 # menggerbang transisi status (WAITING_LOGIN -> ACCOUNT_READY), staff
-# menunggu real-time di Discord.
-LOGIN_POLL_INTERVAL_SECONDS = 5
+# menunggu real-time di Discord. Improve poin 3: dipangkas 5->2 detik --
+# scan_username_blocking cuma 1x UI dump, cukup ringan buat dipoll lebih
+# rapat tanpa membebani device, dan bikin deteksi akun terasa jauh lebih
+# live buat staff yang nungguin di Discord.
+LOGIN_POLL_INTERVAL_SECONDS = 2
 
 # Batas waktu menunggu staff login akun customer sebelum menyerah dan
 # melapor START_FAILED (supaya session tidak nyangkut WAITING_LOGIN selamanya
@@ -63,8 +66,14 @@ LOGIN_WAIT_TIMEOUT_SECONDS = 1800  # 30 menit
 
 # Timeout untuk fase join ke target game SETELAH akun terkonfirmasi benar
 # (terpisah dari DEFAULT_TIMEOUT_SECONDS -- dipakai launch_and_wait()
-# dengan require_join_signal=True).
-JOIN_TIMEOUT_SECONDS = 60
+# dengan require_join_signal=True). Improve poin 3: dipangkas 60->35 detik
+# -- keyword logcat yang ditunggu nyaris tidak pernah muncul di client
+# modifikasi (mis. Delta Lite), jadi RF yang sudah beneran masuk game tidak
+# perlu nunggu selama itu cuma untuk jatuh ke jalur UNCERTAIN/grace-check.
+# launcher.py juga sekarang deteksi PID mati lebih cepat (tiap 3 detik),
+# jadi timeout ini praktis cuma jadi batas atas untuk kasus join yang
+# genuinely lambat, bukan lagi wajar kena penuh tiap kali.
+JOIN_TIMEOUT_SECONDS = 35
 
 # LIFECYCLE REVISION (Masalah #1): dipakai KHUSUS saat launch_and_wait()
 # balik "UNCERTAIN" (proses hidup, tidak ada keyword sukses MAUPUN bukti
@@ -73,7 +82,10 @@ JOIN_TIMEOUT_SECONDS = 60
 # sedikit terlambat, SEBELUM status ini diterima sebagai fallback RUNNING.
 # SENGAJA jauh lebih pendek dari JOIN_TIMEOUT_SECONDS -- ini bukan menunggu
 # join lagi dari awal, cuma observasi tambahan atas proses yang sudah hidup.
-JOIN_VERIFY_GRACE_SECONDS = 10
+# Improve poin 3: dipangkas 10->6 detik, sejalan dengan JOIN_TIMEOUT_SECONDS
+# yang juga dipangkas -- RF yang sudah beneran masuk game jadi lebih cepat
+# dianggap RUNNING alih-alih nyangkut nunggu grace period penuh.
+JOIN_VERIFY_GRACE_SECONDS = 6
 
 # Dipanggil sebelum PREPARING (buka Roblox ke lobby dulu, TANPA target) --
 # hanya perlu proses hidup, tidak perlu sinyal join game.

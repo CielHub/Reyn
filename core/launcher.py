@@ -356,8 +356,137 @@ def _reverify_freeform_window(pkg_name, applied_task_id):
     except Exception as e:
         log.warning(f"FREEFORM RE-VERIFY: error tak terduga untuk {pkg_name} ({str(e)}), lewati.")
 
-def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=False):
+
+# Berapa kali coba resize+cek ulang sebelum activate_freeform() menyerah dan
+# melapor "belum kekonfirmasi tampil" (tetap tidak pernah bikin proses joki
+# gagal -- freeform murni kosmetik/kenyamanan operator).
+_FREEFORM_VERIFY_ATTEMPTS = 3
+_FREEFORM_VERIFY_RETRY_DELAY_SECONDS = 0.6
+
+
+def _window_appears_onscreen(pkg_name, task_id):
     """
+    Verifikasi VISUAL (bukan cuma metadata task/activity) lewat
+    `dumpsys window windows` -- ini yang selama ini belum pernah dicek:
+    `dumpsys activity activities` (dipakai _debug_dump_task_state) cuma
+    menunjukkan state Activity/Task (mode=freeform, visible=true bisa saja
+    cuma berarti "terdaftar di WM sebagai visible", BUKAN jaminan Surface-nya
+    benar-benar sudah di-composite ke layar).
+
+    Cek dilakukan longgar (beberapa token umum dipakai berbagai versi/vendor
+    Android) supaya tidak false-negative di ROM yang formatnya sedikit beda:
+    isOnScreen=true / mHasSurface=true / shown=true / isReadyForDisplay=true
+    pada blok window yang menyebut pkg_name (dan task_id kalau ketemu).
+
+    CATATAN: heuristik ini best-effort -- kalau ternyata device/ROM tertentu
+    pakai token lain, activate_freeform() tetap akan melapor "GAGAL
+    verifikasi" (bukan diam-diam anggap sukses) supaya ketahuan lewat log,
+    bukan silently salah.
+    """
+    try:
+        result = _shell_with_fallback(['dumpsys', 'window', 'windows'])
+        out = result.stdout or ''
+    except Exception as e:
+        log.warning(f"FREEFORM VISUAL VERIFY: gagal jalankan dumpsys window windows ({str(e)}).")
+        return False, ""
+
+    # Pecah per blok window ("Window #N ..." di kebanyakan versi Android)
+    # supaya token isOnScreen/mHasSurface yang dicek benar2 milik window
+    # pkg_name ini, bukan kebetulan nempel di window app lain di baris dekat.
+    blocks, current = [], []
+    for line in out.splitlines():
+        if re.match(r'\s*Window #\d+', line) or line.strip().startswith('WINDOW '):
+            if current:
+                blocks.append(current)
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        blocks.append(current)
+    if not blocks:
+        blocks = [out.splitlines()]  # fallback: ROM dengan format beda, treat seluruh output 1 blok
+
+    relevant_text = ""
+    for block in blocks:
+        block_text = "\n".join(block)
+        if pkg_name in block_text and (not task_id or f't{task_id}' in block_text or f'#{task_id}' in block_text or True):
+            relevant_text += block_text + "\n"
+
+    if not relevant_text:
+        return False, ""
+
+    lowered = relevant_text.lower()
+    onscreen_tokens = ('isonscreen=true', 'ishasnsurface=true', 'mhassurface=true',
+                        'isreadyfordisplay=true', 'shown=true')
+    is_onscreen = any(tok in lowered for tok in onscreen_tokens)
+    return is_onscreen, relevant_text
+
+
+def activate_freeform(pkg_name):
+    """
+    Titik masuk EKSPLISIT untuk mengubah pkg_name (yang SUDAH dipastikan
+    aktif/ready oleh caller lewat launch_and_wait(..., defer_freeform=True))
+    menjadi Freeform, dan MEMASTIKAN window-nya benar-benar tampil di layar
+    (bukan cuma task/activity metadata bilang "freeform"/"visible").
+
+    Urutan sesuai permintaan: LAUNCH ROBLOX (sudah selesai sebelum fungsi ini
+    dipanggil) -> WAIT ROBLOX READY (sudah selesai) -> UBAH KE FREEFORM ->
+    VERIFY WINDOW BENAR-BENAR MUNCUL -> baru caller lanjut proses berikutnya.
+
+    Return (ok: bool, task_id: str|None). ok=False TIDAK berarti proses
+    joki gagal -- ini murni status kosmetik freeform, caller (session_agent)
+    tetap melanjutkan sesi seperti biasa kalau ok=False, cuma window-nya
+    kemungkinan tetap di mode/posisi lama.
+
+    No-op (return False, None) kalau bukan Android 12 -- gerbang sama
+    seperti launch_and_wait, tidak ada risiko ke device lain.
+    """
+    if not is_android12():
+        return False, None
+
+    _ensure_freeform_settings_once()
+
+    task_id = None
+    for attempt in range(1, _FREEFORM_VERIFY_ATTEMPTS + 1):
+        task_id = _apply_freeform_grid(pkg_name)
+        if not task_id:
+            log.warning(f"FREEFORM ACTIVATE: {pkg_name} percobaan {attempt}/{_FREEFORM_VERIFY_ATTEMPTS} -- "
+                        f"taskId tidak ditemukan, tidak bisa resize.")
+            time.sleep(_FREEFORM_VERIFY_RETRY_DELAY_SECONDS)
+            continue
+
+        onscreen, evidence = _window_appears_onscreen(pkg_name, task_id)
+        if onscreen:
+            log.info(f"FREEFORM ACTIVATE: {pkg_name} taskId={task_id} TERKONFIRMASI tampil di layar "
+                     f"(percobaan {attempt}/{_FREEFORM_VERIFY_ATTEMPTS}).")
+            return True, task_id
+
+        log.warning(f"FREEFORM ACTIVATE: {pkg_name} taskId={task_id} sudah di-resize tapi BELUM "
+                    f"terkonfirmasi tampil di layar (percobaan {attempt}/{_FREEFORM_VERIFY_ATTEMPTS})"
+                    + (f" -- window dump: {evidence.strip()[:400]!r}" if evidence else " -- tidak ada window dump ditemukan untuk pkg ini."))
+        time.sleep(_FREEFORM_VERIFY_RETRY_DELAY_SECONDS)
+
+    log.error(f"FREEFORM ACTIVATE: {pkg_name} GAGAL dipastikan tampil di layar setelah "
+              f"{_FREEFORM_VERIFY_ATTEMPTS}x percobaan (taskId terakhir={task_id}). "
+              f"Lanjut tanpa freeform terverifikasi -- sesi TIDAK dihentikan gara-gara ini.")
+    return False, task_id
+
+
+def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=False, defer_freeform=False):
+    """
+    defer_freeform (default False -- PERILAKU LAMA TIDAK BERUBAH untuk semua
+    pemanggil existing yang tidak mengisi argumen ini): kalau True, fungsi
+    ini SELALU melakukan launch NORMAL (`base_am_args`, tanpa `--windowingMode
+    5` sama sekali) dan TIDAK melakukan resize/verify freeform apa pun di
+    sini -- walaupun device Android 12. Dipakai session_agent.py supaya
+    urutan barunya jadi: LAUNCH NORMAL -> tunggu Roblox benar-benar aktif
+    (Smart Wait selesai di sini) -> BARU caller memanggil
+    activate_freeform(pkg_name) secara eksplisit setelah itu. Ini menghindari
+    memaksa windowingMode freeform SAAT Roblox masih transisi
+    (ActivityProtocolLaunch -> ActivityNativeMain / splash), yang terbukti
+    jadi sumber window "freeform tapi tidak muncul di layar" walau dumpsys
+    bilang visible=true.
+
     FIX (Lobby-trigger tidak sampai ke app): `am start` di bawah SELALU
     memakai `--activity-single-top`. Tanpa flag ini, kalau activity package
     kebetulan SUDAH di posisi paling atas (mis. package masih di tengah
@@ -440,7 +569,7 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     # itu. Deteksi SDK & aktivasi setting freeform sendiri sudah di-cache
     # sekali per proses (lihat detect_android_sdk()/_ensure_freeform_settings_once()),
     # jadi baris di bawah ini TIDAK melakukan query ulang tiap launch.
-    use_freeform = is_android12()
+    use_freeform = is_android12() and not defer_freeform
     freeform_applied = False
     launch_result = None
 

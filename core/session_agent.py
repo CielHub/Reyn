@@ -35,7 +35,7 @@ import datetime
 
 from core.logger import log
 from core.deeplink import get_intent_url, get_lobby_intent
-from core.launcher import launch_and_wait, get_pid_quick
+from core.launcher import launch_and_wait, get_pid_quick, activate_freeform
 from core.join_verifier import has_recent_disconnect_signal
 from core import process_manager
 from core import username_scanner
@@ -159,6 +159,24 @@ SESSIONS: dict = {}
 # package_name -> asyncio.Task watchdog yang sedang berjalan untuk package itu.
 _watchdog_tasks: dict = {}
 
+# === MULTI-PACKAGE FREEFORM (Android 12) ===
+# package_name -> {"session_id", "task_id", "state"} untuk package yang
+# SUDAH dipastikan Freeform+tampil (lihat _activate_freeform_and_restore_siblings).
+# Dipakai SEMATA-MATA untuk tahu package MANA SAJA yang perlu di-"bangkitkan"
+# balik ke foreground (monkey) setiap kali ada package BARU yang baru selesai
+# di-freeform-kan -- supaya window freeform yang sudah lebih dulu ada tidak
+# ketutup/ke-background akibat proses buka package baru. Entry dihapus lagi
+# di handle_stop_session begitu package itu berhenti (jangan restore package
+# yang sudah tidak aktif).
+_FREEFORM_REGISTRY: dict = {}
+
+# Jeda antar panggilan `monkey` per sibling package saat rotasi freeform --
+# sama seperti _FINISH_RESTORE_STEP_DELAY_SECONDS (satu "monkey" cuma
+# membawa satu package, jeda kecil ini cuma supaya panggilan beruntun tidak
+# asal numpuk).
+_FREEFORM_RESTORE_STEP_DELAY_SECONDS = 0.3
+
+
 # package_name -> asyncio.Task username scanner (PHASE 4.5) yang sedang
 # berjalan untuk package itu -- lifecycle SAMA seperti _watchdog_tasks
 # (mulai bareng START_SESSION, berhenti begitu package dihapus dari
@@ -280,6 +298,7 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
     try:
         lobby_ok = await asyncio.to_thread(
             launch_and_wait, pkg, get_lobby_intent(), LOBBY_TIMEOUT_SECONDS,
+            require_join_signal=False, defer_freeform=True,  # launch NORMAL dulu -- freeform diaktifkan eksplisit di bawah SETELAH Roblox aktif
         )
     except Exception:
         log.error(f"SESSION_AGENT: exception saat buka lobby {pkg}.", exc_info=True)
@@ -293,6 +312,13 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
                             reason="LOBBY_LAUNCH_FAILED")
         return
     SESSIONS[pkg]["pid"] = get_pid_quick(pkg) or "-"
+
+    # Roblox sudah AKTIF (lobby_ok) -- baru sekarang ubah ke Freeform +
+    # verify window benar-benar tampil, lalu bangkitkan sibling package lain
+    # yang sudah lebih dulu Freeform (lihat _activate_freeform_and_restore_siblings).
+    await _activate_freeform_and_restore_siblings(pkg, session_id)
+    if not _still_current():
+        return
 
     # --- Tahap 2: pastikan akun customer yang benar sudah login ---
     if expected_username:
@@ -343,7 +369,8 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
     await _emit_status(local_device_id, session_id, pkg, order_id, "JOINING_GAME")
     try:
         join_status, join_reason = await asyncio.to_thread(
-            launch_and_wait, pkg, intent_url, timeout_seconds, True,  # require_join_signal
+            launch_and_wait, pkg, intent_url, timeout_seconds,
+            require_join_signal=True, defer_freeform=True,  # sama seperti tahap lobby -- freeform diaktifkan eksplisit terpisah
         )
     except Exception:
         log.error(f"SESSION_AGENT: exception saat join target {pkg}.", exc_info=True)
@@ -407,6 +434,14 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
                  f"hidup, tidak ada bukti kegagalan setelah grace-check) -> RUNNING.")
         # lanjut ke Tahap 4 seperti SUCCESS biasa.
 
+    # Package ini baru saja pindah/join ke target (intent baru, task bisa
+    # saja berubah) -- re-verify freeform-nya masih tampil (idempotent, aman
+    # dipanggil ulang) sekaligus bangkitkan lagi sibling package lain kalau
+    # sempat ketutup selama proses join ini.
+    await _activate_freeform_and_restore_siblings(pkg, session_id)
+    if not _still_current():
+        return
+
     # --- Tahap 4: RUNNING -- SATU-SATUNYA titik joki benar-benar dimulai. ---
     SESSIONS[pkg]["status"] = "ACTIVE"  # nilai internal SESSIONS tetap "ACTIVE" (dipakai watchdog)
     SESSIONS[pkg]["pid"] = get_pid_quick(pkg) or "-"
@@ -416,6 +451,68 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
 
     await _emit_status(local_device_id, session_id, pkg, order_id, "RUNNING")
     log.info(f"SESSION_AGENT: {pkg} (session {session_id}) RUNNING -- timer customer dimulai sekarang.")
+
+
+async def _activate_freeform_and_restore_siblings(pkg: str, session_id: str) -> None:
+    """
+    SATU-SATUNYA titik pkg diubah ke Freeform. Dipanggil setelah Roblox
+    dipastikan aktif (lobby_ok / join_status sukses -- proses SUDAH
+    launch_and_wait(..., defer_freeform=True), yaitu launch NORMAL tanpa
+    windowingMode dipaksakan saat masih transisi/splash).
+
+    Urutan sesuai permintaan:
+    LAUNCH NORMAL (selesai sebelum dipanggil) -> ROBLOX AKTIF (selesai
+    sebelum dipanggil) -> UBAH KE FREEFORM -> VERIFY WINDOW BENAR-BENAR
+    MUNCUL (activate_freeform() -- cek dumpsys window windows, bukan cuma
+    task/activity metadata) -> kalau berhasil, BANGKITKAN kembali semua
+    package LAIN yang sudah lebih dulu Freeform (mereka bisa saja ikut
+    ketutup/ke-background akibat proses buka package ini) lewat
+    `monkey -p <package> 1` (process_manager.restore_foreground) SATU PER
+    SATU -- ini murni bring-to-front, TIDAK pernah kill/restart/rejoin
+    package lain.
+
+    Dipanggil untuk package yang sama di lebih dari satu tahap (lobby DAN
+    setelah join target) supaya kalau ada transisi task lanjutan saat join,
+    window-nya tetap diverifikasi ulang -- idempotent & aman dipanggil
+    berkali-kali untuk package yang sama.
+
+    Gagal di sini TIDAK PERNAH menghentikan session (freeform murni
+    kosmetik/kenyamanan operator, bukan syarat validitas joki) -- cuma
+    di-log.
+    """
+    try:
+        ok, task_id = await asyncio.to_thread(activate_freeform, pkg)
+    except Exception:
+        log.error(f"SESSION_AGENT: exception saat activate_freeform {pkg}.", exc_info=True)
+        ok, task_id = False, None
+
+    if not ok:
+        log.warning(f"SESSION_AGENT: {pkg} (session {session_id}) belum kekonfirmasi Freeform+tampil -- "
+                    f"lanjut proses seperti biasa (tidak menghentikan session gara-gara ini).")
+        return
+
+    log.info(f"SESSION_AGENT: {pkg} (session {session_id}) Freeform terverifikasi tampil (taskId={task_id}).")
+    was_registered = pkg in _FREEFORM_REGISTRY
+    _FREEFORM_REGISTRY[pkg] = {"session_id": session_id, "task_id": task_id, "state": "VISIBLE"}
+
+    # Sibling: package LAIN yang sudah lebih dulu Freeform DAN masih ACTIVE
+    # di SESSIONS (jangan restore package yang sesi-nya sudah berhenti/mati).
+    siblings = [p for p in _FREEFORM_REGISTRY
+                if p != pkg and p in SESSIONS and SESSIONS[p].get("status") == "ACTIVE"]
+    if not siblings:
+        return
+
+    log.info(f"SESSION_AGENT: {pkg} {'re-verify' if was_registered else 'baru'} Freeform -- "
+             f"bangkitkan {len(siblings)} package lain yang sudah lebih dulu Freeform: {siblings}")
+    for sibling_pkg in siblings:
+        # Re-cek per iterasi: kalau sibling ini berhenti selagi loop restore
+        # masih jalan, jangan sentuh.
+        if sibling_pkg not in SESSIONS or SESSIONS[sibling_pkg].get("status") != "ACTIVE":
+            continue
+        restored = await asyncio.to_thread(process_manager.restore_foreground, sibling_pkg)
+        log.info(f"SESSION_AGENT: restore foreground sibling {sibling_pkg} (rotasi freeform): "
+                 f"{'OK' if restored else 'GAGAL'}")
+        await asyncio.sleep(_FREEFORM_RESTORE_STEP_DELAY_SECONDS)
 
 
 def _ensure_watchdog(pkg: str) -> None:
@@ -627,6 +724,7 @@ async def handle_stop_session(msg: dict, local_device_id: str, do_reset: bool = 
     # supaya loop restore-survivor (_finish_kill_and_restore_survivors)
     # tidak pernah menganggap package ini sendiri sebagai survivor.
     SESSIONS.pop(pkg, None)
+    _FREEFORM_REGISTRY.pop(pkg, None)  # jangan ikut di-restore lagi oleh rotasi freeform package lain
 
     log.info(f"[FINISH] session={session_id} package={pkg} pid={target_pid} -- STOP_SESSION "
              f"diterima, kill target + restore-foreground survivor berjalan di background.")
@@ -685,7 +783,10 @@ async def _headless_watchdog_loop(pkg: str) -> None:
                         f"relaunch ke target yang sama...")
             try:
                 intent_url = get_intent_url(info["target"])
-                success = await asyncio.to_thread(launch_and_wait, pkg, intent_url, DEFAULT_TIMEOUT_SECONDS)
+                success = await asyncio.to_thread(
+                    launch_and_wait, pkg, intent_url, DEFAULT_TIMEOUT_SECONDS,
+                    require_join_signal=False, defer_freeform=True,  # sama seperti start flow -- freeform diaktifkan eksplisit di bawah
+                )
             except Exception:
                 log.error(f"SESSION_AGENT: exception saat relaunch {pkg}.", exc_info=True)
                 success = False
@@ -696,6 +797,11 @@ async def _headless_watchdog_loop(pkg: str) -> None:
             if success:
                 SESSIONS[pkg]["pid"] = get_pid_quick(pkg) or "-"
                 SESSIONS[pkg]["launch_count"] += 1
+                # Roblox baru relaunch (proses sempat mati) -- kalau package
+                # ini sebelumnya sudah Freeform, pastikan kembali Freeform+
+                # tampil, sekaligus bangkitkan sibling lain kalau perlu.
+                if pkg in _FREEFORM_REGISTRY:
+                    await _activate_freeform_and_restore_siblings(pkg, info["session_id"])
             else:
                 SESSIONS[pkg]["pid"] = "-"
                 log.error(f"SESSION_AGENT: relaunch {pkg} gagal, akan dicoba lagi siklus berikutnya.")

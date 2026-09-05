@@ -53,9 +53,13 @@ LOGIN_POLL_INTERVAL_SECONDS = 5
 
 # Batas waktu menunggu staff login akun customer sebelum menyerah dan
 # melapor START_FAILED (supaya session tidak nyangkut WAITING_LOGIN selamanya
-# kalau staff lupa/order salah). Bisa staff coba lagi lewat Assign Device
-# ulang -- angka ini SENGAJA longgar (staff perlu waktu untuk pindah akun).
-LOGIN_WAIT_TIMEOUT_SECONDS = 900  # 15 menit
+# kalau staff lupa/order salah). Staff bisa coba lagi lewat tombol "🔄 Coba
+# Lagi" (bot.py) tanpa bikin order baru. Dinaikkan dari 15->30 menit (2026,
+# permintaan Improve Joki Egg poin 2) supaya staff dikasih toleransi lebih
+# panjang sebelum dianggap gagal -- perubahan ini SHARED dengan Treadmill
+# (satu jalur Assign Device yang sama), jadi Treadmill ikut dapat toleransi
+# 30 menit yang sama, bukan cuma Egg.
+LOGIN_WAIT_TIMEOUT_SECONDS = 1800  # 30 menit
 
 # Timeout untuk fase join ke target game SETELAH akun terkonfirmasi benar
 # (terpisah dari DEFAULT_TIMEOUT_SECONDS -- dipakai launch_and_wait()

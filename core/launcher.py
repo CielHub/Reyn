@@ -583,8 +583,173 @@ def activate_freeform(pkg_name):
     return False, last_task_id
 
 
+def launch_normal(pkg_name, intent_url):
+    """Kirim `am start` NORMAL (tanpa windowingMode dipaksa) dan LANGSUNG
+    kembali -- TIDAK menunggu Roblox aktif/Smart Wait sama sekali.
+
+    IMPROVE ANDROID 12 (Timer utk Proses Freeform): dipisah dari badan
+    launch_and_wait() supaya session_agent.py bisa memanggil activate_freeform()
+    lewat TIMER TETAP (2-3 detik) segera setelah `am start` terkirim, alih-alih
+    menunggu seluruh Smart Wait (yang bisa puluhan detik) selesai dulu.
+    Menunggu Smart Wait sebelum freeform berarti package LAIN yang sudah
+    Freeform ikut lama tertahan di background tanpa dibangkitkan
+    (_activate_freeform_and_restore_siblings) -- makin lama, makin besar
+    risiko package itu di-kill sistem. wait_for_launch_signal() (Smart Wait)
+    tetap jalan seperti biasa, cuma sekarang BERBARENGAN dengan timer
+    freeform, bukan sebelumnya.
+
+    --activity-single-top: WAJIB supaya intent ini TETAP dikirim ke activity
+    yang sudah berjalan lewat onNewIntent() walau activity tsb kebetulan
+    sudah di posisi paling atas/foreground (skenario "trigger balik ke
+    Lobby" pada package yang masih hidup di tengah game -- tanpa flag ini
+    Android cuma membalas "brought to the front" tanpa mengirim intent).
+
+    Return (ok: bool, start_time_str: str | None). start_time_str WAJIB
+    dipakai sebagai titik awal filter logcat di wait_for_launch_signal() --
+    diambil SEBELUM `am start` dikirim (sama seperti sebelumnya) supaya
+    tidak ada baris logcat relevan yang kelewat.
+    """
+    if not intent_url:
+        log.error(f"LAUNCH FAILED: {pkg_name} tidak memiliki Intent URL.")
+        return False, None
+
+    log.info(f"LAUNCH: Membuka {pkg_name}...")
+
+    start_time_str = datetime.datetime.now().strftime('%m-%d %H:%M:%S.000')
+
+    base_am_args = ['am', 'start', '--activity-single-top', '-p', pkg_name,
+                     '-a', 'android.intent.action.VIEW', '-d', intent_url]
+
+    launch_result = subprocess.run(base_am_args, capture_output=True, text=True, errors='replace')
+
+    launch_output = ((launch_result.stdout or '') + '\n' + (launch_result.stderr or '')).strip()
+    if launch_output:
+        log.info(f"LAUNCH RESULT [{pkg_name}]: {launch_output.replace(chr(10), ' | ')}")
+    if launch_result.returncode != 0:
+        log.error(f"LAUNCH COMMAND FAILED [{pkg_name}]: rc={launch_result.returncode}")
+        return False, start_time_str
+
+    return True, start_time_str
+
+
+def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_join_signal=False):
+    """Smart Wait -- DIPISAH dari launch_normal() (lihat docstring-nya) supaya
+    bisa dijalankan BERBARENGAN dengan aktivasi Freeform lewat timer, bukan
+    jadi syarat sebelum Freeform boleh diaktifkan. Isi logika Smart
+    Wait/verify_join PERSIS sama seperti sebelumnya (tidak ada perubahan
+    perilaku deteksi join di sini) -- cuma dipindah dari launch_and_wait()
+    supaya bisa dipanggil terpisah dari launch_normal().
+
+    Return sama seperti launch_and_wait(): bool (require_join_signal=False)
+    atau tuple (status, reason) berisi SUCCESS/FAILED/UNCERTAIN
+    (require_join_signal=True) -- lihat docstring launch_and_wait().
+    """
+    log.info(f"Smart Wait: Menunggu {pkg_name} terhubung ({timeout_seconds} detik)...")
+
+    logcat_cmd = ['logcat', '-T', start_time_str, '-v', 'time']
+
+    process = subprocess.Popen(
+        logcat_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        bufsize=1
+    )
+
+    keywords = ["gamejoinutil", "datamodel initialized", "successfully connected"]
+    found_success = False
+    found_failure = False
+    failure_code = None
+    start_time = time.time()
+    PID_CHECK_INTERVAL_SECONDS = 3
+    last_pid_check = start_time
+
+    try:
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed >= timeout_seconds:
+                log.warning(f"FALLBACK: Logcat timeout. Menggunakan Dumb Wait untuk {pkg_name}.")
+                break
+
+            ready, _, _ = select.select([process.stdout], [], [], 1.0)
+
+            if ready:
+                line = process.stdout.readline()
+                if not line:
+                    break
+
+                line_lower = line.lower()
+                if any(kw in line_lower for kw in keywords):
+                    found_success = True
+                    break
+
+                if require_join_signal and _FLOG_NETWORK_PATTERN.search(line_lower):
+                    match = _DISCONNECT_REASON_PATTERN.search(line_lower)
+                    if match:
+                        found_failure = True
+                        failure_code = match.group(1)
+                        break
+            elif time.time() - last_pid_check >= PID_CHECK_INTERVAL_SECONDS:
+                last_pid_check = time.time()
+                if not get_pid_quick(pkg_name):
+                    log.warning(f"[FAST-FAIL] {pkg_name}: PID hilang sebelum timeout habis "
+                                f"(elapsed={elapsed:.1f}s) -- berhenti nunggu lebih awal.")
+                    break
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+    final_pid = get_pid_quick(pkg_name)
+    if not final_pid:
+        log.error(f"LAUNCH FAILED: {pkg_name} gagal diluncurkan (Proses mati secara prematur).")
+        return ("FAILED", "PROCESS_NOT_RUNNING") if require_join_signal else False
+
+    if not require_join_signal:
+        verified, reason = verify_join(pkg_name)
+        if not verified:
+            log.error(f"VERIFY FAILED: {pkg_name} -> {reason}")
+            return False
+        log.info(f"VERIFY: {pkg_name} -> {reason}")
+        log.info(f"SUCCESS: {pkg_name} selesai diproses.")
+        return True
+
+    if found_failure:
+        log.warning(f"[VERIFY] {pkg_name}: bukti disconnect/kick asli terdeteksi "
+                    f"(reason={failure_code}) sebelum/selama menunggu sinyal join -- FAILED.")
+        return ("FAILED", f"JOIN_ERROR_SIGNAL_{failure_code}")
+
+    if found_success:
+        verified, reason = verify_join(pkg_name)
+        if not verified:
+            log.error(f"VERIFY FAILED: {pkg_name} -> {reason} (padahal keyword join ditemukan).")
+            return ("FAILED", f"VERIFY_FAILED_AFTER_KEYWORD:{reason}")
+        log.info(f"[VERIFY] {pkg_name}: keyword join ditemukan + {reason} -> SUCCESS.")
+        return ("SUCCESS", "JOIN_KEYWORD_FOUND")
+
+    log.warning(f"[VERIFY] {pkg_name}: proses hidup (pid={final_pid}), tidak ada keyword join "
+                f"MAUPUN bukti kegagalan dalam {timeout_seconds}s -- UNCERTAIN, perlu grace-check.")
+    return ("UNCERTAIN", "NO_JOIN_SIGNAL_TIMEOUT")
+
+
 def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=False, defer_freeform=False):
     """
+    IMPROVE ANDROID 12 (Timer utk Proses Freeform): kalau defer_freeform=True,
+    fungsi ini sekarang MURNI wrapper launch_normal() + wait_for_launch_signal()
+    di atas -- return value & perilaku Smart Wait/verify_join TIDAK BERUBAH
+    SAMA SEKALI dibanding sebelumnya untuk caller manapun. Perubahan nyatanya
+    ada di session_agent.py: caller di sana TIDAK LAGI memanggil launch_and_wait()
+    untuk jalur defer_freeform, melainkan memanggil launch_normal() dan
+    wait_for_launch_signal() terpisah lewat _launch_then_freeform_soon() supaya
+    activate_freeform() bisa jalan lewat timer tetap tanpa menunggu fungsi ini
+    selesai. launch_and_wait() dipertahankan apa adanya (dan tetap dipakai
+    core/menu.py, core/tester.py, core/recovery_manager.py) supaya tidak ada
+    yang perlu diubah di luar session_agent.py.
+
     defer_freeform (default False -- PERILAKU LAMA TIDAK BERUBAH untuk semua
     pemanggil existing yang tidak mengisi argumen ini): kalau True, fungsi
     ini SELALU melakukan launch NORMAL (`base_am_args`, tanpa `--windowingMode
@@ -652,6 +817,13 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     tetap return bool, keyword logcat tetap diabaikan seperti sebelumnya
     (cukup proses hidup + verify_join()).
     """
+    if defer_freeform:
+        ok, start_time_str = launch_normal(pkg_name, intent_url)
+        if not ok:
+            return ("FAILED", "LAUNCH_COMMAND_FAILED") if require_join_signal else False
+        return wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_join_signal)
+
+    # --- defer_freeform=False dari sini ke bawah: PERILAKU LAMA, TIDAK BERUBAH ---
     if not intent_url:
         log.error(f"LAUNCH FAILED: {pkg_name} tidak memiliki Intent URL.")
         return ("FAILED", "NO_INTENT_URL") if require_join_signal else False

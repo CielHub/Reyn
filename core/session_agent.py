@@ -35,7 +35,10 @@ import datetime
 
 from core.logger import log
 from core.deeplink import get_intent_url, get_lobby_intent
-from core.launcher import launch_and_wait, get_pid_quick, activate_freeform
+from core.launcher import (
+    get_pid_quick, activate_freeform,
+    launch_normal, wait_for_launch_signal,
+)
 from core.join_verifier import has_recent_disconnect_signal
 from core import process_manager
 from core import username_scanner
@@ -90,6 +93,24 @@ JOIN_VERIFY_GRACE_SECONDS = 6
 # Dipanggil sebelum PREPARING (buka Roblox ke lobby dulu, TANPA target) --
 # hanya perlu proses hidup, tidak perlu sinyal join game.
 LOBBY_TIMEOUT_SECONDS = 30
+
+# IMPROVE ANDROID 12 (Timer utk Proses Freeform): sebelumnya Freeform baru
+# diaktifkan SETELAH launch_and_wait() selesai menunggu Roblox "beneran
+# aktif" (Smart Wait logcat, bisa sampai puluhan detik / LOBBY_TIMEOUT_SECONDS
+# & JOIN_TIMEOUT_SECONDS di atas) -- makin lama itu berjalan, makin lama
+# package LAIN yang SUDAH Freeform ikut tertahan di background tanpa
+# dibangkitkan (_activate_freeform_and_restore_siblings), makin besar risiko
+# package itu di-kill sistem karena kelamaan di background.
+#
+# Sekarang: activate_freeform() dipicu lewat TIMER TETAP setelah `am start`
+# terkirim (launch_normal()), BUKAN menunggu hasil Smart Wait
+# (wait_for_launch_signal()) -- keduanya jalan BERBARENGAN (lihat
+# _launch_then_freeform_soon()). 2-3 detik dipilih supaya Roblox sempat
+# lewat fase transisi awal (ActivityProtocolLaunch -> ActivityNativeMain /
+# splash) -- window belum ada di fase itu, dan activate_freeform() sendiri
+# masih retry beberapa kali (lihat _FREEFORM_VERIFY_ATTEMPTS di launcher.py)
+# kalau taskId/window belum kebentuk pas timer ini habis.
+FREEFORM_ACTIVATION_DELAY_SECONDS = 2.5
 
 # async(dict) -> None, diregistrasi agent_client.py SETIAP KALI koneksi WS
 # baru tersambung (lihat register_sender()). Dipakai modul ini untuk kirim
@@ -296,9 +317,14 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
     # tetap lewat lobby dulu supaya perilaku konsisten -- cuma pengecekan
     # username-nya yang dilewati di tahap 2.
     try:
-        lobby_ok = await asyncio.to_thread(
-            launch_and_wait, pkg, get_lobby_intent(), LOBBY_TIMEOUT_SECONDS,
-            require_join_signal=False, defer_freeform=True,  # launch NORMAL dulu -- freeform diaktifkan eksplisit di bawah SETELAH Roblox aktif
+        # IMPROVE ANDROID 12 (Timer utk Proses Freeform): freeform TIDAK LAGI
+        # menunggu lobby_ok -- dipicu lewat timer tetap di dalam
+        # _launch_then_freeform_soon() begitu `am start` terkirim, BERBARENGAN
+        # dengan Smart Wait (bukan setelahnya lagi). Lihat docstring fungsi
+        # tsb / FREEFORM_ACTIVATION_DELAY_SECONDS.
+        lobby_ok = await _launch_then_freeform_soon(
+            pkg, get_lobby_intent(), LOBBY_TIMEOUT_SECONDS,
+            require_join_signal=False, session_id=session_id,
         )
     except Exception:
         log.error(f"SESSION_AGENT: exception saat buka lobby {pkg}.", exc_info=True)
@@ -313,10 +339,6 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
         return
     SESSIONS[pkg]["pid"] = get_pid_quick(pkg) or "-"
 
-    # Roblox sudah AKTIF (lobby_ok) -- baru sekarang ubah ke Freeform +
-    # verify window benar-benar tampil, lalu bangkitkan sibling package lain
-    # yang sudah lebih dulu Freeform (lihat _activate_freeform_and_restore_siblings).
-    await _activate_freeform_and_restore_siblings(pkg, session_id)
     if not _still_current():
         return
 
@@ -368,9 +390,14 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
     # --- Tahap 3: join ke target game (Place ID / Private Server) ---
     await _emit_status(local_device_id, session_id, pkg, order_id, "JOINING_GAME")
     try:
-        join_status, join_reason = await asyncio.to_thread(
-            launch_and_wait, pkg, intent_url, timeout_seconds,
-            require_join_signal=True, defer_freeform=True,  # sama seperti tahap lobby -- freeform diaktifkan eksplisit terpisah
+        # IMPROVE ANDROID 12 (Timer utk Proses Freeform): sama seperti tahap
+        # lobby -- freeform dipicu lewat timer tetap begitu `am start`
+        # (ke target) terkirim, BERBARENGAN dengan Smart Wait join, bukan
+        # menunggu join_status selesai (yang bisa sampai JOIN_TIMEOUT_SECONDS
+        # + JOIN_VERIFY_GRACE_SECONDS kalau UNCERTAIN).
+        join_status, join_reason = await _launch_then_freeform_soon(
+            pkg, intent_url, timeout_seconds,
+            require_join_signal=True, session_id=session_id,
         )
     except Exception:
         log.error(f"SESSION_AGENT: exception saat join target {pkg}.", exc_info=True)
@@ -434,10 +461,13 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
                  f"hidup, tidak ada bukti kegagalan setelah grace-check) -> RUNNING.")
         # lanjut ke Tahap 4 seperti SUCCESS biasa.
 
-    # Package ini baru saja pindah/join ke target (intent baru, task bisa
-    # saja berubah) -- re-verify freeform-nya masih tampil (idempotent, aman
-    # dipanggil ulang) sekaligus bangkitkan lagi sibling package lain kalau
-    # sempat ketutup selama proses join ini.
+    # Freeform utamanya SUDAH dipicu lewat timer di dalam
+    # _launch_then_freeform_soon() di atas (jauh sebelum baris ini
+    # tercapai). Panggilan ini murni RE-VERIFY tambahan -- package baru saja
+    # pindah/join ke target (intent baru, task bisa saja berubah lagi
+    # setelah timer freeform lewat, terutama kalau UNCERTAIN sempat kena
+    # grace period) -- idempotent & aman dipanggil ulang, sekaligus
+    # bangkitkan lagi sibling package lain kalau sempat ketutup.
     await _activate_freeform_and_restore_siblings(pkg, session_id)
     if not _still_current():
         return
@@ -513,6 +543,63 @@ async def _activate_freeform_and_restore_siblings(pkg: str, session_id: str) -> 
         log.info(f"SESSION_AGENT: restore foreground sibling {sibling_pkg} (rotasi freeform): "
                  f"{'OK' if restored else 'GAGAL'}")
         await asyncio.sleep(_FREEFORM_RESTORE_STEP_DELAY_SECONDS)
+
+
+async def _launch_then_freeform_soon(pkg: str, intent_url: str, timeout_seconds: int,
+                                      require_join_signal: bool, session_id: str,
+                                      only_if_previously_freeform: bool = False):
+    """IMPROVE ANDROID 12 (Timer utk Proses Freeform) -- pengganti pola lama
+    `launch_and_wait(..., defer_freeform=True)` lalu (SETELAH selesai)
+    `await _activate_freeform_and_restore_siblings(...)`.
+
+    Sekarang: `am start` dulu (launch_normal(), cepat) -> jadwalkan
+    activate_freeform()+restore siblings lewat TIMER TETAP
+    (FREEFORM_ACTIVATION_DELAY_SECONDS), BERBARENGAN (bukan SETELAH) dengan
+    Smart Wait (wait_for_launch_signal()) yang tetap jalan seperti biasa
+    untuk menentukan status lobby/join sebenarnya. Freeform TIDAK LAGI
+    menunggu hasil Smart Wait -- package lain yang sudah Freeform jadi jauh
+    lebih cepat dibangkitkan lagi, tidak lama nunggu di background gara-gara
+    package ini masih diverifikasi.
+
+    only_if_previously_freeform (dipakai _headless_watchdog_loop untuk
+    relaunch setelah crash): kalau True, timer TETAP jalan tapi
+    activate_freeform() hanya benar-benar dipanggil kalau pkg SUDAH pernah
+    tercatat Freeform sebelumnya di _FREEFORM_REGISTRY (perilaku lama --
+    package yang belum pernah Freeform tidak dipaksa Freeform cuma karena
+    relaunch crash).
+
+    Return-nya PERSIS sama seperti launch_and_wait(..., defer_freeform=True)
+    dulu: bool kalau require_join_signal=False, tuple (status, reason) kalau
+    True -- caller (_run_start_flow/_headless_watchdog_loop) tidak perlu
+    berubah cara membaca hasilnya.
+    """
+    ok, start_time_str = await asyncio.to_thread(launch_normal, pkg, intent_url)
+    if not ok:
+        return ("FAILED", "LAUNCH_COMMAND_FAILED") if require_join_signal else False
+
+    async def _freeform_after_delay():
+        if only_if_previously_freeform and pkg not in _FREEFORM_REGISTRY:
+            return
+        await asyncio.sleep(FREEFORM_ACTIVATION_DELAY_SECONDS)
+        await _activate_freeform_and_restore_siblings(pkg, session_id)
+
+    freeform_task = asyncio.create_task(_freeform_after_delay())
+    try:
+        result = await asyncio.to_thread(
+            wait_for_launch_signal, pkg, start_time_str, timeout_seconds, require_join_signal,
+        )
+    finally:
+        # Smart Wait butuh minimal beberapa detik (fast-fail PID check tiap
+        # 3 detik), jadi normalnya freeform_task (2-3 detik) SUDAH selesai
+        # duluan pas titik ini tercapai -- await di sini murni jaga-jaga
+        # (supaya exception di dalamnya ke-log, bukan silently swallowed)
+        # dan TIDAK menambah waktu tunggu berarti untuk caller.
+        try:
+            await freeform_task
+        except Exception:
+            log.error(f"SESSION_AGENT: exception freeform-timer task {pkg}.", exc_info=True)
+
+    return result
 
 
 def _ensure_watchdog(pkg: str) -> None:
@@ -783,9 +870,15 @@ async def _headless_watchdog_loop(pkg: str) -> None:
                         f"relaunch ke target yang sama...")
             try:
                 intent_url = get_intent_url(info["target"])
-                success = await asyncio.to_thread(
-                    launch_and_wait, pkg, intent_url, DEFAULT_TIMEOUT_SECONDS,
-                    require_join_signal=False, defer_freeform=True,  # sama seperti start flow -- freeform diaktifkan eksplisit di bawah
+                # IMPROVE ANDROID 12 (Timer utk Proses Freeform): sama seperti
+                # start flow -- freeform (kalau pkg pernah Freeform sebelumnya,
+                # only_if_previously_freeform=True menjaga perilaku lama)
+                # dipicu lewat timer tetap, BERBARENGAN dengan Smart Wait,
+                # bukan menunggunya selesai dulu.
+                success = await _launch_then_freeform_soon(
+                    pkg, intent_url, DEFAULT_TIMEOUT_SECONDS,
+                    require_join_signal=False, session_id=info["session_id"],
+                    only_if_previously_freeform=True,
                 )
             except Exception:
                 log.error(f"SESSION_AGENT: exception saat relaunch {pkg}.", exc_info=True)
@@ -797,11 +890,6 @@ async def _headless_watchdog_loop(pkg: str) -> None:
             if success:
                 SESSIONS[pkg]["pid"] = get_pid_quick(pkg) or "-"
                 SESSIONS[pkg]["launch_count"] += 1
-                # Roblox baru relaunch (proses sempat mati) -- kalau package
-                # ini sebelumnya sudah Freeform, pastikan kembali Freeform+
-                # tampil, sekaligus bangkitkan sibling lain kalau perlu.
-                if pkg in _FREEFORM_REGISTRY:
-                    await _activate_freeform_and_restore_siblings(pkg, info["session_id"])
             else:
                 SESSIONS[pkg]["pid"] = "-"
                 log.error(f"SESSION_AGENT: relaunch {pkg} gagal, akan dicoba lagi siklus berikutnya.")

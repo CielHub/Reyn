@@ -197,7 +197,35 @@ def start_monitoring(packages, intent_url, timeout_seconds, max_retries, cooldow
 
     check_interval = 15
     last_check_time = current_time
-    STABILITY_THRESHOLD = 300 
+    STABILITY_THRESHOLD = 300
+
+    # FIX (Bug Android 12: "Package Muncul Kembali Setelah Joki Selesai"):
+    # root cause-nya BUKAN watchdog/recovery yang salah baca status, tapi
+    # KONFLIK DUA WATCHDOG -- kalau operator pernah "start all" package lewat
+    # menu interaktif ini (start_monitoring), package tsb dipantau watchdog
+    # DI SINI. Kalau package yang SAMA belakangan diassign joki lewat Discord
+    # Bot, package itu JUGA dipantau watchdog headless TERPISAH di
+    # core/session_agent.py (_headless_watchdog_loop) -- SENGAJA terpisah,
+    # lihat DESAIN PENTING di session_agent.py, supaya tidak bentrok state.
+    # Tapi watchdog DI SINI tidak tahu soal itu: begitu joki selesai dan
+    # STOP_SESSION mematikan package tsb (memang DISENGAJA, order sudah
+    # selesai), watchdog INI salah mengira itu CRASH (PID hilang) lalu
+    # trigger_recovery() -- membangkitkan lagi package yang order-nya sudah
+    # tidak ada. `_managed_by_joki` menandai package yang SEDANG dipegang
+    # session headless (di-skip total dari crash-check) dan package yang
+    # BARU SAJA lepas dari headless (baseline PID di-refresh dulu SEKALI,
+    # tanpa dihitung sebagai crash) sebelum watchdog ini melanjutkan
+    # menganggapnya sebagai package yang harus SELALU online seperti biasa.
+    # Aditif & non-fatal: kalau core.session_agent tidak bisa diimpor (mis.
+    # dipakai tanpa agent Discord sama sekali), watchdog jalan seperti biasa.
+    _previously_joki_managed = set()
+
+    def _pkg_is_joki_managed(pkg: str) -> bool:
+        try:
+            from core.session_agent import SESSIONS as _joki_sessions
+            return pkg in _joki_sessions
+        except Exception:
+            return False
 
     set_console_logging(False)
 
@@ -221,6 +249,26 @@ def start_monitoring(packages, intent_url, timeout_seconds, max_retries, cooldow
                             continue
 
                         for pkg in packages:
+                            if _pkg_is_joki_managed(pkg):
+                                # Package sedang aktif dipegang order joki (Discord
+                                # Bot) -- watchdog headless session_agent yang
+                                # bertanggung jawab, JANGAN disentuh dari sini sama
+                                # sekali (termasuk jangan hitung crash/recovery).
+                                _previously_joki_managed.add(pkg)
+                                continue
+
+                            if pkg in _previously_joki_managed:
+                                # Baru saja lepas dari kontrol joki (order selesai/
+                                # dibatalkan, package sudah di-stop SENGAJA oleh
+                                # STOP_SESSION) -- refresh baseline PID watchdog ini
+                                # ke kondisi SEKARANG (biasanya kosong/idle) TANPA
+                                # menghitungnya sebagai crash, supaya tidak langsung
+                                # di-trigger_recovery() di siklus yang sama.
+                                _previously_joki_managed.discard(pkg)
+                                tracked_pids[pkg] = get_pid(pkg)
+                                stats[pkg]['pid'] = tracked_pids[pkg] if tracked_pids[pkg] else '-'
+                                continue
+
                             if stats[pkg]['status'] in ['RECOVERY', 'LOGIN', 'LOADING', 'CAPTCHA', 'CACHE CLEAN']:
                                 continue
                                 

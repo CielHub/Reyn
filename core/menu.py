@@ -15,7 +15,7 @@ from core.target_resolver import TargetResolver
 from core.state_machine import set_state
 from core.states import PackageState
 from core.scanner import get_roblox_packages
-from core.launcher import launch_and_wait
+from core.launcher import launch_and_wait, activate_freeform, is_android12
 from core.agent_client import start_agent_background, get_agent_status
 from core.monitor import (
     start_monitoring,
@@ -342,6 +342,38 @@ def run_auto_rejoiner():
             draw_dashboard(stats, time.time(), len(packages), include_header=True),
             screen=True,
         ) as live:
+            # FIX (Improve Android 12: Urutan Launch & Freeform): SEBELUMNYA
+            # launch_and_wait() dipanggil TANPA defer_freeform di loop batch
+            # ini -- di Android 12, itu berarti perubahan ke Freeform (yang
+            # cukup lama: switch windowingMode + apply grid + verify window
+            # benar2 tampil) jadi BAGIAN BLOCKING dari launch_and_wait package
+            # SAAT ITU, sebelum loop lanjut ke package berikutnya. Akibatnya
+            # package berikutnya baru mulai di-launch SETELAH freeform
+            # package sebelumnya selesai -- kalau lama, package berikutnya
+            # bisa keburu dianggap timeout/mati.
+            #
+            # Sekarang: launch_and_wait() SELALU dipanggil dengan
+            # defer_freeform=True (no-op di device non-Android 12, lihat
+            # launcher.is_android12() -- tidak mengubah perilaku sama sekali
+            # selain Android 12). Freeform utk package yang BARU SAJA
+            # berhasil di-launch BARU diterapkan SETELAH package BERIKUTNYA
+            # selesai di-launch (activate_freeform ditunda 1 langkah,
+            # `pending_freeform_pkg`) -- persis flow yang diminta: launch
+            # pkg saat ini -> lanjut launch pkg berikutnya -> baru freeform-kan
+            # pkg sebelumnya -> dst. `activate_freeform()` sendiri (dari
+            # launcher.py, fungsi yang SAMA dipakai session_agent.py untuk
+            # joki headless) sudah aman dipanggil kapan pun -- kosmetik,
+            # gagal di sini tidak pernah menggagalkan launch.
+            pending_freeform_pkg = None
+
+            def _flush_pending_freeform():
+                nonlocal pending_freeform_pkg
+                if pending_freeform_pkg is not None:
+                    ok, _ = activate_freeform(pending_freeform_pkg)
+                    log.info(f"FREEFORM (deferred): {pending_freeform_pkg} -> "
+                             f"{'OK' if ok else 'gagal/lewat (non-Android12 atau belum siap)'}")
+                    pending_freeform_pkg = None
+
             for pkg in packages:
                 clean_package_cache(pkg)
 
@@ -362,9 +394,13 @@ def run_auto_rejoiner():
                         dashboard_size,
                     )
                     log.error(f"LAUNCH SKIPPED: {pkg} tidak memiliki target join yang valid.")
+                    # Package ini dilewati (tidak jadi dilaunch) -- tetap flush
+                    # freeform package SEBELUMNYA sekarang juga, supaya tidak
+                    # nyangkut tertunda sampai package valid berikutnya.
+                    _flush_pending_freeform()
                     continue
 
-                success = launch_and_wait(pkg, intent_url, timeout_seconds)
+                success = launch_and_wait(pkg, intent_url, timeout_seconds, defer_freeform=True)
 
                 if not success:
                     try:
@@ -385,7 +421,7 @@ def run_auto_rejoiner():
                                 draw_dashboard(stats, time.time(), len(packages), include_header=True),
                                 dashboard_size,
                             )
-                            success = launch_and_wait(pkg, intent_url, timeout_seconds)
+                            success = launch_and_wait(pkg, intent_url, timeout_seconds, defer_freeform=True)
                         elif login_status == "CAPTCHA":
                             stats[pkg]['status'] = 'CAPTCHA'
                         else:
@@ -393,9 +429,18 @@ def run_auto_rejoiner():
                     except ImportError:
                         pass
 
+                # Package SAAT INI sudah selesai dipanggil (berhasil/gagal) --
+                # BARU SEKARANG freeform-kan package SEBELUMNYA yang masih
+                # tertunda. Ini titik intinya: freeform package N-1 terjadi
+                # SETELAH package N dipanggil, bukan sebelum -- package N
+                # tidak pernah menunggu freeform N-1 lebih dulu.
+                _flush_pending_freeform()
+
                 if success:
                     set_state(stats, pkg, PackageState.ONLINE)
                     stats[pkg]['uptime_start'] = time.time()
+                    if is_android12():
+                        pending_freeform_pkg = pkg
                 else:
                     if stats[pkg]['status'] not in ['LOGIN FAILED', 'CAPTCHA']:
                         set_state(stats, pkg, PackageState.FAILED)
@@ -406,8 +451,14 @@ def run_auto_rejoiner():
                     draw_dashboard(stats, time.time(), len(packages), include_header=True),
                     dashboard_size,
                 )
+
+            # Package TERAKHIR yang berhasil launch tidak punya "package
+            # berikutnya" buat memicu freeform-nya lewat _flush_pending_freeform
+            # di dalam loop -- flush manual sekali lagi di sini setelah loop selesai.
+            _flush_pending_freeform()
     finally:
         stop_dashboard_resize_watcher(resize_handler)
+
 
     try:
         sniper_agent.start()

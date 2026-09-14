@@ -47,7 +47,14 @@ class RecoveryManager:
         # Jadwal Auto Clear Cache (independen dari recovery, lihat CLEAR_CACHE_MINUTES)
         self._next_cache_clean_at = None
         self._last_cache_interval = None
-        
+
+        # Jadwal Scheduled Restart (lihat SCHEDULED_RESTART_ENABLED/_HOURS).
+        # next_restart_at[pkg] = timestamp kapan package tsb berikutnya WAJIB
+        # direstart. Dipakai baik untuk restart proaktif (package masih sehat)
+        # maupun untuk menahan recovery crash sampai jadwal ini tiba.
+        self.next_restart_at = {}
+        self._last_restart_interval = None
+
         # Lock untuk memastikan anti duplicate recovery
         self.recovery_lock = threading.Lock()
 
@@ -59,6 +66,30 @@ class RecoveryManager:
         self.intent_url = intent_url
         self.timeout_seconds = timeout_seconds
         self.config_data = config_data if config_data else {}
+
+        if self._scheduled_restart_enabled():
+            now = time.time()
+            interval = self._restart_interval_seconds()
+            # Jangan timpa jadwal yang sudah ada (mis. re-configure saat
+            # runtime) -- hanya isi package yang belum punya jadwal.
+            for pkg in packages:
+                self.next_restart_at.setdefault(pkg, now + interval)
+            self._last_restart_interval = interval
+        else:
+            self.next_restart_at = {}
+            self._last_restart_interval = None
+
+    def _scheduled_restart_enabled(self):
+        return int(self.config_data.get("SCHEDULED_RESTART_ENABLED", 0) or 0) == 1
+
+    def _restart_interval_seconds(self):
+        try:
+            hours = float(self.config_data.get("SCHEDULED_RESTART_HOURS", 5) or 5)
+        except (TypeError, ValueError):
+            hours = 5.0
+        if hours <= 0:
+            hours = 5.0
+        return hours * 3600
 
     def start(self):
         if self._running:
@@ -256,7 +287,66 @@ class RecoveryManager:
                 self._run_scheduled_cache_clean()
                 self._next_cache_clean_at = time.time() + (interval_minutes * 60)
 
+            # ==================================================
+            # 4. SCHEDULED: RESTART INTERVAL (SCHEDULED_RESTART_HOURS)
+            # ==================================================
+            if self._scheduled_restart_enabled():
+                restart_interval = self._restart_interval_seconds()
+                if self._last_restart_interval != restart_interval:
+                    # Interval baru saja diubah lewat menu Settings -> jadwalkan
+                    # ulang semua package dari SEKARANG, jangan pakai jadwal lama.
+                    now = time.time()
+                    self.next_restart_at = {pkg: now + restart_interval for pkg in self.packages}
+                    self._last_restart_interval = restart_interval
+                elif not self.is_global_recovery():
+                    self._check_scheduled_restarts(restart_interval)
+            else:
+                self._last_restart_interval = None
+
             time.sleep(0.1)
+
+    def _check_scheduled_restarts(self, restart_interval):
+        """Restart package yang statusnya ONLINE dan sudah mencapai jadwal
+        tetapnya. Ini TIDAK menyentuh package yang lagi LOADING/LOGIN/
+        RECOVERY/SCHED WAIT/dll -- package itu akan dicek lagi siklus
+        berikutnya (kalau ternyata lagi menunggu jadwal karena crash, itu
+        ditangani terpisah oleh single_recovery_worker/_wait_for_schedule)."""
+        now = time.time()
+        for pkg in self.packages:
+            if self.stats.get(pkg, {}).get('status') != 'ONLINE':
+                continue
+
+            due_at = self.next_restart_at.get(pkg)
+            if due_at is None:
+                self.next_restart_at[pkg] = now + restart_interval
+                continue
+
+            if now < due_at:
+                continue
+
+            if self.is_global_recovery():
+                break
+
+            log.info(f"[SCHED-RESTART] {pkg} mencapai interval {restart_interval/3600:.2f} jam, restart terjadwal...")
+            self._run_scheduled_single_restart(pkg)
+            self.next_restart_at[pkg] = time.time() + restart_interval
+
+    def _run_scheduled_single_restart(self, pkg):
+        """Restart satu package karena JADWAL (bukan crash/error) -- kill lalu
+        launch ulang. Beda dari kill_all_packages (GLOBAL) karena ini cuma
+        menyentuh satu package sekaligus, tidak membuat semua package mati
+        bersamaan (poin utama fitur ini: restart tetap terkontrol/rapi)."""
+        self.stats[pkg]['status'] = 'SCHED RESTART'
+
+        pid = self.stats[pkg].get('pid')
+        if pid and pid != '-':
+            graceful_kill(pid, pkg)
+            wait_until_process_dead(pid, timeout=10)
+
+        self.stats[pkg]['pid'] = '-'
+        self.tracked_pids[pkg] = ''
+
+        self.launch_single_package(pkg)
 
     def _run_scheduled_cache_clean(self):
         """Bersihkan cache tiap package secara bergiliran di luar jalur recovery.
@@ -410,6 +500,13 @@ class RecoveryManager:
         self.stats[pkg]['consecutive_crashes'] = 0
         self.recovery_baseline_pids[pkg] = new_pid
         log.info(f"[RECOVERY L{level}] {pkg} recovered successfully: {reason} (PID {new_pid})")
+
+        if self._scheduled_restart_enabled():
+            # Package baru saja hidup lagi -- hitung ulang jadwal restart
+            # berikutnya dari titik ini, supaya interval tetap konsisten
+            # (mis. 5 jam) dihitung sejak dia benar-benar online kembali.
+            self.next_restart_at[pkg] = time.time() + self._restart_interval_seconds()
+
         return True
 
     def _wait_for_baseline_pid_to_exit(self, pkg, baseline_pid, timeout=5.0):
@@ -490,6 +587,44 @@ class RecoveryManager:
         log.warning(f"[RECOVERY L{level}] {pkg} recovery attempt failed.")
         return False
 
+    def _wait_for_restart_schedule(self, pkg):
+        """Dipanggil oleh single_recovery_worker SEBELUM tiering relaunch.
+
+        Kalau package ini mati lebih awal dari jadwal Scheduled Restart-nya,
+        dia TIDAK boleh langsung direlaunch -- harus nunggu sampai jadwal
+        tetap (SCHEDULED_RESTART_HOURS) tiba, biar aktivitas akun tidak
+        terlihat mencurigakan karena restart kelewat sering. Status
+        ditampilkan sebagai 'SCHED WAIT' di dashboard selama menunggu.
+        """
+        due_at = self.next_restart_at.get(pkg)
+        if due_at is None:
+            due_at = time.time() + self._restart_interval_seconds()
+            self.next_restart_at[pkg] = due_at
+
+        remaining = due_at - time.time()
+        if remaining <= 0:
+            return
+
+        log.info(f"[SCHED-RESTART] {pkg} mati sebelum jadwal, menunggu {remaining/60:.1f} menit sebelum direlaunch...")
+        self.stats[pkg]['status'] = 'SCHED WAIT'
+
+        while self._running:
+            if not self._scheduled_restart_enabled():
+                # Fitur dimatikan lewat Settings selagi menunggu -- lanjut
+                # recovery normal tanpa menunggu jadwal lagi.
+                break
+
+            # Interval bisa saja diubah lewat Settings selagi package ini
+            # menunggu -- selalu pakai jadwal TERBARU untuk package ini.
+            due_at = self.next_restart_at.get(pkg, due_at)
+            remaining = due_at - time.time()
+            if remaining <= 0:
+                break
+
+            time.sleep(min(5.0, remaining))
+
+        self.stats[pkg]['status'] = 'RECOVERY'
+
     def single_recovery_worker(self, pkg):
         """Single-package tiered recovery with package-isolated diagnostics."""
         try:
@@ -507,6 +642,9 @@ class RecoveryManager:
                 levels = (3,)
             else:
                 levels = (1, 2, 3)
+
+            if self._scheduled_restart_enabled():
+                self._wait_for_restart_schedule(pkg)
 
             for level in levels:
                 existing_pid = get_pid(pkg)

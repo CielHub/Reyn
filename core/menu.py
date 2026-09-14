@@ -568,6 +568,58 @@ def show_device_agent_menu(config_data):
             break
 
 
+def show_scheduled_restart_menu(config_data):
+    """Scheduled Restart: restart package tiap interval JAM tetap, bukan
+    tiap kali crash. Kalau package mati sebelum jadwal berikutnya, dia
+    menunggu sampai jadwal tiba (lihat recovery_manager.py) -- supaya
+    restart tetap terkontrol/tidak mencurigakan untuk map yang berat.
+    """
+    while True:
+        reset_terminal()
+        draw_header("SCHEDULED RESTART")
+
+        enabled = int(config_data.get('SCHEDULED_RESTART_ENABLED', 0) or 0) == 1
+        hours = config_data.get('SCHEDULED_RESTART_HOURS', 5)
+
+        console.print("[dim]Restart tiap package otomatis per interval jam tetap. Package yang mati\nsebelum jadwalnya TIDAK langsung direstart -- nunggu sampai jadwal tiba.[/]\n")
+
+        table = Table(box=None, padding=(0, 0), show_header=False)
+        table.add_column("No", style="bold cyan", width=5, no_wrap=True)
+        table.add_column("Icon", style="white", width=3, no_wrap=True)
+        table.add_column("Config", style="white", width=25, no_wrap=True)
+        table.add_column("Value", style="dim white", justify="right", width=23, no_wrap=True)
+
+        table.add_row("[1]", "⏰", "Status", f"[{'bold green' if enabled else 'dim white'}]{'AKTIF' if enabled else 'NONAKTIF'}[/]")
+        table.add_row("[2]", "⏳", "Interval Restart", f"[cyan]{hours} jam[/]")
+        table.add_row("[3]", "↩", "Kembali", ">")
+
+        console.print(table)
+        draw_footer("ESC / 3  Back  |  [1] Toggle Aktif/Nonaktif")
+
+        choice = safe_prompt_ask("\n[dim]Pilih (1-3)[/]", choices=["1", "2", "3"])
+        if choice == "RESIZE_EVENT":
+            continue
+
+        if choice == '1':
+            config_data['SCHEDULED_RESTART_ENABLED'] = 0 if enabled else 1
+            save_config(config_data, "config.conf")
+            if enabled:
+                console.print("\n[bold yellow]Scheduled Restart DIMATIKAN.[/]")
+            else:
+                console.print(f"\n[bold green]Scheduled Restart DIAKTIFKAN. Package akan direstart tiap {hours} jam sekali.[/]")
+            time.sleep(1.2)
+        elif choice == '2':
+            new_hours = safe_console_input("\n[dim]Masukkan Interval Restart (jam, bilangan bulat):[/] ")
+            if new_hours != "RESIZE_EVENT" and new_hours.isdigit() and int(new_hours) > 0:
+                config_data['SCHEDULED_RESTART_HOURS'] = int(new_hours)
+                save_config(config_data, "config.conf")
+            elif new_hours not in ("RESIZE_EVENT", ""):
+                console.print("[bold red][!] Interval harus bilangan bulat lebih dari 0.[/]")
+                time.sleep(1)
+        elif choice == '3':
+            break
+
+
 def show_settings():
     clear_screen()
     config_data = load_config("config.conf")
@@ -600,15 +652,18 @@ def show_settings():
         table.add_row("[6]", "🔄", "Max Retries", f"[cyan]{config_data.get('MAX_RETRIES', 3)}x[/]")
         table.add_row("[7]", "❄", "Cooldown", f"[cyan]{config_data.get('COOLDOWN_SECONDS', 300)}s[/]")
         table.add_row("[8]", "🧹", "Auto Clear Cache", f"[cyan]{config_data.get('CLEAR_CACHE_MINUTES', 30)}m[/]")
-        table.add_row("[9]", "📦", "Atur Link per Package", ">")
-        table.add_row("[10]", "🗺", "Atur Map ID per Package", ">")
-        table.add_row("[11]", "🔌", "Device Agent (Joki Bot)", _device_agent_status(config_data))
-        table.add_row("[12]", "↩", "Kembali", ">")
+        sched_restart_on = int(config_data.get('SCHEDULED_RESTART_ENABLED', 0) or 0) == 1
+        sched_restart_label = f"AKTIF ({config_data.get('SCHEDULED_RESTART_HOURS', 5)}j)" if sched_restart_on else "NONAKTIF"
+        table.add_row("[9]", "⏰", "Scheduled Restart", f"[{'bold green' if sched_restart_on else 'dim white'}]{sched_restart_label}[/]")
+        table.add_row("[10]", "📦", "Atur Link per Package", ">")
+        table.add_row("[11]", "🗺", "Atur Map ID per Package", ">")
+        table.add_row("[12]", "🔌", "Device Agent (Joki Bot)", _device_agent_status(config_data))
+        table.add_row("[13]", "↩", "Kembali", ">")
         
         console.print(table)
-        draw_footer("ESC / 12  Back to Menu  |  [3] Toggle Lobby Only (abaikan PS/Map ID)")
+        draw_footer("ESC / 13  Back to Menu  |  [3] Toggle Lobby Only (abaikan PS/Map ID)")
         
-        choice = safe_prompt_ask("\n[dim]Pilih (1-12)[/]", choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"])
+        choice = safe_prompt_ask("\n[dim]Pilih (1-13)[/]", choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"])
         if choice == "RESIZE_EVENT": continue
         
         if choice == '1':
@@ -672,12 +727,14 @@ def show_settings():
                 config_data['CLEAR_CACHE_MINUTES'] = int(new_cache)
                 save_config(config_data, "config.conf")
         elif choice == '9':
-            show_link_manager(config_data)
+            show_scheduled_restart_menu(config_data)
         elif choice == '10':
-            show_map_manager(config_data)
+            show_link_manager(config_data)
         elif choice == '11':
-            show_device_agent_menu(config_data)
+            show_map_manager(config_data)
         elif choice == '12':
+            show_device_agent_menu(config_data)
+        elif choice == '13':
             break
 
 def run_updater():

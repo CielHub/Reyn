@@ -44,6 +44,12 @@ def load_config(config_path="config.conf"):
         "GRID_OFFSET_Y": 60,
         "CLEAR_CACHE_MINUTES": 30,
         "LOBBY_ONLY_MODE": 0,
+        # --- Scheduled Restart: restart package tiap interval JAM tetap,
+        # bukan tiap kali crash. Kalau package mati sebelum jadwal
+        # berikutnya tiba, dia WAJIB menunggu (lihat recovery_manager.py),
+        # supaya restart tetap terkontrol/tidak mencurigakan buat map berat.
+        "SCHEDULED_RESTART_ENABLED": 0,
+        "SCHEDULED_RESTART_HOURS": 5,
         # --- PHASE 1: kredensial agent Joki Control Bot (opsional) ---
         # BOT_WS_URL sudah di-hardcode ke alamat NuraHost yang sudah dites
         # berhasil -- user cuma perlu isi DEVICE_ID/DEVICE_TOKEN lewat menu.
@@ -72,7 +78,8 @@ def load_config(config_path="config.conf"):
                     config[key] = val
                 elif key in ["TIMEOUT_SECONDS", "RECOVERY_DELAY_SECONDS", "DELAY_SECONDS", "MAX_RETRIES", "COOLDOWN_SECONDS", 
                              "GRID_ENABLED", "GRID_COLS", "GRID_CELL_W", "GRID_CELL_H", 
-                             "GRID_MARGIN", "GRID_OFFSET_Y", "CLEAR_CACHE_MINUTES", "LOBBY_ONLY_MODE"]:
+                             "GRID_MARGIN", "GRID_OFFSET_Y", "CLEAR_CACHE_MINUTES", "LOBBY_ONLY_MODE",
+                             "SCHEDULED_RESTART_ENABLED", "SCHEDULED_RESTART_HOURS"]:
                     try: 
                         config[key] = int(val)
                     except ValueError: 

@@ -29,6 +29,7 @@ PHASE 8 -- prinsip SYNC_SESSIONS (lihat reconcile_sync() untuk detail):
   sudah mati, device cukup lapor apa adanya, keputusan lanjut ada di bot.
 """
 import asyncio
+import random
 import time
 
 import datetime
@@ -40,6 +41,7 @@ from core.launcher import (
     launch_normal, wait_for_launch_signal,
 )
 from core.join_verifier import has_recent_disconnect_signal
+from core.error_detector import start_error_detector, has_event, get_event
 from core import process_manager
 from core import username_scanner
 
@@ -93,6 +95,25 @@ JOIN_VERIFY_GRACE_SECONDS = 6
 # Dipanggil sebelum PREPARING (buka Roblox ke lobby dulu, TANPA target) --
 # hanya perlu proses hidup, tidak perlu sinyal join game.
 LOBBY_TIMEOUT_SECONDS = 30
+
+# ==========================================================
+# SISTEM DETEKSI & AUTO-RECOVERY (disconnect logcat + crash PID)
+# ==========================================================
+# Rentang jeda di LOBBY setelah recovery relaunch, SEBELUM join ulang ke
+# target -- supaya Roblox benar-benar siap (bukan cuma proses hidup) sebelum
+# dipaksa masuk game lagi. Diacak tiap kali (bukan angka tetap) di rentang
+# 60-90 detik.
+RECOVERY_LOBBY_WAIT_MIN_SECONDS = 60
+RECOVERY_LOBBY_WAIT_MAX_SECONDS = 90
+
+# Jeda sebelum retry attempt recovery BERIKUTNYA kalau satu tahap (kill/
+# launch lobby/join ulang) gagal -- recovery retry TANPA BATAS (sampai
+# berhasil atau session-nya distop/diganti), tapi tidak boleh langsung
+# nyoba lagi detik itu juga supaya tidak "terburu-buru"/spam.
+RECOVERY_RETRY_DELAY_SECONDS = 20
+
+# Seberapa sering consumer men-drain queue event dari error_detector.py.
+DISCONNECT_POLL_INTERVAL_SECONDS = 1
 
 # IMPROVE ANDROID 12 (Timer utk Proses Freeform): sebelumnya Freeform baru
 # diaktifkan SETELAH launch_and_wait() selesai menunggu Roblox "beneran
@@ -179,6 +200,18 @@ SESSIONS: dict = {}
 
 # package_name -> asyncio.Task watchdog yang sedang berjalan untuk package itu.
 _watchdog_tasks: dict = {}
+
+# Set package_name yang SEDANG dalam proses recovery (kill->lobby->delay->
+# join ulang) -- dipakai sebagai lock ringan supaya PID-crash watchdog
+# (_headless_watchdog_loop) dan consumer disconnect logcat
+# (_error_event_consumer_loop) tidak sama-sama memicu recovery dobel untuk
+# package yang sama pada saat bersamaan.
+_recovery_in_progress: set = set()
+
+# Task tunggal (BUKAN per-package -- logcat "Roblox" mencakup semua PID
+# sekaligus) yang membaca queue error_detector.py dan mencocokkan PID ke
+# package/akun yang sedang ACTIVE. Lihat _ensure_error_watcher().
+_error_watcher_task = None
 
 # === MULTI-PACKAGE FREEFORM (Android 12) ===
 # package_name -> {"session_id", "task_id", "state"} untuk package yang
@@ -478,6 +511,7 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
 
     _ensure_watchdog(pkg)
     _ensure_username_scanner(pkg)  # PHASE 4.5 (lihat D2) -- tetap jalan untuk tampilan heartbeat
+    _ensure_error_watcher()  # deteksi disconnect logcat (Error 266/267/277/279/280), lihat bawah
 
     await _emit_status(local_device_id, session_id, pkg, order_id, "RUNNING")
     log.info(f"SESSION_AGENT: {pkg} (session {session_id}) RUNNING -- timer customer dimulai sekarang.")
@@ -834,8 +868,12 @@ async def handle_stop_session(msg: dict, local_device_id: str, do_reset: bool = 
 
 async def _headless_watchdog_loop(pkg: str) -> None:
     """Watchdog ringan khusus package yang dikontrol agent. Cuma menjaga PID
-    tetap hidup (relaunch pakai target yang sama kalau crash) -- BUKAN
-    pengganti tiering recovery_manager.py yang dipakai mode manual/menu.
+    tetap hidup -- begitu terdeteksi mati, delegasikan ke
+    _run_package_recovery() (kill jaga-jaga -> lobby -> delay 60-90s ->
+    join ulang) SUPAYA PERSIS SAMA alurnya dengan recovery yang dipicu
+    deteksi disconnect logcat (_handle_disconnect_event), bukan relaunch
+    langsung ke target seperti sebelumnya. BUKAN pengganti tiering
+    recovery_manager.py yang dipakai mode manual/menu.
 
     Anti-rejoin (PHASE 6/7, SUDAH AKTIF): loop ini HANYA bertindak kalau
     status == "ACTIVE" (lihat cek di bawah) -- begitu handle_stop_session()
@@ -859,45 +897,281 @@ async def _headless_watchdog_loop(pkg: str) -> None:
                 # SETELAH RUNNING tercapai (lihat _run_start_flow), jadi
                 # cabang ini praktis tidak pernah kena PREPARING/WAITING_LOGIN/
                 # ACCOUNT_READY/JOINING_GAME -- tetap dijaga untuk keamanan.
+                # Termasuk skip kalau statusnya "RECOVERING" (recovery lain
+                # -- mis. dari disconnect logcat -- sedang berjalan).
                 continue
 
             current_pid = process_manager.get_pid(pkg)
             if current_pid and current_pid == info.get("pid"):
                 continue  # masih hidup, normal
 
+            if pkg in _recovery_in_progress:
+                continue  # sudah/baru saja ditangani jalur recovery lain
+
             info["crash_count"] += 1
-            log.warning(f"SESSION_AGENT: {pkg} terdeteksi mati (session {info['session_id']}), "
-                        f"relaunch ke target yang sama...")
-            try:
-                intent_url = get_intent_url(info["target"])
-                # IMPROVE ANDROID 12 (Timer utk Proses Freeform): sama seperti
-                # start flow -- freeform (kalau pkg pernah Freeform sebelumnya,
-                # only_if_previously_freeform=True menjaga perilaku lama)
-                # dipicu lewat timer tetap, BERBARENGAN dengan Smart Wait,
-                # bukan menunggunya selesai dulu.
-                success = await _launch_then_freeform_soon(
-                    pkg, intent_url, DEFAULT_TIMEOUT_SECONDS,
-                    require_join_signal=False, session_id=info["session_id"],
-                    only_if_previously_freeform=True,
-                )
-            except Exception:
-                log.error(f"SESSION_AGENT: exception saat relaunch {pkg}.", exc_info=True)
-                success = False
-
-            if pkg not in SESSIONS:
-                break  # sesi sudah dihapus selagi kita relaunch
-
-            if success:
-                SESSIONS[pkg]["pid"] = get_pid_quick(pkg) or "-"
-                SESSIONS[pkg]["launch_count"] += 1
-            else:
-                SESSIONS[pkg]["pid"] = "-"
-                log.error(f"SESSION_AGENT: relaunch {pkg} gagal, akan dicoba lagi siklus berikutnya.")
+            session_id = info["session_id"]
+            log.warning(f"SESSION_AGENT: {pkg} terdeteksi mati (session {session_id}), "
+                        f"memulai recovery (kill->lobby->delay->join ulang)...")
+            info["status"] = "RECOVERING"
+            _recovery_in_progress.add(pkg)
+            # Di-await LANGSUNG (bukan create_task) -- loop ini SATU per
+            # package, jadi menunggu recovery package ini selesai di sini
+            # tidak memblokir watchdog package LAIN (masing-masing task
+            # terpisah, lihat _ensure_watchdog).
+            await _run_package_recovery(pkg, session_id, "PID_CRASH")
     except asyncio.CancelledError:
         raise
     finally:
         log.info(f"SESSION_AGENT: watchdog headless berhenti untuk {pkg}.")
         _watchdog_tasks.pop(pkg, None)
+
+
+def _ensure_error_watcher() -> None:
+    """Pastikan cuma ADA SATU consumer task global untuk event disconnect
+    logcat (error_detector.py sendiri sudah singleton internal, ini cuma
+    memastikan task Python-nya juga tidak numpuk kalau dipanggil berkali-kali
+    dari beberapa START_SESSION)."""
+    global _error_watcher_task
+    if _error_watcher_task is not None and not _error_watcher_task.done():
+        return
+    start_error_detector()
+    _error_watcher_task = asyncio.create_task(_error_event_consumer_loop())
+
+
+async def _error_event_consumer_loop() -> None:
+    """Drain queue error_detector.py (deteksi disconnect Roblox in-game via
+    logcat reason 266/267/277/279/280) lalu cocokkan PID di event ke
+    package/akun yang sedang ACTIVE di SESSIONS -- SATU package saja yang
+    kena recovery (identifikasi via kombinasi package+PID, lihat
+    _handle_disconnect_event), package lain tetap farming seperti biasa."""
+    log.info("SESSION_AGENT: error watcher (deteksi disconnect logcat) mulai.")
+    try:
+        while True:
+            await asyncio.sleep(DISCONNECT_POLL_INTERVAL_SECONDS)
+            while has_event():
+                event = get_event()
+                if event is None:
+                    break
+                try:
+                    await _handle_disconnect_event(event)
+                except Exception:
+                    log.error("SESSION_AGENT: exception memproses event disconnect logcat.",
+                              exc_info=True)
+    except asyncio.CancelledError:
+        raise
+
+
+async def _handle_disconnect_event(event: dict) -> None:
+    """Cocokkan PID dari event error_detector.py ke package yang SEDANG
+    ACTIVE di SESSIONS (identifikasi package+PID sekaligus, bukan cuma PID
+    mentah, supaya tidak salah sasaran ke package yang bukan joki/sudah
+    berhenti). Kalau tidak ada yang cocok (mis. PID dari package non-joki
+    di device yang sama, atau package itu sudah dalam recovery/berhenti),
+    event ini dilewati saja."""
+    pid = str(event.get("pid") or "").strip()
+    reason = event.get("reason")
+    if not pid:
+        return
+
+    target_pkg = None
+    for pkg, info in list(SESSIONS.items()):
+        if info.get("status") == "ACTIVE" and str(info.get("pid") or "") == pid:
+            target_pkg = pkg
+            break
+
+    if not target_pkg or target_pkg in _recovery_in_progress:
+        return
+
+    info = SESSIONS.get(target_pkg)
+    if not info:
+        return
+
+    session_id = info["session_id"]
+    username = info.get("expected_username") or "?"
+    info["status"] = "RECOVERING"
+    _recovery_in_progress.add(target_pkg)
+    log.warning(f"SESSION_AGENT: [DISCONNECT] {target_pkg} (akun {username}, session {session_id}) "
+                f"terdeteksi Error {reason} (PID {pid}) -- memulai recovery.")
+    # create_task (BUKAN await langsung) -- loop consumer ini SATU untuk
+    # SEMUA package, jangan sampai tertahan nunggu recovery 60-90+ detik
+    # package ini sementara package LAIN yang juga disconnect tidak terproses.
+    asyncio.create_task(_run_package_recovery(target_pkg, session_id, f"LOGCAT_{reason}"))
+
+
+async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) -> None:
+    """Recovery INDEPENDEN per-package: kill (jaga-jaga kalau proses masih
+    hidup -- disconnect logcat BUKAN berarti proses mati) -> launch ke
+    LOBBY -> tunggu acak 60-90 detik (RECOVERY_LOBBY_WAIT_*_SECONDS) supaya
+    Roblox benar-benar siap -> join ulang ke target yang SAMA -> kembali
+    farming. Dipanggil baik dari watchdog PID-crash maupun consumer
+    disconnect logcat -- keduanya berakhir di sini supaya perilakunya PERSIS
+    SAMA, tidak ada dua alur recovery yang bisa divergen.
+
+    Retry TANPA BATAS (permintaan eksplisit) dengan jeda
+    RECOVERY_RETRY_DELAY_SECONDS di antar percobaan kalau satu tahap gagal
+    -- berhenti hanya kalau berhasil ATAU session ini sudah diganti/distop
+    (_still_current() jadi False, mis. staff pencet Finish/Assign ulang
+    selagi recovery masih berjalan).
+
+    Package LAIN yang sedang farming TIDAK PERNAH disentuh oleh fungsi ini
+    (cuma memanggil launcher/process_manager untuk `pkg` yang diberikan).
+    """
+    def _still_current() -> bool:
+        current = SESSIONS.get(pkg)
+        return bool(current and current.get("session_id") == session_id)
+
+    try:
+        if not _still_current():
+            return
+
+        info = SESSIONS[pkg]
+        target = info.get("target")
+        expected_username = info.get("expected_username") or "?"
+
+        attempt = 0
+        while _still_current():
+            attempt += 1
+            info = SESSIONS[pkg]
+            info["status"] = "RECOVERING"
+            log.warning(f"SESSION_AGENT: [RECOVERY] {pkg} (akun {expected_username}, "
+                        f"session {session_id}) percobaan #{attempt} -- alasan: {trigger_reason}.")
+
+            # --- Kill dulu KALAU proses masih hidup. Disconnect logcat bisa
+            # terjadi selagi proses Roblox-nya SENDIRI masih berjalan (cuma
+            # koneksi game-nya yang putus), beda dari crash PID yang memang
+            # sudah mati duluan -- jadi step ini dibuat aman untuk kedua
+            # kasus (tidak ada-apa kalau memang sudah mati).
+            current_pid = await asyncio.to_thread(process_manager.get_pid, pkg)
+            if current_pid:
+                await asyncio.to_thread(process_manager.graceful_kill, current_pid, pkg)
+                await asyncio.to_thread(process_manager.wait_until_process_dead, current_pid, 10)
+
+            if not _still_current():
+                return
+
+            # --- Launch ke LOBBY dulu (BUKAN langsung ke target) ---
+            try:
+                lobby_ok = await _launch_then_freeform_soon(
+                    pkg, get_lobby_intent(), LOBBY_TIMEOUT_SECONDS,
+                    require_join_signal=False, session_id=session_id,
+                    only_if_previously_freeform=True,
+                )
+            except Exception:
+                log.error(f"SESSION_AGENT: [RECOVERY] exception buka lobby {pkg}.", exc_info=True)
+                lobby_ok = False
+
+            if not _still_current():
+                return
+
+            if not lobby_ok:
+                log.warning(f"SESSION_AGENT: [RECOVERY] {pkg} gagal buka lobby, retry dalam "
+                            f"{RECOVERY_RETRY_DELAY_SECONDS}s...")
+                await asyncio.sleep(RECOVERY_RETRY_DELAY_SECONDS)
+                continue
+
+            info["pid"] = get_pid_quick(pkg) or "-"
+
+            # --- Tunggu acak 60-90 detik di lobby sebelum join ulang ---
+            wait_seconds = random.uniform(
+                RECOVERY_LOBBY_WAIT_MIN_SECONDS, RECOVERY_LOBBY_WAIT_MAX_SECONDS,
+            )
+            log.info(f"SESSION_AGENT: [RECOVERY] {pkg} di lobby, menunggu {wait_seconds:.0f}s "
+                     f"sebelum join ulang ke target...")
+            await asyncio.sleep(wait_seconds)
+
+            if not _still_current():
+                return
+
+            # --- Join ulang ke target yang SAMA ---
+            try:
+                intent_url = get_intent_url(target)
+            except ValueError as e:
+                log.error(f"SESSION_AGENT: [RECOVERY] {pkg} target tidak valid lagi ({e}), retry "
+                          f"dalam {RECOVERY_RETRY_DELAY_SECONDS}s...")
+                await asyncio.sleep(RECOVERY_RETRY_DELAY_SECONDS)
+                continue
+
+            joined = await _attempt_join_target(pkg, session_id, intent_url, DEFAULT_TIMEOUT_SECONDS)
+
+            if not _still_current():
+                return
+
+            if joined:
+                info = SESSIONS.get(pkg)
+                if info is not None:
+                    info["status"] = "ACTIVE"
+                    info["pid"] = get_pid_quick(pkg) or "-"
+                    info["launch_count"] = info.get("launch_count", 0) + 1
+                await _activate_freeform_and_restore_siblings(pkg, session_id)
+                log.info(f"SESSION_AGENT: [RECOVERY] {pkg} (akun {expected_username}) berhasil "
+                         f"kembali farming (percobaan #{attempt}).")
+                return
+
+            log.warning(f"SESSION_AGENT: [RECOVERY] {pkg} gagal join ulang, retry dalam "
+                        f"{RECOVERY_RETRY_DELAY_SECONDS}s...")
+            await asyncio.sleep(RECOVERY_RETRY_DELAY_SECONDS)
+    finally:
+        _recovery_in_progress.discard(pkg)
+
+
+async def _attempt_join_target(pkg: str, session_id: str, intent_url: str, timeout_seconds: int) -> bool:
+    """Coba join ke target game -- dipakai KHUSUS oleh _run_package_recovery
+    (bukan Tahap 3 di _run_start_flow). Logic join_status/UNCERTAIN/
+    grace-check di sini SENGAJA disalin (bukan direfactor jadi satu fungsi
+    bersama dengan _run_start_flow) supaya alur start awal yang sudah teruji
+    tidak ikut berubah risikonya. Tidak pernah mengirim SESSION_STATUS --
+    post-RUNNING pesan itu selalu diabaikan bot.py (lihat
+    handle_session_status: session yang sudah RUNNING mengabaikan status
+    apa pun berikutnya untuk mencegah timer customer ke-reset), jadi cukup
+    logging lokal di device."""
+    def _still_current() -> bool:
+        current = SESSIONS.get(pkg)
+        return bool(current and current.get("session_id") == session_id)
+
+    try:
+        join_status, join_reason = await _launch_then_freeform_soon(
+            pkg, intent_url, timeout_seconds,
+            require_join_signal=True, session_id=session_id,
+        )
+    except Exception:
+        log.error(f"SESSION_AGENT: [RECOVERY] exception saat join target {pkg}.", exc_info=True)
+        return False
+
+    if not _still_current():
+        return False
+
+    if join_status == "FAILED":
+        log.warning(f"SESSION_AGENT: [RECOVERY] {pkg} join gagal: {join_reason}")
+        return False
+
+    if join_status == "UNCERTAIN":
+        log.info(f"SESSION_AGENT: [RECOVERY] {pkg} join UNCERTAIN ({join_reason}), grace-check...")
+        grace_start_str = datetime.datetime.now().strftime('%m-%d %H:%M:%S.000')
+        await asyncio.sleep(JOIN_VERIFY_GRACE_SECONDS)
+
+        if not _still_current():
+            return False
+
+        pid_after_grace = get_pid_quick(pkg)
+        if not pid_after_grace:
+            log.warning(f"SESSION_AGENT: [RECOVERY] {pkg} mati selama grace-check.")
+            return False
+
+        try:
+            has_failure, failure_code = await asyncio.to_thread(
+                has_recent_disconnect_signal, pkg, grace_start_str,
+            )
+        except Exception:
+            log.error(f"SESSION_AGENT: [RECOVERY] exception grace-check disconnect {pkg}.",
+                      exc_info=True)
+            has_failure, failure_code = False, None
+
+        if has_failure:
+            log.warning(f"SESSION_AGENT: [RECOVERY] {pkg} bukti disconnect asli "
+                        f"(reason={failure_code}) selama grace-check.")
+            return False
+
+    return True
 
 
 # ==========================================================

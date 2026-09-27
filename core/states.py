@@ -13,17 +13,8 @@ class UpdaterState(Enum):
     RESTARTING = "RESTARTING"
     ERROR = "ERROR"
 
-# TODO Phase 3: Tambahkan LauncherState, MonitorState, dll di sini.
+# TODO Phase 3: Tambahkan LauncherState, dll di sini.
 
-
-
-class PackageState(Enum):
-    """Explicit lifecycle states for a Roblox package."""
-    OFFLINE = "OFFLINE"
-    LAUNCHING = "LAUNCHING"
-    CONNECTING = "CONNECTING"
-    ONLINE = "ONLINE"
-    RECOVERING = "RECOVERING"
-    COOLDOWN = "COOLDOWN"
-    FAILED = "FAILED"
-    NO_TARGET = "NO TARGET"
+# PackageState (dulu dipakai dashboard standalone Auto Rejoin lewat
+# state_machine.py) sudah dihapus -- tidak ada consumer produksi lagi
+# setelah refactor: remove standalone auto rejoin engine.

@@ -5,32 +5,16 @@ Tanggung Jawab: Menampilkan CLI interaktif dan routing eksekusi.
 import os
 import sys
 import time
-import logging
-import shutil
 
 from core.logger import log
 from core.config import load_config, save_config
-from core.deeplink import get_intent_url
-from core.target_resolver import TargetResolver
-from core.state_machine import set_state
-from core.states import PackageState
 from core.scanner import get_roblox_packages
-from core.launcher import launch_and_wait, activate_freeform, is_android12
 from core.agent_client import start_agent_background, get_agent_status
-from core.monitor import (
-    start_monitoring,
-    draw_dashboard,
-    create_dashboard_live,
-    refresh_dashboard_live,
-    get_dashboard_terminal_size,
-)
 from core.ui import (
-    console, clear_screen, reset_terminal, full_terminal_reset, draw_header, show_transition,
+    console, clear_screen, reset_terminal, draw_header, show_transition,
     draw_footer, safe_prompt_ask, safe_console_input,
-    start_dashboard_resize_watcher, stop_dashboard_resize_watcher,
 )
 from core.tester import show_test_menu
-from core.cache_cleaner import clean_package_cache
 #from core.accounts import load_accounts, save_accounts
 
 try:
@@ -108,364 +92,6 @@ def show_auto_login_menu():
                 console.print("[bold red][!] ID tidak valid.[/]")
                 time.sleep(1)
 
-def resolve_join_intent(config_data, pkg):
-    """Backward-compatible wrapper around the centralized TargetResolver."""
-    target = TargetResolver(config_data).resolve(pkg)
-    if target is None:
-        return None, "NONE"
-    label = f"{target.target_type} ({target.scope})"
-    return target.intent_url, label
-
-
-def show_map_manager(config_data):
-    clear_screen()
-    all_packages = get_roblox_packages()
-    if not all_packages:
-        console.print("\n[bold red][!] Tidak ada package Roblox terdeteksi.[/]")
-        safe_console_input("\n[dim]Tekan Enter untuk kembali...[/]")
-        return
-
-    while True:
-        reset_terminal()
-        draw_header("MAP ID PER PACKAGE")
-
-        table = Table(box=None, padding=(0, 0), show_header=True, header_style="dim white")
-        table.add_column("ID", style="bold cyan", width=4, no_wrap=True)
-        table.add_column("PACKAGE NAME", style="white", width=20, no_wrap=True)
-        table.add_column("MAP / PLACE ID", style="cyan", width=20, no_wrap=True)
-
-        for idx, pkg in enumerate(all_packages, 1):
-            place_id = config_data.get(f"PKG_{pkg}_PLACE_ID", "")
-            display = place_id if place_id else "[dim white]<Global Map ID>[/]"
-            table.add_row(f"[{idx}]", pkg, display)
-
-        console.print(table)
-        draw_footer("[1,2,3..] Pilih ID untuk edit   |   [0] Kembali")
-
-        choice = safe_console_input("\n[dim]Pilih ID (0 untuk keluar):[/] ")
-        if choice == "RESIZE_EVENT":
-            continue
-        choice = choice.strip()
-
-        if choice == '0':
-            break
-        if not choice.isdigit() or not (1 <= int(choice) <= len(all_packages)):
-            console.print("[bold red][!] ID tidak valid.[/]")
-            time.sleep(1)
-            continue
-
-        selected_pkg = all_packages[int(choice) - 1]
-        key = f"PKG_{selected_pkg}_PLACE_ID"
-        current = config_data.get(key, "")
-        console.print(f"\n[bold cyan]Map ID untuk {selected_pkg}[/]")
-        console.print("[dim]Kosongkan lalu Enter untuk menggunakan Global Map ID.[/]")
-        new_id = safe_console_input(f"[dim]Place ID baru [{current or 'Global'}]:[/] ")
-        if new_id == "RESIZE_EVENT":
-            continue
-
-        new_id = new_id.strip()
-        if new_id and not new_id.isdigit():
-            console.print("[bold red][!] Place ID harus berupa angka.[/]")
-            time.sleep(1)
-            continue
-
-        if new_id:
-            # Satu package hanya boleh punya satu target aktif.
-            # Jika Map ID diisi, Private Server Link package otomatis dikosongkan.
-            config_data[key] = new_id
-            config_data.pop(f"PKG_{selected_pkg}", None)
-        else:
-            config_data.pop(key, None)
-        save_config(config_data, "config.conf")
-
-
-def show_link_manager(config_data):
-    clear_screen()
-    all_packages = get_roblox_packages()
-    if not all_packages:
-        console.print("\n[bold red][!] Tidak ada package Roblox terdeteksi.[/]")
-        safe_console_input("\n[dim]Tekan Enter untuk kembali...[/]")
-        return
-
-    while True:
-        reset_terminal()
-        draw_header("LINK PER PACKAGE")
-        
-        table = Table(box=None, padding=(0, 0), show_header=True, header_style="dim white")
-        table.add_column("ID", style="bold cyan", width=4, no_wrap=True)
-        table.add_column("PACKAGE NAME", style="white", width=20, no_wrap=True)
-        table.add_column("DEEP LINK", style="cyan", width=30, no_wrap=True, overflow="ellipsis")
-        
-        for idx, pkg in enumerate(all_packages, 1):
-            pkg_key = f"PKG_{pkg}"
-            link = config_data.get(pkg_key, "")
-            display_link = link if link else "[dim white]<Global Link>[/]"
-            table.add_row(f"[{idx}]", pkg, display_link)
-            
-        console.print(table)
-        draw_footer("[1,2,3..] Pilih ID untuk edit   |   [0] Kembali")
-        
-        choice = safe_console_input("\n[dim]Pilih ID (0 untuk keluar):[/] ")
-        if choice == "RESIZE_EVENT": continue
-        choice = choice.strip()
-        
-        if choice == '0':
-            break
-        elif choice.isdigit():
-            idx = int(choice)
-            if 1 <= idx <= len(all_packages):
-                selected_pkg = all_packages[idx-1]
-                pkg_key = f"PKG_{selected_pkg}"
-                console.print(f"\n[dim]Kosongkan lalu Enter untuk menggunakan Global Link.[/]")
-                
-                new_link = safe_console_input(f"[dim]Link baru untuk [white]{selected_pkg}[/]:[/] ")
-                if new_link == "RESIZE_EVENT": continue
-                
-                if new_link.strip():
-                    # Satu package hanya boleh punya satu target aktif.
-                    # Jika Private Server diisi, Map ID package otomatis dikosongkan.
-                    config_data[pkg_key] = new_link.strip()
-                    config_data.pop(f"{pkg_key}_PLACE_ID", None)
-                else:
-                    config_data.pop(pkg_key, None)
-
-                save_config(config_data, "config.conf")
-            else:
-                console.print("[bold red][!] ID tidak valid.[/]")
-                time.sleep(1)
-
-def run_auto_rejoiner():
-    clear_screen()
-    draw_header("INITIALIZING AUTO REJOINER")
-    
-    config_data = load_config("config.conf")
-    timeout_seconds = config_data.get("TIMEOUT_SECONDS", 45)
-    delay_seconds = config_data.get("DELAY_SECONDS", 3)
-    max_retries = config_data.get("MAX_RETRIES", 3)
-    cooldown_secs = config_data.get("COOLDOWN_SECONDS", 300)
-    
-    all_packages = get_roblox_packages()
-    if not all_packages:
-        console.print("\n[bold red][!] Tidak ada package Roblox terdeteksi.[/]")
-        safe_console_input("\n[dim]Tekan Enter untuk kembali...[/]")
-        return
-
-    if int(config_data.get('LOBBY_ONLY_MODE', 0) or 0) == 1:
-        console.print("\n[bold green]🏠 MODE LOBBY ONLY AKTIF — semua package hanya login ke Menu/Home, tidak join Place ID / Private Server.[/]")
-
-    console.print("\n[bold cyan]Detected Packages:[/]")
-    for idx, pkg in enumerate(all_packages, 1):
-        console.print(f"[{idx}] {pkg}")
-    console.print("\n[bold cyan][A][/] All Packages")
-    
-    packages = []
-    while True:
-        choice = safe_console_input("\n[dim]Input (A / 1,2,3...):[/] ")
-        if choice == "RESIZE_EVENT":
-            reset_terminal()
-            draw_header("INITIALIZING AUTO REJOINER")
-            console.print("\n[bold cyan]Detected Packages:[/]")
-            for idx, pkg in enumerate(all_packages, 1):
-                console.print(f"[{idx}] {pkg}")
-            console.print("\n[bold cyan][A][/] All Packages")
-            continue
-            
-        choice = choice.strip().upper()
-        
-        if choice == '':
-            console.print("[bold red][!] Input tidak boleh kosong. Silakan coba lagi.[/]")
-            continue
-        elif choice == 'A':
-            packages = all_packages
-            break
-        else:
-            parts = choice.split(',')
-            new_active = []
-            invalid_nums = []
-            seen = set()
-            for p in parts:
-                p = p.strip()
-                if p.isdigit():
-                    idx = int(p)
-                    if 1 <= idx <= len(all_packages):
-                        pkg_name = all_packages[idx-1]
-                        if pkg_name not in seen:
-                            seen.add(pkg_name)
-                            new_active.append(pkg_name)
-                    else:
-                        invalid_nums.append(p)
-                else:
-                    invalid_nums.append(p)
-                    
-            if invalid_nums:
-                console.print(f"[bold red][!] Input tidak valid/tidak ditemukan: {', '.join(invalid_nums)}[/]")
-                continue
-            else:
-                packages = new_active
-                break
-
-    intent_dict = {}
-
-    for pkg in packages:
-        try:
-            intent, target_type = resolve_join_intent(config_data, pkg)
-            intent_dict[pkg] = intent
-            if intent:
-                log.info(f"TARGET: {pkg} -> {target_type}")
-            else:
-                console.print(f"[bold yellow][!] PERINGATAN: Tidak ada target join untuk {pkg} (PS/Map ID). Akan terhenti di Home.[/]")
-        except ValueError as exc:
-            console.print(f"[bold red][!] Target {pkg} tidak valid: {exc}[/]")
-            intent_dict[pkg] = None
-    
-    current_time = time.time()
-    stats = {}
-    for pkg in packages:
-        stats[pkg] = {
-            'pid': '-', 'status': 'OFFLINE', 'uptime_start': 0,
-            'launch_count': 0, 'recovery_count': 0, 'crash_count': 0,
-            'consecutive_crashes': 0, 'last_recovery_time': current_time, 'cooldown_until': 0, 'state': 'OFFLINE'
-        }
-    
-    for handler in log.handlers[:]:
-        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
-            log.removeHandler(handler)
-            
-    # Full terminal reset happens exactly once, immediately before the first dashboard frame.
-    # After this point the dashboard lifecycle never performs another terminal reset.
-    full_terminal_reset()
-    
-    dashboard_size = get_dashboard_terminal_size()
-    resize_handler = start_dashboard_resize_watcher()
-    try:
-        with create_dashboard_live(
-            draw_dashboard(stats, time.time(), len(packages), include_header=True),
-            screen=True,
-        ) as live:
-            # FIX (Improve Android 12: Urutan Launch & Freeform): SEBELUMNYA
-            # launch_and_wait() dipanggil TANPA defer_freeform di loop batch
-            # ini -- di Android 12, itu berarti perubahan ke Freeform (yang
-            # cukup lama: switch windowingMode + apply grid + verify window
-            # benar2 tampil) jadi BAGIAN BLOCKING dari launch_and_wait package
-            # SAAT ITU, sebelum loop lanjut ke package berikutnya. Akibatnya
-            # package berikutnya baru mulai di-launch SETELAH freeform
-            # package sebelumnya selesai -- kalau lama, package berikutnya
-            # bisa keburu dianggap timeout/mati.
-            #
-            # Sekarang: launch_and_wait() SELALU dipanggil dengan
-            # defer_freeform=True (no-op di device non-Android 12, lihat
-            # launcher.is_android12() -- tidak mengubah perilaku sama sekali
-            # selain Android 12). Freeform utk package yang BARU SAJA
-            # berhasil di-launch BARU diterapkan SETELAH package BERIKUTNYA
-            # selesai di-launch (activate_freeform ditunda 1 langkah,
-            # `pending_freeform_pkg`) -- persis flow yang diminta: launch
-            # pkg saat ini -> lanjut launch pkg berikutnya -> baru freeform-kan
-            # pkg sebelumnya -> dst. `activate_freeform()` sendiri (dari
-            # launcher.py, fungsi yang SAMA dipakai session_agent.py untuk
-            # joki headless) sudah aman dipanggil kapan pun -- kosmetik,
-            # gagal di sini tidak pernah menggagalkan launch.
-            pending_freeform_pkg = None
-
-            def _flush_pending_freeform():
-                nonlocal pending_freeform_pkg
-                if pending_freeform_pkg is not None:
-                    ok, _ = activate_freeform(pending_freeform_pkg)
-                    log.info(f"FREEFORM (deferred): {pending_freeform_pkg} -> "
-                             f"{'OK' if ok else 'gagal/lewat (non-Android12 atau belum siap)'}")
-                    pending_freeform_pkg = None
-
-            for pkg in packages:
-                clean_package_cache(pkg)
-
-                set_state(stats, pkg, PackageState.LAUNCHING)
-                stats[pkg]['launch_count'] += 1
-                dashboard_size, _ = refresh_dashboard_live(
-                    live,
-                    draw_dashboard(stats, time.time(), len(packages), include_header=True),
-                    dashboard_size,
-                )
-
-                intent_url = intent_dict.get(pkg)
-                if not intent_url:
-                    set_state(stats, pkg, PackageState.NO_TARGET)
-                    dashboard_size, _ = refresh_dashboard_live(
-                        live,
-                        draw_dashboard(stats, time.time(), len(packages), include_header=True),
-                        dashboard_size,
-                    )
-                    log.error(f"LAUNCH SKIPPED: {pkg} tidak memiliki target join yang valid.")
-                    # Package ini dilewati (tidak jadi dilaunch) -- tetap flush
-                    # freeform package SEBELUMNYA sekarang juga, supaya tidak
-                    # nyangkut tertunda sampai package valid berikutnya.
-                    _flush_pending_freeform()
-                    continue
-
-                success = launch_and_wait(pkg, intent_url, timeout_seconds, defer_freeform=True)
-
-                if not success:
-                    try:
-                        from core.autologin import run as run_autologin
-                        stats[pkg]['status'] = 'LOGIN'
-                        dashboard_size, _ = refresh_dashboard_live(
-                            live,
-                            draw_dashboard(stats, time.time(), len(packages), include_header=True),
-                            dashboard_size,
-                        )
-
-                        login_status = run_autologin(pkg)
-
-                        if login_status in ["SUCCESS", "ALREADY_LOGGED_IN"]:
-                            stats[pkg]['status'] = 'LOADING'
-                            dashboard_size, _ = refresh_dashboard_live(
-                                live,
-                                draw_dashboard(stats, time.time(), len(packages), include_header=True),
-                                dashboard_size,
-                            )
-                            success = launch_and_wait(pkg, intent_url, timeout_seconds, defer_freeform=True)
-                        elif login_status == "CAPTCHA":
-                            stats[pkg]['status'] = 'CAPTCHA'
-                        else:
-                            stats[pkg]['status'] = 'LOGIN FAILED'
-                    except ImportError:
-                        pass
-
-                # Package SAAT INI sudah selesai dipanggil (berhasil/gagal) --
-                # BARU SEKARANG freeform-kan package SEBELUMNYA yang masih
-                # tertunda. Ini titik intinya: freeform package N-1 terjadi
-                # SETELAH package N dipanggil, bukan sebelum -- package N
-                # tidak pernah menunggu freeform N-1 lebih dulu.
-                _flush_pending_freeform()
-
-                if success:
-                    set_state(stats, pkg, PackageState.ONLINE)
-                    stats[pkg]['uptime_start'] = time.time()
-                    if is_android12():
-                        pending_freeform_pkg = pkg
-                else:
-                    if stats[pkg]['status'] not in ['LOGIN FAILED', 'CAPTCHA']:
-                        set_state(stats, pkg, PackageState.FAILED)
-
-                time.sleep(delay_seconds)
-                dashboard_size, _ = refresh_dashboard_live(
-                    live,
-                    draw_dashboard(stats, time.time(), len(packages), include_header=True),
-                    dashboard_size,
-                )
-
-            # Package TERAKHIR yang berhasil launch tidak punya "package
-            # berikutnya" buat memicu freeform-nya lewat _flush_pending_freeform
-            # di dalam loop -- flush manual sekali lagi di sini setelah loop selesai.
-            _flush_pending_freeform()
-    finally:
-        stop_dashboard_resize_watcher(resize_handler)
-
-
-    try:
-        sniper_agent.start()
-    except NameError:
-        pass
-        
-    start_monitoring(packages, intent_dict, timeout_seconds, max_retries, cooldown_secs, stats, config_data)
 
 _AGENT_STATUS_LABELS = {
     "OFFLINE": "[dim]OFFLINE[/]",
@@ -568,173 +194,39 @@ def show_device_agent_menu(config_data):
             break
 
 
-def show_scheduled_restart_menu(config_data):
-    """Scheduled Restart: restart package tiap interval JAM tetap, bukan
-    tiap kali crash. Kalau package mati sebelum jadwal berikutnya, dia
-    menunggu sampai jadwal tiba (lihat recovery_manager.py) -- supaya
-    restart tetap terkontrol/tidak mencurigakan untuk map yang berat.
-    """
-    while True:
-        reset_terminal()
-        draw_header("SCHEDULED RESTART")
-
-        enabled = int(config_data.get('SCHEDULED_RESTART_ENABLED', 0) or 0) == 1
-        hours = config_data.get('SCHEDULED_RESTART_HOURS', 5)
-
-        console.print("[dim]Restart tiap package otomatis per interval jam tetap. Package yang mati\nsebelum jadwalnya TIDAK langsung direstart -- nunggu sampai jadwal tiba.[/]\n")
-
-        table = Table(box=None, padding=(0, 0), show_header=False)
-        table.add_column("No", style="bold cyan", width=5, no_wrap=True)
-        table.add_column("Icon", style="white", width=3, no_wrap=True)
-        table.add_column("Config", style="white", width=25, no_wrap=True)
-        table.add_column("Value", style="dim white", justify="right", width=23, no_wrap=True)
-
-        table.add_row("[1]", "⏰", "Status", f"[{'bold green' if enabled else 'dim white'}]{'AKTIF' if enabled else 'NONAKTIF'}[/]")
-        table.add_row("[2]", "⏳", "Interval Restart", f"[cyan]{hours} jam[/]")
-        table.add_row("[3]", "↩", "Kembali", ">")
-
-        console.print(table)
-        draw_footer("ESC / 3  Back  |  [1] Toggle Aktif/Nonaktif")
-
-        choice = safe_prompt_ask("\n[dim]Pilih (1-3)[/]", choices=["1", "2", "3"])
-        if choice == "RESIZE_EVENT":
-            continue
-
-        if choice == '1':
-            config_data['SCHEDULED_RESTART_ENABLED'] = 0 if enabled else 1
-            save_config(config_data, "config.conf")
-            if enabled:
-                console.print("\n[bold yellow]Scheduled Restart DIMATIKAN.[/]")
-            else:
-                console.print(f"\n[bold green]Scheduled Restart DIAKTIFKAN. Package akan direstart tiap {hours} jam sekali.[/]")
-            time.sleep(1.2)
-        elif choice == '2':
-            new_hours = safe_console_input("\n[dim]Masukkan Interval Restart (jam, bilangan bulat):[/] ")
-            if new_hours != "RESIZE_EVENT" and new_hours.isdigit() and int(new_hours) > 0:
-                config_data['SCHEDULED_RESTART_HOURS'] = int(new_hours)
-                save_config(config_data, "config.conf")
-            elif new_hours not in ("RESIZE_EVENT", ""):
-                console.print("[bold red][!] Interval harus bilangan bulat lebih dari 0.[/]")
-                time.sleep(1)
-        elif choice == '3':
-            break
-
-
 def show_settings():
+    """Settings sekarang hanya berisi Device Agent (Joki Bot) -- satu-satunya
+    konfigurasi yang masih dipakai jalur Discord/Headless. Seluruh
+    konfigurasi standalone Auto Rejoin (Global Target, Link/Map per
+    Package, Timeout/Delay/Retry/Cooldown, Auto Clear Cache, Scheduled
+    Restart) sudah dihapus bersama engine-nya -- lihat
+    refactor: remove standalone auto rejoin engine.
+    """
     clear_screen()
     config_data = load_config("config.conf")
-    
+
     while True:
         reset_terminal()
         draw_header("SETTINGS")
-        
-        link = config_data.get('PRIVATE_SERVER_LINK', '')
-        display_link = link[:25] + "..." if len(link) > 25 else link
-        
+
         table = Table(box=None, padding=(0, 0), show_header=False)
         table.add_column("No", style="bold cyan", width=5, no_wrap=True)
         table.add_column("Icon", style="white", width=3, no_wrap=True)
         table.add_column("Config", style="white", width=25, no_wrap=True)
         table.add_column("Value", style="dim white", justify="right", width=23, no_wrap=True)
-        
-        global_place_id = config_data.get('GLOBAL_PLACE_ID', '')
-        lobby_only = int(config_data.get('LOBBY_ONLY_MODE', 0) or 0) == 1
-        if lobby_only:
-            target_mode = "LOBBY ONLY (Menu/Home)"
-        else:
-            target_mode = "PRIVATE SERVER" if link else ("MAP / PLACE ID" if global_place_id else "NOT SET")
-        table.add_row("[0]", "🎯", "Global Target", f"[cyan]{target_mode}[/]")
-        table.add_row("[1]", "🔗", "Global Server Link", f"[cyan]{display_link or '<Not Set>'}[/]")
-        table.add_row("[2]", "🗺", "Global Map / Place ID", f"[cyan]{global_place_id or '<Not Set>'}[/]")
-        table.add_row("[3]", "🏠", "Mode Lobby Only", f"[{'bold green' if lobby_only else 'dim white'}]{'AKTIF' if lobby_only else 'NONAKTIF'}[/]")
-        table.add_row("[4]", "⏱", "Timeout Wait", f"[cyan]{config_data.get('TIMEOUT_SECONDS', 45)}s[/]")
-        table.add_row("[5]", "⏳", "Delay Package", f"[cyan]{config_data.get('DELAY_SECONDS', 3)}s[/]")
-        table.add_row("[6]", "🔄", "Max Retries", f"[cyan]{config_data.get('MAX_RETRIES', 3)}x[/]")
-        table.add_row("[7]", "❄", "Cooldown", f"[cyan]{config_data.get('COOLDOWN_SECONDS', 300)}s[/]")
-        table.add_row("[8]", "🧹", "Auto Clear Cache", f"[cyan]{config_data.get('CLEAR_CACHE_MINUTES', 30)}m[/]")
-        sched_restart_on = int(config_data.get('SCHEDULED_RESTART_ENABLED', 0) or 0) == 1
-        sched_restart_label = f"AKTIF ({config_data.get('SCHEDULED_RESTART_HOURS', 5)}j)" if sched_restart_on else "NONAKTIF"
-        table.add_row("[9]", "⏰", "Scheduled Restart", f"[{'bold green' if sched_restart_on else 'dim white'}]{sched_restart_label}[/]")
-        table.add_row("[10]", "📦", "Atur Link per Package", ">")
-        table.add_row("[11]", "🗺", "Atur Map ID per Package", ">")
-        table.add_row("[12]", "🔌", "Device Agent (Joki Bot)", _device_agent_status(config_data))
-        table.add_row("[13]", "↩", "Kembali", ">")
-        
+
+        table.add_row("[1]", "🔌", "Device Agent (Joki Bot)", _device_agent_status(config_data))
+        table.add_row("[2]", "↩", "Kembali", ">")
+
         console.print(table)
-        draw_footer("ESC / 13  Back to Menu  |  [3] Toggle Lobby Only (abaikan PS/Map ID)")
-        
-        choice = safe_prompt_ask("\n[dim]Pilih (1-13)[/]", choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"])
+        draw_footer("ESC / 2  Back to Menu")
+
+        choice = safe_prompt_ask("\n[dim]Pilih (1-2)[/]", choices=["1", "2"])
         if choice == "RESIZE_EVENT": continue
-        
+
         if choice == '1':
-            new_link = safe_console_input("\n[dim]Masukkan Global Private Server Link (kosongkan untuk hapus):[/] ")
-            if new_link != "RESIZE_EVENT":
-                new_link = new_link.strip()
-                if new_link:
-                    # Global target bersifat mutually exclusive.
-                    config_data['PRIVATE_SERVER_LINK'] = new_link
-                    config_data['GLOBAL_PLACE_ID'] = ''
-                else:
-                    config_data['PRIVATE_SERVER_LINK'] = ''
-                save_config(config_data, "config.conf")
-        elif choice == '2':
-            new_place_id = safe_console_input("\n[dim]Masukkan Global Map / Place ID (kosongkan untuk hapus):[/] " )
-            if new_place_id != "RESIZE_EVENT":
-                new_place_id = new_place_id.strip()
-                if new_place_id and new_place_id.isdigit() and int(new_place_id) > 0:
-                    # Global target bersifat mutually exclusive.
-                    config_data['GLOBAL_PLACE_ID'] = new_place_id
-                    config_data['PRIVATE_SERVER_LINK'] = ''
-                    save_config(config_data, "config.conf")
-                elif not new_place_id:
-                    config_data['GLOBAL_PLACE_ID'] = ''
-                    save_config(config_data, "config.conf")
-                else:
-                    console.print("[bold red][!] Place ID harus berupa angka positif.[/]")
-                    time.sleep(1)
-        elif choice == '3':
-            currently_on = int(config_data.get('LOBBY_ONLY_MODE', 0) or 0) == 1
-            config_data['LOBBY_ONLY_MODE'] = 0 if currently_on else 1
-            save_config(config_data, "config.conf")
-            if currently_on:
-                console.print("\n[bold yellow]Mode Lobby Only DIMATIKAN. Target kembali ke Private Server / Map ID.[/]")
-            else:
-                console.print("\n[bold green]Mode Lobby Only DIAKTIFKAN. Semua package hanya login ke Menu/Home, tidak akan join Place ID / Private Server.[/]")
-            time.sleep(1.2)
-        elif choice == '4':
-            new_timeout = safe_console_input("\n[dim]Masukkan Timeout (detik):[/] ")
-            if new_timeout != "RESIZE_EVENT" and new_timeout.isdigit(): 
-                config_data['TIMEOUT_SECONDS'] = int(new_timeout)
-                save_config(config_data, "config.conf")
-        elif choice == '5':
-            new_delay = safe_console_input("\n[dim]Masukkan Delay (detik):[/] ")
-            if new_delay != "RESIZE_EVENT" and new_delay.isdigit(): 
-                config_data['DELAY_SECONDS'] = int(new_delay)
-                save_config(config_data, "config.conf")
-        elif choice == '6':
-            new_retries = safe_console_input("\n[dim]Masukkan Max Retries:[/] ")
-            if new_retries != "RESIZE_EVENT" and new_retries.isdigit(): 
-                config_data['MAX_RETRIES'] = int(new_retries)
-                save_config(config_data, "config.conf")
-        elif choice == '7':
-            new_cooldown = safe_console_input("\n[dim]Masukkan Cooldown (detik):[/] ")
-            if new_cooldown != "RESIZE_EVENT" and new_cooldown.isdigit(): 
-                config_data['COOLDOWN_SECONDS'] = int(new_cooldown)
-                save_config(config_data, "config.conf")
-        elif choice == '8':
-            new_cache = safe_console_input("\n[dim]Masukkan Interval Clear Cache (menit, 0 untuk nonaktif):[/] ")
-            if new_cache != "RESIZE_EVENT" and new_cache.isdigit(): 
-                config_data['CLEAR_CACHE_MINUTES'] = int(new_cache)
-                save_config(config_data, "config.conf")
-        elif choice == '9':
-            show_scheduled_restart_menu(config_data)
-        elif choice == '10':
-            show_link_manager(config_data)
-        elif choice == '11':
-            show_map_manager(config_data)
-        elif choice == '12':
             show_device_agent_menu(config_data)
-        elif choice == '13':
+        elif choice == '2':
             break
 
 def run_updater():
@@ -804,19 +296,18 @@ def show_main_menu():
         table.add_column("Menu", style="white", width=45, no_wrap=True)
         table.add_column("Chevron", style="dim white", justify="right", width=3, no_wrap=True)
         
-        table.add_row("[1]", "▶", "Auto Rejoiner", ">")
-        table.add_row("[2]", "⚙", "Settings", ">")
-        table.add_row("[3]", "🔑", "Auto Login Roblox", ">")
-        table.add_row("[4]", "🧪", "Test (Unit Testing)", ">")
-        table.add_row("[5]", "📝", "Logs (Lihat Log)", ">")
-        table.add_row("[6]", "ⓘ", "About", ">")
-        table.add_row("[7]", "🔄", "Update Program", ">")
-        table.add_row("[bold red][8][/]", "[red]⏻[/]", "[red]Exit[/]", "[red]>[/]")
+        table.add_row("[1]", "⚙", "Settings", ">")
+        table.add_row("[2]", "🔑", "Auto Login Roblox", ">")
+        table.add_row("[3]", "🧪", "Test (Unit Testing)", ">")
+        table.add_row("[4]", "📝", "Logs (Lihat Log)", ">")
+        table.add_row("[5]", "ⓘ", "About", ">")
+        table.add_row("[6]", "🔄", "Update Program", ">")
+        table.add_row("[bold red][7][/]", "[red]⏻[/]", "[red]Exit[/]", "[red]>[/]")
         
         console.print(table)
         draw_footer("CTRL+C  Dashboard    CTRL+Z  Exit")
         
-        choice = safe_prompt_ask("\n[dim]Pilih menu (1-8)[/]", choices=["1", "2", "3", "4", "5", "6", "7", "8"])
+        choice = safe_prompt_ask("\n[dim]Pilih menu (1-7)[/]", choices=["1", "2", "3", "4", "5", "6", "7"])
         
         # BUG FIX: Deteksi event resize, ulangi loop untuk render ulang layar
         if choice == "RESIZE_EVENT": 
@@ -828,18 +319,15 @@ def show_main_menu():
         clear_screen()
         
         if choice == '1':
-            show_transition("Starting Engine...")
-            run_auto_rejoiner()
-        elif choice == '2':
             show_transition("Loading Menu...")
             show_settings()
-        elif choice == '3':
+        elif choice == '2':
             show_transition("Loading Auto Login...")
             show_auto_login_menu()
-        elif choice == '4':
+        elif choice == '3':
             show_test_menu()
             show_transition("Loading Menu...")
-        elif choice == '5':
+        elif choice == '4':
             show_transition("Fetching Logs...")
             reset_terminal()
             draw_header("LOGS VIEWER")
@@ -854,7 +342,7 @@ def show_main_menu():
             
             draw_footer("Enter  Back to Menu")
             safe_console_input("\n[dim]Tekan Enter...[/]")
-        elif choice == '6':
+        elif choice == '5':
             show_transition("Opening About...")
             reset_terminal()
             draw_header("ABOUT")
@@ -863,7 +351,7 @@ def show_main_menu():
             table.add_column("Key", style="dim white", width=20)
             table.add_column("Value", style="bold white", width=35)
             
-            table.add_row("Aplikasi", "CARRERA-HUB Auto Rejoiner")
+            table.add_row("Aplikasi", "CARRERA-HUB")
             table.add_row("Versi", "[cyan]Python Modular Edition[/]")
             table.add_row("Status", "[green]Stabil & Termux Root Ready[/]")
             table.add_row("Developer", "[magenta]Carrera-Hub Team[/]")
@@ -871,10 +359,10 @@ def show_main_menu():
             console.print(table)
             draw_footer("Enter  Back to Menu")
             safe_console_input("\n[dim]Tekan Enter...[/]")
-        elif choice == '7':
+        elif choice == '6':
             show_transition("Checking Server...")
             run_updater()
-        elif choice == '8':
+        elif choice == '7':
             show_transition("Shutting Down...")
             try:
                 sniper_agent.stop()

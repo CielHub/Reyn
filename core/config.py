@@ -28,28 +28,10 @@ def load_config(config_path="config.conf"):
     # -----------------------------------
 
     # --- PARSING KONFIGURASI (BUG FIX SPASI GAIB) ---
+    # Standalone Auto Rejoin dihapus -- satu-satunya konfigurasi yang
+    # tersisa adalah kredensial agent Joki Control Bot (jalur Discord/
+    # Headless). Lihat refactor: remove standalone auto rejoin engine.
     config = {
-        "PRIVATE_SERVER_LINK": "",
-        "GLOBAL_PLACE_ID": "",
-        "TIMEOUT_SECONDS": 45,
-        "RECOVERY_DELAY_SECONDS": 30,
-        "DELAY_SECONDS": 3,
-        "MAX_RETRIES": 3,
-        "COOLDOWN_SECONDS": 300,
-        "GRID_ENABLED": 0,        
-        "GRID_COLS": 0,           
-        "GRID_CELL_W": 0,         
-        "GRID_CELL_H": 0,         
-        "GRID_MARGIN": 10,
-        "GRID_OFFSET_Y": 60,
-        "CLEAR_CACHE_MINUTES": 30,
-        "LOBBY_ONLY_MODE": 0,
-        # --- Scheduled Restart: restart package tiap interval JAM tetap,
-        # bukan tiap kali crash. Kalau package mati sebelum jadwal
-        # berikutnya tiba, dia WAJIB menunggu (lihat recovery_manager.py),
-        # supaya restart tetap terkontrol/tidak mencurigakan buat map berat.
-        "SCHEDULED_RESTART_ENABLED": 0,
-        "SCHEDULED_RESTART_HOURS": 5,
         # --- PHASE 1: kredensial agent Joki Control Bot (opsional) ---
         # BOT_WS_URL sudah di-hardcode ke alamat NuraHost yang sudah dites
         # berhasil -- user cuma perlu isi DEVICE_ID/DEVICE_TOKEN lewat menu.
@@ -73,44 +55,14 @@ def load_config(config_path="config.conf"):
                 key = key.strip()
                 val = val.strip().strip('"\'')
                 
-                if key in ["PRIVATE_SERVER_LINK", "GLOBAL_PLACE_ID",
-                           "DEVICE_ID", "DEVICE_TOKEN", "BOT_WS_URL"]:
-                    config[key] = val
-                elif key in ["TIMEOUT_SECONDS", "RECOVERY_DELAY_SECONDS", "DELAY_SECONDS", "MAX_RETRIES", "COOLDOWN_SECONDS", 
-                             "GRID_ENABLED", "GRID_COLS", "GRID_CELL_W", "GRID_CELL_H", 
-                             "GRID_MARGIN", "GRID_OFFSET_Y", "CLEAR_CACHE_MINUTES", "LOBBY_ONLY_MODE",
-                             "SCHEDULED_RESTART_ENABLED", "SCHEDULED_RESTART_HOURS"]:
-                    try: 
-                        config[key] = int(val)
-                    except ValueError: 
-                        pass
-                elif key.startswith("PKG_"):
-                    # Sekarang "PKG_com.roblox.client " akan otomatis jadi "PKG_com.roblox.client"
+                if key in ["DEVICE_ID", "DEVICE_TOKEN", "BOT_WS_URL"]:
                     config[key] = val
                     
-    _normalize_targets(config)
-
     log.info("CONFIG: Konfigurasi berhasil dimuat dengan aman.")
     return config
 
-def _normalize_targets(config_data):
-    """Menjamin hanya satu target aktif pada setiap scope."""
-    # Global: Private Server menang jika keduanya terisi (kompatibilitas config lama).
-    if str(config_data.get("PRIVATE_SERVER_LINK", "")).strip():
-        config_data["GLOBAL_PLACE_ID"] = ""
-
-    # Package: Private Server menang jika keduanya terisi.
-    for key in list(config_data.keys()):
-        if key.startswith("PKG_") and key.endswith("_PLACE_ID"):
-            pkg = key[len("PKG_"):-len("_PLACE_ID")]
-            if str(config_data.get(f"PKG_{pkg}", "")).strip():
-                config_data[key] = ""
-
-    return config_data
-
 
 def save_config(config_data, config_path="config.conf"):
-    _normalize_targets(config_data)
     with open(config_path, 'w') as f:
         for key, value in config_data.items():
             if isinstance(value, str):
@@ -118,4 +70,3 @@ def save_config(config_data, config_path="config.conf"):
             else:
                 f.write(f'{key}={value}\n')
     log.info("CONFIG: Konfigurasi berhasil disimpan.")
-    

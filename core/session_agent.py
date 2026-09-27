@@ -106,11 +106,47 @@ LOBBY_TIMEOUT_SECONDS = 30
 RECOVERY_LOBBY_WAIT_MIN_SECONDS = 60
 RECOVERY_LOBBY_WAIT_MAX_SECONDS = 90
 
-# Jeda sebelum retry attempt recovery BERIKUTNYA kalau satu tahap (kill/
-# launch lobby/join ulang) gagal -- recovery retry TANPA BATAS (sampai
-# berhasil atau session-nya distop/diganti), tapi tidak boleh langsung
-# nyoba lagi detik itu juga supaya tidak "terburu-buru"/spam.
-RECOVERY_RETRY_DELAY_SECONDS = 20
+# Jeda kecil SEBELUM kill (dijalankan tiap mulai 1 percobaan recovery) --
+# supaya transisi "disconnect -> kill" gak instan kayak mesin (manusia yang
+# beneran ke-disconnect biasanya ada jeda "ngecek dulu" sebelum benerin).
+RECOVERY_PRE_KILL_JITTER_MIN_SECONDS = 2
+RECOVERY_PRE_KILL_JITTER_MAX_SECONDS = 6
+
+# Backoff antar percobaan kalau satu tahap (kill/launch lobby/join ulang)
+# gagal -- TETAP retry TANPA BATAS (tidak pernah menyerah, sesuai
+# permintaan), tapi delay-nya membesar eksponensial + diacak (jitter)
+# supaya tidak jadi pola "coba lagi tiap 20 detik persis" yang keliatan
+# seperti brute-force dari sisi anti-fraud Roblox. attempt ke-1 gagal ->
+# sekitar RECOVERY_RETRY_BASE_DELAY_SECONDS, attempt berikutnya makin
+# lama, dibatasi RECOVERY_RETRY_MAX_DELAY_SECONDS supaya tidak tak
+# terhingga.
+RECOVERY_RETRY_BASE_DELAY_SECONDS = 20
+RECOVERY_RETRY_MAX_DELAY_SECONDS = 300
+
+# "Circuit breaker": begitu SATU siklus recovery (untuk 1 kejadian
+# disconnect/crash yang sama) sudah gagal berturut-turut sebanyak ini,
+# berhenti mempercepat -- masuk mode cooldown panjang (acak 5-10 menit)
+# tiap putaran, BUKAN berhenti retry sama sekali. Ini yang mencegah
+# pola "brute-force login" kalau penyebabnya ternyata bukan sesuatu yang
+# sementara (mis. device lagi di-rate-limit atau akunnya sendiri sudah
+# kena flag).
+RECOVERY_CIRCUIT_BREAKER_THRESHOLD = 5
+RECOVERY_CIRCUIT_BREAKER_COOLDOWN_MIN_SECONDS = 300
+RECOVERY_CIRCUIT_BREAKER_COOLDOWN_MAX_SECONDS = 600
+
+
+def _recovery_backoff_delay(attempt: int) -> float:
+    """Hitung jeda sebelum percobaan recovery berikutnya. attempt = nomor
+    percobaan yang BARU SAJA gagal (1-based). Selama masih di bawah
+    RECOVERY_CIRCUIT_BREAKER_THRESHOLD, delay naik eksponensial + jitter
+    acak (bukan angka tetap). Setelah lewat threshold, masuk mode cooldown
+    panjang acak (circuit breaker) -- tetap retry, cuma jauh lebih jarang."""
+    if attempt >= RECOVERY_CIRCUIT_BREAKER_THRESHOLD:
+        return random.uniform(
+            RECOVERY_CIRCUIT_BREAKER_COOLDOWN_MIN_SECONDS, RECOVERY_CIRCUIT_BREAKER_COOLDOWN_MAX_SECONDS,
+        )
+    base = min(RECOVERY_RETRY_MAX_DELAY_SECONDS, RECOVERY_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)))
+    return random.uniform(base * 0.7, base * 1.3)
 
 # Seberapa sering consumer men-drain queue event dari error_detector.py.
 DISCONNECT_POLL_INTERVAL_SECONDS = 1
@@ -1007,9 +1043,17 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
     disconnect logcat -- keduanya berakhir di sini supaya perilakunya PERSIS
     SAMA, tidak ada dua alur recovery yang bisa divergen.
 
-    Retry TANPA BATAS (permintaan eksplisit) dengan jeda
-    RECOVERY_RETRY_DELAY_SECONDS di antar percobaan kalau satu tahap gagal
-    -- berhenti hanya kalau berhasil ATAU session ini sudah diganti/distop
+    Retry TANPA BATAS (permintaan eksplisit, TIDAK dihapus) -- tapi supaya
+    polanya tidak "terburu-buru"/mekanis (yang bisa keliatan seperti
+    brute-force dari sisi anti-fraud Roblox kalau errornya keseringan),
+    dua lapis pengaman DITAMBAHKAN, fungsinya tetap sama:
+      1. Jeda kecil acak sebelum kill (RECOVERY_PRE_KILL_JITTER_*).
+      2. Delay antar percobaan BUKAN angka tetap lagi, tapi backoff
+         eksponensial + jitter (_recovery_backoff_delay) yang membesar
+         tiap gagal, dan begitu lewat RECOVERY_CIRCUIT_BREAKER_THRESHOLD
+         kali gagal berturut-turut, masuk mode cooldown acak 5-10 menit
+         per putaran -- TETAP mengulang selamanya, cuma jauh lebih jarang.
+    Berhenti hanya kalau berhasil ATAU session ini sudah diganti/distop
     (_still_current() jadi False, mis. staff pencet Finish/Assign ulang
     selagi recovery masih berjalan).
 
@@ -1035,6 +1079,14 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
             info["status"] = "RECOVERING"
             log.warning(f"SESSION_AGENT: [RECOVERY] {pkg} (akun {expected_username}, "
                         f"session {session_id}) percobaan #{attempt} -- alasan: {trigger_reason}.")
+
+            # --- Jeda kecil acak sebelum kill (biar transisinya gak instan) ---
+            await asyncio.sleep(random.uniform(
+                RECOVERY_PRE_KILL_JITTER_MIN_SECONDS, RECOVERY_PRE_KILL_JITTER_MAX_SECONDS,
+            ))
+
+            if not _still_current():
+                return
 
             # --- Kill dulu KALAU proses masih hidup. Disconnect logcat bisa
             # terjadi selagi proses Roblox-nya SENDIRI masih berjalan (cuma
@@ -1064,9 +1116,10 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
                 return
 
             if not lobby_ok:
+                delay = _recovery_backoff_delay(attempt)
                 log.warning(f"SESSION_AGENT: [RECOVERY] {pkg} gagal buka lobby, retry dalam "
-                            f"{RECOVERY_RETRY_DELAY_SECONDS}s...")
-                await asyncio.sleep(RECOVERY_RETRY_DELAY_SECONDS)
+                            f"{delay:.0f}s (percobaan #{attempt})...")
+                await asyncio.sleep(delay)
                 continue
 
             info["pid"] = get_pid_quick(pkg) or "-"
@@ -1086,9 +1139,10 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
             try:
                 intent_url = get_intent_url(target)
             except ValueError as e:
+                delay = _recovery_backoff_delay(attempt)
                 log.error(f"SESSION_AGENT: [RECOVERY] {pkg} target tidak valid lagi ({e}), retry "
-                          f"dalam {RECOVERY_RETRY_DELAY_SECONDS}s...")
-                await asyncio.sleep(RECOVERY_RETRY_DELAY_SECONDS)
+                          f"dalam {delay:.0f}s (percobaan #{attempt})...")
+                await asyncio.sleep(delay)
                 continue
 
             joined = await _attempt_join_target(pkg, session_id, intent_url, DEFAULT_TIMEOUT_SECONDS)
@@ -1107,9 +1161,10 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
                          f"kembali farming (percobaan #{attempt}).")
                 return
 
+            delay = _recovery_backoff_delay(attempt)
             log.warning(f"SESSION_AGENT: [RECOVERY] {pkg} gagal join ulang, retry dalam "
-                        f"{RECOVERY_RETRY_DELAY_SECONDS}s...")
-            await asyncio.sleep(RECOVERY_RETRY_DELAY_SECONDS)
+                        f"{delay:.0f}s (percobaan #{attempt})...")
+            await asyncio.sleep(delay)
     finally:
         _recovery_in_progress.discard(pkg)
 

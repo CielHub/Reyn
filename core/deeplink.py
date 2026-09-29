@@ -1,81 +1,112 @@
 """
 Modul: deeplink.py
-Tanggung Jawab: Mengonversi target Roblox (Private Server / Place ID) menjadi Android Intent Deep Link.
+Tanggung Jawab: Mengonversi target Roblox (Private Server / Place ID)
+menjadi Android Intent Deep Link.
 """
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 import re
+
 from core.logger import log
+
+_ROBLOX_HOST = "roblox.com"
+
+
+def _is_roblox_host(hostname: str | None) -> bool:
+    host = (hostname or "").strip().lower().rstrip(".")
+    return host == _ROBLOX_HOST or host.endswith("." + _ROBLOX_HOST)
+
+
+def _parse_https_roblox_url(value: str):
+    try:
+        parsed = urlparse(value)
+    except ValueError as exc:
+        raise ValueError("URL Roblox tidak valid.") from exc
+
+    if parsed.scheme.lower() != "https" or not _is_roblox_host(parsed.hostname):
+        raise ValueError("URL harus merupakan HTTPS URL Roblox yang valid.")
+
+    return parsed
 
 
 def get_place_intent(place_id):
-    """Membuat deep link Roblox untuk langsung membuka sebuah Place ID.
-
-    FIX: sebelumnya pakai skema custom `roblox://placeId=<id>` ("Direct to
-    app") -- format ini SUDAH DEPRECATED RESMI oleh Roblox (dikonfirmasi di
-    create.roblox.com/docs/production/promotion/deeplinks: "This process is
-    deprecated. To create public deep links, use share links.") dan makin
-    gak reliable di app Roblox versi baru buat sebagian game -- gejalanya
-    Roblox kebuka tapi gak pernah masuk ke map (place ID 113290951185459 /
-    Anime Dice, dilaporkan staff).
-
-    Sekarang pakai format `https://www.roblox.com/games/start?placeId=<id>`
-    ("Web list to app" di dokumentasi yang sama, BUKAN yang deprecated).
-    Ini link https biasa yang di-`am start` LANGSUNG ke package Roblox
-    (`-p <pkg>`), jadi Android mencocokkan ke intent-filter App Link Roblox
-    utk domain roblox.com (yang sama persis dipakai kalau user tap link
-    Roblox dari Discord/WhatsApp lalu langsung kebuka di app) -- bukan lewat
-    browser sama sekali. Keuntungan lain: bisa dibangun otomatis dari angka
-    Place ID doang (staff TIDAK perlu cari Share Link manual lagi).
-    """
+    """Membuat deep link Roblox untuk langsung membuka sebuah Place ID."""
     value = str(place_id).strip()
     if not re.fullmatch(r"\d+", value) or int(value) <= 0:
         raise ValueError("Place ID harus berupa angka positif.")
 
-    log.info(f"DEEPLINK: Place ID {value} dikonversi ke Intent (format https, bukan skema deprecated).")
-    return f"https://www.roblox.com/games/start?placeId={value}"
+    log.info(f"DEEPLINK: Place ID {value} dikonversi ke Intent HTTPS.")
+    query = urlencode({"placeId": value})
+    return f"https://www.roblox.com/games/start?{query}"
 
 
 def get_lobby_intent():
-    """Membuat deep link Roblox tanpa Place ID / Private Server (hanya buka ke Menu/Lobby/Home).
-
-    Skema `roblox://` polos (tanpa parameter apa pun) ini BUKAN bagian dari
-    "Direct to app" deep link yang dideprecated Roblox (yang dideprecated
-    spesifik `roblox://placeId=...`) -- ini cuma trigger buka app-nya saja
-    ke halaman Home, jadi tetap dipertahankan apa adanya.
-    """
+    """Membuat intent untuk membuka Roblox ke Home/Lobby."""
     log.info("DEEPLINK: Mode Lobby Only aktif, membuka Roblox ke Menu/Home tanpa join map.")
     return "roblox://"
 
 
-def get_intent_url(private_server_link):
-    """Mengekstrak dan mengonversi URL/Place ID menjadi format yang bisa dieksekusi 'am start'."""
-    value = str(private_server_link or "").strip()
+def _normalize_share_link(value: str) -> str:
+    parsed = _parse_https_roblox_url(value)
+    path = parsed.path.rstrip("/").lower()
+    if not path.startswith("/share"):
+        raise ValueError("Share Link Roblox tidak valid.")
 
+    params = parse_qs(parsed.query, keep_blank_values=False)
+    code = params.get("code", [""])[0].strip()
+    link_type = params.get("type", [""])[0].strip()
+    if not code or not link_type:
+        raise ValueError("Share Link Roblox harus memiliki code dan type.")
+
+    clean_query = urlencode({"code": code, "type": link_type})
+    clean = parsed._replace(query=clean_query, fragment="")
+    return urlunparse(clean)
+
+
+def _parse_legacy_private_server(value: str) -> tuple[str, str]:
+    parsed = _parse_https_roblox_url(value)
+    place_match = re.search(r"/games/(\d+)(?:/|$)", parsed.path, re.IGNORECASE)
+    if not place_match:
+        raise ValueError("URL Private Server tidak memiliki Place ID yang valid.")
+
+    params = parse_qs(parsed.query, keep_blank_values=False)
+    link_code = ""
+    for key in ("privateServerLinkCode", "linkCode"):
+        values = params.get(key)
+        if values and values[0].strip():
+            link_code = values[0].strip()
+            break
+
+    if not link_code:
+        raise ValueError("URL Private Server tidak memiliki privateServerLinkCode yang valid.")
+
+    return place_match.group(1), link_code
+
+
+def get_intent_url(private_server_link):
+    """Validasi target Roblox dan mengubahnya menjadi URL intent yang aman."""
+    value = str(private_server_link or "").strip()
     if not value:
         raise ValueError("Target Roblox kosong.")
 
-    # Place ID langsung, misalnya: 123456789
+    # Place ID langsung.
     if re.fullmatch(r"\d+", value):
         return get_place_intent(value)
 
-    # Share Link baru
-    if "/share" in value:
-        log.info("DEEPLINK: Terdeteksi format Share Link baru.")
-        return value
+    # Share Link baru. Validasi hostname + parameter, bukan sekadar substring '/share'.
+    try:
+        parsed = urlparse(value)
+    except ValueError as exc:
+        raise ValueError("Target Roblox tidak valid.") from exc
 
-    # Format lama Private Server
-    place_id_match = re.search(r'games/(\d+)', value)
-    link_code_match = re.search(r'privateServerLinkCode=([^&]+)', value)
+    if parsed.scheme.lower() == "https" and _is_roblox_host(parsed.hostname):
+        if parsed.path.rstrip("/").lower().startswith("/share"):
+            log.info("DEEPLINK: Terdeteksi format Share Link Roblox yang valid.")
+            return _normalize_share_link(value)
 
-    if not place_id_match or not link_code_match:
-        raise ValueError("Link Private Server / URL Roblox tidak valid.")
+        # Format lama Private Server.
+        place_id, link_code = _parse_legacy_private_server(value)
+        query = urlencode({"placeId": place_id, "linkCode": link_code})
+        log.info("DEEPLINK: URL Private Server lama dikonversi ke Intent HTTPS.")
+        return f"https://www.roblox.com/games/start?{query}"
 
-    place_id = place_id_match.group(1)
-    link_code = link_code_match.group(1)
-
-    # FIX: sama seperti get_place_intent() -- pakai https (bukan skema
-    # roblox:// yang dideprecated) supaya konsisten reliable, memanfaatkan
-    # parameter `linkCode` yang didukung format https ini juga (lihat
-    # tabel parameter deep link resmi Roblox).
-    log.info("DEEPLINK: URL Berhasil dikonversi ke Intent (Format Lama, https).")
-    return f"https://www.roblox.com/games/start?placeId={place_id}&linkCode={link_code}"
-
+    raise ValueError("Link Private Server / URL Roblox tidak valid.")

@@ -15,16 +15,61 @@ from core.join_verifier import verify_join
 # (dan core/error_detector.py) -- dipakai di sini HANYA untuk fast-fail dini
 # (berhenti nunggu lebih cepat kalau sudah ada bukti kick asli), bukan sebagai
 # signal sukses.
-_FLOG_NETWORK_PATTERN = re.compile(r"\[flog::network\]")
-_DISCONNECT_REASON_PATTERN = re.compile(r"reason\s*:\s*(266|267|277|279|280)")
+_FLOG_NETWORK_PATTERN = re.compile(r"\[flog::network\]", re.IGNORECASE)
+_DISCONNECT_REASON_PATTERN = re.compile(r"reason\s*:\s*(266|267|277|279|280)", re.IGNORECASE)
+
+# Android `logcat -v threadtime` format:
+# MM-DD HH:MM:SS.mmm PID TID LEVEL TAG: message
+_LOGCAT_THREADTIME_PID_RE = re.compile(
+    r"^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+(\d+)\s+\d+\s+[VDIWEFAS]\s+",
+    re.IGNORECASE,
+)
+
+
+def get_pids_quick(pkg_name):
+    """Return every current PID belonging to one Android package."""
+    try:
+        result = subprocess.run(
+            ['pidof', pkg_name],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            errors='replace',
+        )
+        return {pid for pid in (result.stdout or '').strip().split() if pid.isdigit()}
+    except Exception:
+        return set()
+
 
 def get_pid_quick(pkg_name):
-    try:
-        result = subprocess.run(['pidof', pkg_name], capture_output=True, text=True)
-        pids = result.stdout.strip().split()
-        return pids[0] if pids else ""
-    except Exception:
-        return ""
+    """Return one current PID for compatibility with existing callers."""
+    pids = get_pids_quick(pkg_name)
+    return next(iter(pids), "")
+
+
+def _extract_logcat_pid(line):
+    """Extract the PID from a `logcat -v threadtime` line."""
+    match = _LOGCAT_THREADTIME_PID_RE.match(line or "")
+    return match.group(1) if match else ""
+
+
+def _logcat_line_belongs_to_package(line, pkg_name, tracked_pids):
+    """Reject logcat events from other Roblox clones.
+
+    A matching PID is the primary correlation key. Package text is accepted as
+    a secondary fallback for vendor logcat formats that omit/alter threadtime
+    fields or emit package names in the message itself.
+    """
+    line_pid = _extract_logcat_pid(line)
+    if line_pid:
+        return line_pid in tracked_pids
+    return pkg_name.lower() in (line or "").lower()
+
+
+def _refresh_tracked_pids(pkg_name, tracked_pids):
+    """Add newly-created package PIDs without losing the original ones."""
+    tracked_pids.update(get_pids_quick(pkg_name))
+    return tracked_pids
 
 
 # =============================================================================
@@ -646,7 +691,7 @@ def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_jo
     """
     log.info(f"Smart Wait: Menunggu {pkg_name} terhubung ({timeout_seconds} detik)...")
 
-    logcat_cmd = ['logcat', '-T', start_time_str, '-v', 'time']
+    logcat_cmd = ['logcat', '-T', start_time_str, '-v', 'threadtime']
 
     process = subprocess.Popen(
         logcat_cmd,
@@ -665,6 +710,7 @@ def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_jo
     start_time = time.time()
     PID_CHECK_INTERVAL_SECONDS = 3
     last_pid_check = start_time
+    tracked_pids = get_pids_quick(pkg_name)
 
     try:
         while True:
@@ -680,6 +726,10 @@ def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_jo
                 if not line:
                     break
 
+                _refresh_tracked_pids(pkg_name, tracked_pids)
+                if not _logcat_line_belongs_to_package(line, pkg_name, tracked_pids):
+                    continue
+
                 line_lower = line.lower()
                 if any(kw in line_lower for kw in keywords):
                     found_success = True
@@ -693,7 +743,8 @@ def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_jo
                         break
             elif time.time() - last_pid_check >= PID_CHECK_INTERVAL_SECONDS:
                 last_pid_check = time.time()
-                if not get_pid_quick(pkg_name):
+                _refresh_tracked_pids(pkg_name, tracked_pids)
+                if not tracked_pids:
                     log.warning(f"[FAST-FAIL] {pkg_name}: PID hilang sebelum timeout habis "
                                 f"(elapsed={elapsed:.1f}s) -- berhenti nunggu lebih awal.")
                     break
@@ -710,7 +761,7 @@ def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_jo
         return ("FAILED", "PROCESS_NOT_RUNNING") if require_join_signal else False
 
     if not require_join_signal:
-        verified, reason = verify_join(pkg_name)
+        verified, reason = verify_join(pkg_name, expected_pid=final_pid)
         if not verified:
             log.error(f"VERIFY FAILED: {pkg_name} -> {reason}")
             return False
@@ -724,7 +775,7 @@ def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_jo
         return ("FAILED", f"JOIN_ERROR_SIGNAL_{failure_code}")
 
     if found_success:
-        verified, reason = verify_join(pkg_name)
+        verified, reason = verify_join(pkg_name, expected_pid=final_pid)
         if not verified:
             log.error(f"VERIFY FAILED: {pkg_name} -> {reason} (padahal keyword join ditemukan).")
             return ("FAILED", f"VERIFY_FAILED_AFTER_KEYWORD:{reason}")
@@ -893,7 +944,7 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
 
     log.info(f"Smart Wait: Menunggu {pkg_name} terhubung ({timeout_seconds} detik)...")
     
-    logcat_cmd = ['logcat', '-T', start_time_str, '-v', 'time']
+    logcat_cmd = ['logcat', '-T', start_time_str, '-v', 'threadtime']
     
     # --- BUG FIX IMPLEMENTATION ---
     process = subprocess.Popen(
@@ -921,6 +972,7 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     # diputuskan sama sekali, cuma mempercepat jalur proses mati.
     PID_CHECK_INTERVAL_SECONDS = 3
     last_pid_check = start_time
+    tracked_pids = get_pids_quick(pkg_name)
 
     try:
         while True:
@@ -936,6 +988,10 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
                 if not line:
                     break 
                 
+                _refresh_tracked_pids(pkg_name, tracked_pids)
+                if not _logcat_line_belongs_to_package(line, pkg_name, tracked_pids):
+                    continue
+
                 line_lower = line.lower()
                 if any(kw in line_lower for kw in keywords):
                     found_success = True
@@ -953,7 +1009,8 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
                         break
             elif time.time() - last_pid_check >= PID_CHECK_INTERVAL_SECONDS:
                 last_pid_check = time.time()
-                if not get_pid_quick(pkg_name):
+                _refresh_tracked_pids(pkg_name, tracked_pids)
+                if not tracked_pids:
                     log.warning(f"[FAST-FAIL] {pkg_name}: PID hilang sebelum timeout habis "
                                 f"(elapsed={elapsed:.1f}s) -- berhenti nunggu lebih awal.")
                     break
@@ -978,7 +1035,7 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
 
     if not require_join_signal:
         # PERILAKU LAMA TIDAK BERUBAH: proses hidup + verify_join() saja.
-        verified, reason = verify_join(pkg_name)
+        verified, reason = verify_join(pkg_name, expected_pid=final_pid)
         if not verified:
             log.error(f"VERIFY FAILED: {pkg_name} -> {reason}")
             return False
@@ -994,7 +1051,7 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
         return ("FAILED", f"JOIN_ERROR_SIGNAL_{failure_code}")
 
     if found_success:
-        verified, reason = verify_join(pkg_name)
+        verified, reason = verify_join(pkg_name, expected_pid=final_pid)
         if not verified:
             log.error(f"VERIFY FAILED: {pkg_name} -> {reason} (padahal keyword join ditemukan).")
             return ("FAILED", f"VERIFY_FAILED_AFTER_KEYWORD:{reason}")

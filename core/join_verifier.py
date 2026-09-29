@@ -21,22 +21,41 @@ _FLOG_NETWORK_PATTERN = re.compile(r"\[FLog::Network\]", re.IGNORECASE)
 _DISCONNECT_REASON_PATTERN = re.compile(r"reason\s*:\s*(266|267|277|279|280)", re.IGNORECASE)
 
 
-def has_recent_disconnect_signal(pkg_name, since_time_str, timeout_seconds=3):
-    """One-shot check (buffer dump, BUKAN live tail) apakah ada bukti
-    disconnect/kick asli dari Roblox di logcat sejak `since_time_str`
-    (format sama seperti dipakai launcher.py: '%m-%d %H:%M:%S.000').
-
-    Dipakai sebagai signal NEGATIF tambahan saat join tidak bisa dipastikan
-    lewat keyword sukses (lihat launcher.py) -- kalau ada bukti kick/error
-    asli, JANGAN anggap sukses walau proses masih hidup. Kalau tidak ada
-    bukti kick sama sekali, fungsi ini TIDAK membuktikan sukses -- itu bukan
-    tanggung jawabnya (lihat verify_join() untuk itu).
-
-    Return (found: bool, code: str|None).
-    """
+def _get_package_pids(pkg_name):
+    """Return all current PIDs for the requested package."""
     try:
         result = subprocess.run(
-            ['logcat', '-d', '-T', since_time_str, '-v', 'time'],
+            ['pidof', pkg_name],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            errors='replace',
+        )
+    except Exception:
+        return set()
+    return {pid for pid in (result.stdout or '').strip().split() if pid.isdigit()}
+
+
+def _extract_logcat_pid(line):
+    """Extract PID from Android logcat -v threadtime output."""
+    match = re.match(r'^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+(\d+)\s+\d+\s+[VDIWEFAS]\s+', line)
+    return match.group(1) if match else ""
+
+
+def has_recent_disconnect_signal(pkg_name, since_time_str, timeout_seconds=3, pid=None):
+    """Check disconnect/kick signals for the requested package/PID only.
+
+    The previous implementation searched the whole logcat buffer, which could
+    let Error 266/267/277/279/280 from another Roblox clone affect this package.
+    When no PID is supplied, current PIDs are resolved from pkg_name.
+    """
+    tracked_pids = {str(pid)} if pid is not None and str(pid).strip() else _get_package_pids(pkg_name)
+    if not tracked_pids:
+        return False, None
+
+    try:
+        result = subprocess.run(
+            ['logcat', '-d', '-T', since_time_str, '-v', 'threadtime'],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -46,6 +65,9 @@ def has_recent_disconnect_signal(pkg_name, since_time_str, timeout_seconds=3):
         return False, None
 
     for line in (result.stdout or '').splitlines():
+        line_pid = _extract_logcat_pid(line)
+        if line_pid not in tracked_pids:
+            continue
         if not _FLOG_NETWORK_PATTERN.search(line):
             continue
         match = _DISCONNECT_REASON_PATTERN.search(line)
@@ -76,7 +98,7 @@ def _foreground_package():
     return ''
 
 
-def verify_join(pkg_name, minimum_wait=0.5):
+def verify_join(pkg_name, minimum_wait=0.5, expected_pid=None):
     """Verify that the Roblox package survived the launch.
 
     Foreground activity is informative rather than mandatory because Delta Lite
@@ -92,13 +114,24 @@ def verify_join(pkg_name, minimum_wait=0.5):
             capture_output=True,
             text=True,
             timeout=2,
+            errors='replace',
         )
-        pid = result.stdout.strip()
+        pids = [pid for pid in (result.stdout or '').strip().split() if pid.isdigit()]
     except Exception:
-        pid = ''
+        pids = []
 
-    if not pid:
+    if not pids:
         return False, 'PROCESS_NOT_RUNNING'
+
+    if expected_pid is not None:
+        expected_pid = str(expected_pid).strip()
+        if not expected_pid.isdigit():
+            return False, 'INVALID_EXPECTED_PID'
+        if expected_pid not in pids:
+            return False, 'EXPECTED_PID_NOT_RUNNING'
+        pid = expected_pid
+    else:
+        pid = pids[0]
 
     focus = _foreground_package()
     if not focus:

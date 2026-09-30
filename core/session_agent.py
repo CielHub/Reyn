@@ -110,6 +110,14 @@ RECOVERY_LOGIN_WAIT_TIMEOUT_SECONDS = 120
 DISCONNECT_POLL_INTERVAL_SECONDS = 1
 FREEFORM_ACTIVATION_DELAY_SECONDS = 2.5
 
+# Jeda masuk map per package. Setelah lobby selesai, setiap package mendapat
+# delay acak sendiri sebelum join target agar beberapa package tidak burst
+# masuk map pada waktu yang sama. Nilai diacak ulang setiap kali join target.
+LOBBY_WAIT_MIN_SECONDS = 60
+LOBBY_WAIT_MAX_SECONDS = 90
+MAP_ENTRY_DELAY_MIN_SECONDS = 10
+MAP_ENTRY_DELAY_MAX_SECONDS = 30
+
 def _recovery_backoff_delay(attempt: int) -> float:
     if attempt >= RECOVERY_CIRCUIT_BREAKER_THRESHOLD:
         return random.uniform(
@@ -318,6 +326,7 @@ async def handle_start_session(msg: dict, local_device_id: str) -> dict:
         "_device_id": local_device_id,
         "target": target,
         "expected_username": expected_username,
+        "session_kind": str(msg.get("session_kind", "") or "").strip().upper(),
         "status": "STARTING",
         "runtime_status": "PREPARING",
         "pid": "-",
@@ -356,6 +365,43 @@ async def handle_start_session(msg: dict, local_device_id: str) -> dict:
         "ok": True, "reason": "PROCESSING",
     }
 
+async def _wait_in_lobby(pkg: str, session_id: str, *, recovery: bool = False) -> bool:
+    """Tunggu 60-90 detik di lobby sebelum package boleh lanjut ke target."""
+    current = SESSIONS.get(pkg)
+    if not current or str(current.get("session_id")) != str(session_id):
+        return False
+
+    delay = random.uniform(LOBBY_WAIT_MIN_SECONDS, LOBBY_WAIT_MAX_SECONDS)
+    current["last_lobby_wait_seconds"] = delay
+    prefix = "[RECOVERY] " if recovery else ""
+    log.info(
+        f"SESSION_AGENT: {prefix}{pkg}/{session_id} menunggu di lobby "
+        f"{delay:.1f}s sebelum lanjut ke tahap berikutnya."
+    )
+    await asyncio.sleep(delay)
+
+    current = SESSIONS.get(pkg)
+    return bool(current and str(current.get("session_id")) == str(session_id))
+
+
+async def _wait_before_map_entry(pkg: str, session_id: str) -> bool:
+    """Delay 10-30 detik acak per package sebelum join target/map."""
+    current = SESSIONS.get(pkg)
+    if not current or str(current.get("session_id")) != str(session_id):
+        return False
+
+    delay = random.uniform(MAP_ENTRY_DELAY_MIN_SECONDS, MAP_ENTRY_DELAY_MAX_SECONDS)
+    current["last_map_entry_delay_seconds"] = delay
+    log.info(
+        f"SESSION_AGENT: {pkg}/{session_id} selesai lobby; "
+        f"menunggu {delay:.1f}s sebelum JOIN MAP."
+    )
+    await asyncio.sleep(delay)
+
+    current = SESSIONS.get(pkg)
+    return bool(current and str(current.get("session_id")) == str(session_id))
+
+
 async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order_id,
                            intent_url: str, expected_username: str, timeout_seconds: int) -> None:
     """PREPARING -> WAITING_LOGIN -> ACCOUNT_READY -> JOINING_GAME -> RUNNING."""
@@ -386,6 +432,9 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
             return
 
         SESSIONS[pkg]["pid"] = get_pid_quick(pkg) or "-"
+
+        if not await _wait_in_lobby(pkg, session_id):
+            return
 
         if expected_username:
             await _emit_status(
@@ -445,6 +494,9 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
             )
 
         await _emit_status(local_device_id, session_id, pkg, order_id, "JOINING_GAME")
+
+        if not await _wait_before_map_entry(pkg, session_id):
+            return
 
         try:
             join_status, join_reason = await _launch_then_freeform_soon(
@@ -1041,6 +1093,9 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
             info = SESSIONS[pkg]
             info["pid"] = get_pid_quick(pkg) or "-"
 
+            if not await _wait_in_lobby(pkg, session_id, recovery=True):
+                return
+
             # Jangan rejoin menggunakan akun yang salah. Recovery wajib
             # melihat ulang username setelah launch lobby.
             if expected_username:
@@ -1072,6 +1127,9 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
                 info.get("_device_id", ""), session_id, pkg,
                 info.get("order_id"), "JOINING_GAME",
             )
+
+            if not await _wait_before_map_entry(pkg, session_id):
+                return
 
             try:
                 intent_url = get_intent_url(target)
@@ -1294,6 +1352,7 @@ async def reconcile_sync(expected_sessions: list, local_device_id: str) -> dict:
             "_device_id": local_device_id,
             "target": target,
             "expected_username": expected_username,
+            "session_kind": str(entry.get("session_kind", "") or "").strip().upper(),
             "status": internal_status,
             "runtime_status": runtime_status,
             "pid": pid,

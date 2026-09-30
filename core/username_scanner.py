@@ -54,53 +54,79 @@ _USERNAME_RE = re.compile(
 # session_agent._username_scanner_loop() lewat asyncio.to_thread.
 _cache: dict = {}
 
+# Generasi per package: forget() menaikkan angka ini, sehingga scan yang masih
+# jalan di thread (mis. task dicancel di tengah scan) tidak menulis ulang cache
+# basi setelah session selesai.
+_gen: dict = {}
+_last_warn: dict = {}
+_WARN_EVERY_SECONDS = 60
+_PKG_RE = re.compile(r"^[A-Za-z0-9_.]+$")
 
-def scan_username_blocking(pkg: str) -> str:
-    """Read the logged-in Roblox username and update the local cache.
 
-    A temporary read/permission failure keeps the last known username instead
-    of replacing it with None. A successful read that contains no username
-    still clears the cache, so a real logout does not leave stale account data.
+def _warn_throttled(pkg: str, msg: str, **kw) -> None:
+    """Log warning maksimal 1x/menit per package+pesan (hindari spam tiap scan)."""
+    now_ts = time.time()
+    key = (pkg, msg)
+    if now_ts - _last_warn.get(key, 0) >= _WARN_EVERY_SECONDS:
+        _last_warn[key] = now_ts
+        log.warning(msg, **kw)
+
+
+def scan_username_blocking(pkg: str):
+    """Baca username Roblox yang sedang login dan update cache lokal.
+
+    Kegagalan baca sementara (su/permission/file sedang ditulis/kosong) TIDAK
+    menghapus username terakhir yang valid. Hanya file yang terbaca utuh dan
+    memang tidak berisi username yang mengosongkan cache (logout beneran).
     """
-    path = f"/data/data/{pkg}/shared_prefs/prefs.xml"
-    previous = _cache.get(pkg, {})
-    previous_username = previous.get("username")
+    if not _PKG_RE.match(pkg or ""):
+        _warn_throttled(pkg, f"USERNAME_SCANNER: nama package tidak valid: {pkg!r}, dilewati.")
+        return None
 
+    gen = _gen.get(pkg, 0)
+    path = f"/data/data/{pkg}/shared_prefs/prefs.xml"
+    previous_username = _cache.get(pkg, {}).get("username")
+
+    read_ok = False
+    content = ""
     try:
         result = subprocess.run(
             ["su", "-c", f"cat '{path}'"],
             capture_output=True, text=True, timeout=5, errors="replace",
         )
-        read_ok = result.returncode == 0
         content = (result.stdout or "").strip()
+        read_ok = result.returncode == 0 and bool(content)
+        if result.returncode != 0:
+            err = (result.stderr or "").strip()[:200]
+            _warn_throttled(
+                pkg,
+                f"USERNAME_SCANNER: gagal baca {path} (rc={result.returncode}): {err or '(stderr kosong)'}",
+            )
+    except subprocess.TimeoutExpired:
+        _warn_throttled(pkg, f"USERNAME_SCANNER: timeout baca prefs.xml untuk {pkg}.")
     except Exception:
-        log.warning(f"USERNAME_SCANNER: exception baca prefs.xml untuk {pkg}.", exc_info=True)
+        _warn_throttled(pkg, f"USERNAME_SCANNER: exception baca prefs.xml untuk {pkg}.", exc_info=True)
+
+    # File terpotong (sedang ditulis Android) -> anggap gagal baca sementara.
+    if read_ok and "</map>" not in content:
         read_ok = False
-        content = ""
+
+    if _gen.get(pkg, 0) != gen:
+        return None  # forget() dipanggil selama scan; jangan tulis cache basi
 
     if not read_ok:
-        # Jangan menghapus username valid hanya karena satu pembacaan gagal.
-        if previous_username:
-            _cache[pkg] = {
-                "username": previous_username,
-                "scanned_at": time.time(),
-                "read_ok": False,
-            }
-            return previous_username
         _cache[pkg] = {
-            "username": None,
+            "username": previous_username,
             "scanned_at": time.time(),
             "read_ok": False,
         }
-        return None
+        return previous_username
 
     username = None
-    if content:
-        m = _USERNAME_RE.search(content)
-        if m:
-            value = m.group(1) if m.group(1) is not None else (m.group(2) or "")
-            value = value.strip()
-            username = value or None
+    m = _USERNAME_RE.search(content)
+    if m:
+        value = m.group(1) if m.group(1) is not None else (m.group(2) or "")
+        username = value.strip() or None
 
     _cache[pkg] = {
         "username": username,
@@ -124,4 +150,5 @@ def forget(pkg: str) -> None:
     scanner loop package tsb berhenti (session selesai/STOP_SESSION),
     supaya heartbeat berikutnya tidak melaporkan username basi untuk
     package yang sudah tidak dikelola agent."""
+    _gen[pkg] = _gen.get(pkg, 0) + 1
     _cache.pop(pkg, None)

@@ -47,6 +47,10 @@ from core import username_scanner
 
 DEFAULT_TIMEOUT_SECONDS = 45
 WATCHDOG_INTERVAL_SECONDS = 15
+# Interval scan username berkala (tampilan heartbeat/panel). Dulu konstanta ini
+# dipakai di _username_scanner_loop tapi TIDAK pernah didefinisikan -> NameError
+# di baris pertama loop, scanner mati diam-diam, username selalu None.
+USERNAME_SCAN_INTERVAL_SECONDS = 10
 
 # LIFECYCLE REVISION (lihat CARRERA_JOKI_SESSION_LIFECYCLE_REVISION.txt):
 # saat menunggu staff login akun customer, modul ini polling username_scanner

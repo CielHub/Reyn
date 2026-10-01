@@ -47,6 +47,12 @@ from core import username_scanner
 
 DEFAULT_TIMEOUT_SECONDS = 45
 WATCHDOG_INTERVAL_SECONDS = 15
+# PID hilang harus terkonfirmasi 2x berturut-turut (jeda singkat) sebelum
+# recovery -- menghindari recovery palsu (yang akan kill proses hidup) akibat
+# satu kali `pidof` meleset.
+WATCHDOG_CONFIRM_DELAY_SECONDS = 3
+WATCHDOG_STUCK_RECOVERY_TICKS = 2
+WATCHDOG_ALIVE_LOG_EVERY_SECONDS = 300
 # Interval scan username berkala (tampilan heartbeat/panel). Dulu konstanta ini
 # dipakai di _username_scanner_loop tapi TIDAK pernah didefinisikan -> NameError
 # di baris pertama loop, scanner mati diam-diam, username selalu None.
@@ -233,12 +239,24 @@ def _snapshot_for_heartbeat() -> dict:
     sedangkan watchdog tetap memakai field internal `status`."""
     snapshot = {}
     for pkg, info in SESSIONS.items():
+        # SUPERVISOR: watchdog tidak boleh hilang diam-diam. Heartbeat jalan
+        # tiap 15 dtk, jadi ini jaring pengaman murah -- session ACTIVE/
+        # RECOVERING yang watchdog-nya mati dihidupkan lagi.
+        if info.get("status") in ("ACTIVE", "RECOVERING"):
+            try:
+                _ensure_watchdog(pkg)
+            except RuntimeError:
+                pass  # tidak ada event loop berjalan (mis. pemanggilan sinkron)
         snapshot[pkg] = {
             "pid": info.get("pid", "-"),
             "state": info.get("runtime_status") or info.get("status", "UNKNOWN"),
             "username": username_scanner.get_cached_username(pkg),
             "session_id": info.get("session_id", ""),
             "last_status_at": info.get("last_status_at"),
+            # Tambahan (additive, bot lama mengabaikan): hasil cek PID nyata
+            # terakhir -- sumber kebenaran liveness, bukan status internal.
+            "pid_alive": info.get("pid_alive"),
+            "last_pid_check_at": info.get("last_pid_check_at"),
         }
     return snapshot
 
@@ -932,8 +950,110 @@ async def handle_stop_session(msg: dict, local_device_id: str, do_reset: bool = 
         "ok": True, "reason": "STOPPED",
     }
 
+def _pick_pid(pids) -> str:
+    """Pilih satu PID deterministik dari himpunan PID hidup."""
+    return str(min((int(p) for p in pids), default="")) if pids else ""
+
+
+async def _start_recovery_inline(pkg: str, info: dict, trigger: str) -> None:
+    """Mulai recovery SATU package. WAJIB dipanggil dengan _recovery_in_progress
+    sudah di-add secara SINKRON oleh caller (tidak ada await di antara cek
+    lock dan add) supaya tidak ada dua recovery untuk package yang sama."""
+    session_id = info.get("session_id", "")
+    info["crash_count"] = info.get("crash_count", 0) + 1
+    info["status"] = "RECOVERING"
+    info["runtime_status"] = "RECOVERING"
+    info["pid_alive"] = False
+    try:
+        await _emit_status(
+            info.get("_device_id", ""), session_id, pkg,
+            info.get("order_id"), "RECOVERING", reason=trigger,
+        )
+        await _run_package_recovery(pkg, session_id, trigger)
+    except asyncio.CancelledError:
+        _recovery_in_progress.discard(pkg)
+        raise
+    except Exception:
+        log.error(f"[{pkg}] watchdog: exception saat memulai recovery.", exc_info=True)
+        _recovery_in_progress.discard(pkg)
+
+
+async def _watchdog_tick(pkg: str, info: dict) -> None:
+    """Satu siklus pengecekan PID NYATA untuk satu package (expected vs actual)."""
+    status = info.get("status")
+
+    # Recovery yang berakhir karena exception melepas lock tapi status tetap
+    # RECOVERING -> tanpa ini package nyangkut selamanya. Dua tick berturut-
+    # turut tanpa recovery aktif = anggap macet, lanjutkan.
+    if status == "RECOVERING":
+        if pkg in _recovery_in_progress:
+            info["_stuck_ticks"] = 0
+            return
+        info["_stuck_ticks"] = info.get("_stuck_ticks", 0) + 1
+        if info["_stuck_ticks"] >= WATCHDOG_STUCK_RECOVERY_TICKS:
+            info["_stuck_ticks"] = 0
+            _recovery_in_progress.add(pkg)  # sinkron, sebelum await apa pun
+            log.warning(f"[{pkg}] RECOVERING tanpa recovery aktif -- melanjutkan recovery.")
+            await _start_recovery_inline(pkg, info, "RECOVERY_RESUME")
+        return
+
+    if status != "ACTIVE":
+        return
+    info["_stuck_ticks"] = 0
+    if pkg in _recovery_in_progress:
+        return
+
+    pids = await asyncio.to_thread(process_manager.get_pids, pkg)
+    info["last_pid_check_at"] = time.time()
+
+    if pids is None:
+        # Pengecekan gagal/ambigu: BUKAN bukti proses mati.
+        log.warning(f"[{pkg}] PID check gagal/ambigu (tidak dianggap mati); ulangi tick berikutnya.")
+        return
+
+    if pids:
+        recorded = str(info.get("pid") or "")
+        info["pid_alive"] = True
+        info["_pid_misses"] = 0
+        if recorded not in pids:
+            new_pid = _pick_pid(pids)
+            log.info(f"[{pkg}] PID berubah {recorded or '-'} -> {new_pid} (proses hidup, monitor diperbarui).")
+            info["pid"] = new_pid
+        elif time.time() - info.get("_last_alive_log", 0) >= WATCHDOG_ALIVE_LOG_EVERY_SECONDS:
+            info["_last_alive_log"] = time.time()
+            log.info(f"[{pkg}] PID check: ACTIVE (pid={recorded}).")
+        return
+
+    # pids == set(): tidak ada proses. Konfirmasi ulang sebelum recovery.
+    log.warning(f"[{pkg}] PID check: NOT FOUND (expected pid={info.get('pid') or '-'}); konfirmasi ulang...")
+    await asyncio.sleep(WATCHDOG_CONFIRM_DELAY_SECONDS)
+    if SESSIONS.get(pkg) is not info or info.get("status") != "ACTIVE" or pkg in _recovery_in_progress:
+        return
+    pids = await asyncio.to_thread(process_manager.get_pids, pkg)
+    if pids is None:
+        log.warning(f"[{pkg}] konfirmasi PID gagal/ambigu; tidak memicu recovery.")
+        return
+    if pids:
+        info["pid_alive"] = True
+        info["pid"] = _pick_pid(pids)
+        log.info(f"[{pkg}] PID muncul lagi pada konfirmasi (pid={info['pid']}); tidak ada recovery.")
+        return
+    if SESSIONS.get(pkg) is not info or info.get("status") != "ACTIVE" or pkg in _recovery_in_progress:
+        return
+
+    _recovery_in_progress.add(pkg)  # sinkron: tidak ada await sejak cek lock terakhir
+    log.warning(f"[{pkg}] Process appears dead (PID NOT FOUND 2x). Triggering recovery.")
+    await _start_recovery_inline(pkg, info, "PID_CRASH")
+
+
 async def _headless_watchdog_loop(pkg: str) -> None:
-    """Watchdog headless per package. Hanya ACTIVE yang boleh masuk recovery."""
+    """Watchdog headless per package: expected state (ACTIVE) vs PID NYATA.
+
+    Perbaikan: exception di satu siklus TIDAK lagi mematikan task (dulu
+    exception apa pun menghentikan watchdog tanpa ada yang tahu, package
+    tetap 'ACTIVE' tanpa pengawas). Supervisor tambahan ada di
+    _snapshot_for_heartbeat.
+    """
     log.info(f"SESSION_AGENT: watchdog headless mulai untuk {pkg}.")
     try:
         while pkg in SESSIONS:
@@ -941,32 +1061,12 @@ async def _headless_watchdog_loop(pkg: str) -> None:
             info = SESSIONS.get(pkg)
             if info is None:
                 break
-            if info.get("status") != "ACTIVE":
-                continue
-
-            current_pid = process_manager.get_pid(pkg)
-            recorded_pid = str(info.get("pid") or "")
-            if current_pid and str(current_pid) == recorded_pid:
-                continue
-
-            if pkg in _recovery_in_progress:
-                continue
-
-            info["crash_count"] = info.get("crash_count", 0) + 1
-            session_id = info.get("session_id", "")
-            info["status"] = "RECOVERING"
-            info["runtime_status"] = "RECOVERING"
-            _recovery_in_progress.add(pkg)
-
-            await _emit_status(
-                info.get("_device_id", ""),
-                session_id,
-                pkg,
-                info.get("order_id"),
-                "RECOVERING",
-                reason="PID_CRASH",
-            )
-            await _run_package_recovery(pkg, session_id, "PID_CRASH")
+            try:
+                await _watchdog_tick(pkg, info)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.error(f"[{pkg}] watchdog tick exception (watchdog TETAP berjalan).", exc_info=True)
     except asyncio.CancelledError:
         raise
     finally:
@@ -1014,7 +1114,13 @@ async def _handle_disconnect_event(event: dict) -> None:
             and pkg not in _recovery_in_progress
         ):
             session_id = info.get("session_id", "")
+            # Lock + status di-set SINKRON sebelum await apa pun, supaya
+            # watchdog tidak melihat 'RECOVERING tanpa lock' lalu memulai
+            # recovery kedua untuk package yang sama (race).
+            _recovery_in_progress.add(pkg)
             info["status"] = "RECOVERING"
+            info["runtime_status"] = "RECOVERING"
+            info["pid_alive"] = False
             await _emit_status(
                 info.get("_device_id", ""),
                 session_id,
@@ -1023,7 +1129,6 @@ async def _handle_disconnect_event(event: dict) -> None:
                 "RECOVERING",
                 reason=f"LOGCAT_{reason}",
             )
-            _recovery_in_progress.add(pkg)
             asyncio.create_task(
                 _run_package_recovery(
                     pkg, session_id, f"LOGCAT_{reason}"
@@ -1064,14 +1169,18 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
             if not _still_current():
                 return
 
-            current_pid = await asyncio.to_thread(process_manager.get_pid, pkg)
-            if current_pid:
+            # Kill TIAP PID hidup milik package ini satu per satu (get_pid
+            # lama mengembalikan string gabungan "p1 p2" kalau lebih dari
+            # satu proses). Tetap hanya PID package ini -- tidak ada global kill.
+            stale_pids = await asyncio.to_thread(process_manager.get_pids, pkg) or set()
+            for stale_pid in sorted(stale_pids):
+                log.info(f"[{pkg}] recovery: mematikan PID {stale_pid} sebelum relaunch.")
                 await asyncio.to_thread(
-                    process_manager.kill_pid_direct, current_pid
+                    process_manager.kill_pid_direct, stale_pid
                 )
                 await asyncio.to_thread(
                     process_manager.wait_until_process_dead,
-                    current_pid, 10,
+                    stale_pid, 10,
                 )
 
             if not _still_current():
@@ -1095,7 +1204,9 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
                 continue
 
             info = SESSIONS[pkg]
+            old_pid = info.get("pid")
             info["pid"] = get_pid_quick(pkg) or "-"
+            log.info(f"[{pkg}] Roblox launched (lobby). PID {old_pid or '-'} -> {info['pid']}")
 
             if not await _wait_in_lobby(pkg, session_id, recovery=True):
                 return
@@ -1156,7 +1267,10 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
             info["status"] = "ACTIVE"
             info["runtime_status"] = "RUNNING"
             info["pid"] = get_pid_quick(pkg) or "-"
+            info["pid_alive"] = info["pid"] != "-"
+            info["_pid_misses"] = 0
             info["launch_count"] = info.get("launch_count", 0) + 1
+            log.info(f"[{pkg}] New PID detected: {info['pid']}. Recovery successful. State: RUNNING")
 
             _ensure_watchdog(pkg)
             _ensure_username_scanner(pkg)

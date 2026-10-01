@@ -10,11 +10,72 @@ import subprocess
 import time
 
 def get_pid(pkg_name):
+    # timeout ditambahkan: `pidof` yang menggantung tidak boleh membekukan
+    # caller (watchdog/recovery/sync). Perilaku lain TIDAK berubah.
     try:
-        result = subprocess.run(['pidof', pkg_name], capture_output=True, text=True)
+        result = subprocess.run(
+            ['pidof', pkg_name], capture_output=True, text=True, timeout=5
+        )
         return result.stdout.strip()
-    except FileNotFoundError:
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return ""
+
+
+def _validate_pid(pid, pkg_name):
+    """Validasi bahwa PID hasil `pidof` memang proses utama package ini dan
+    belum zombie. Return True/False; None kalau /proc tidak bisa dibaca
+    (jangan menolak PID hanya karena tidak bisa diverifikasi)."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().split(b"\x00", 1)[0].decode("utf-8", "ignore").strip()
+    except FileNotFoundError:
+        return False  # proses sudah hilang di antara pidof dan cek ini
+    except Exception:
+        return None
+    if cmd and cmd != pkg_name:
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            stat = f.read().decode("utf-8", "ignore")
+        state = stat.rsplit(")", 1)[1].split()[0]
+        if state in ("Z", "X"):
+            return False
+    except FileNotFoundError:
+        return False
+    except Exception:
+        pass
+    return True
+
+
+def get_pids(pkg_name):
+    """Semua PID hidup milik SATU package (set of str), tervalidasi.
+
+    Return:
+      set() kosong  -> BENAR-BENAR tidak ada proses (pidof exit 1 / kosong).
+      None          -> pengecekan GAGAL/ambigu (timeout, pidof tidak ada,
+                       error lain). Caller WAJIB menganggap ini 'tidak tahu',
+                       BUKAN 'mati', supaya error sesaat tidak memicu
+                       recovery palsu (yang akan kill proses yang hidup).
+    """
+    try:
+        result = subprocess.run(
+            ['pidof', pkg_name], capture_output=True, text=True,
+            timeout=5, errors='replace',
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    except Exception:
+        return None
+    raw = (result.stdout or "").strip().split()
+    candidates = [p for p in raw if p.isdigit()]
+    if not candidates:
+        # pidof exit code 1 = tidak ada proses. Kode lain = error pengecekan.
+        return set() if result.returncode in (0, 1) else None
+    alive = set()
+    for pid in candidates:
+        if _validate_pid(pid, pkg_name) is not False:
+            alive.add(pid)
+    return alive
 
 def pid_exists(pid):
     result = subprocess.run(

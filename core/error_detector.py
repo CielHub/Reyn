@@ -37,10 +37,19 @@ NETWORK_PATTERN = re.compile(
     r"\[FLog::Network\]"
 )
 
+# 287 = "Koneksi Terputus ... Server telah dimatikan" (server shutdown). Pada
+# dialog ini proses Roblox TETAP HIDUP (PID ada), jadi watchdog PID tidak bisa
+# menangkapnya -- satu-satunya sinyal adalah baris log ini.
 REASON_PATTERN = re.compile(
-    r"reason\s*:\s*(266|267|277|279|280)",
+    r"reason\s*:\s*(266|267|277|279|280|287)",
     re.IGNORECASE
 )
+
+# Diagnostik: kode reason 3 digit APA PUN pada baris FLog::Network. Dipakai
+# hanya untuk mencatat kode yang BELUM ada di REASON_PATTERN (sekali per kode),
+# supaya kode error baru bisa ketahuan dari log agent tanpa menebak.
+ANY_REASON_PATTERN = re.compile(r"reason\s*:\s*(\d{3})", re.IGNORECASE)
+_seen_unknown_reasons = set()
 
 # ==========================================================
 # DETECTOR
@@ -103,6 +112,11 @@ class ErrorDetector:
 
                     reason_match = REASON_PATTERN.search(line)
                     if not reason_match:
+                        any_match = ANY_REASON_PATTERN.search(line)
+                        if any_match and any_match.group(1) not in _seen_unknown_reasons:
+                            _seen_unknown_reasons.add(any_match.group(1))
+                            print(f"[ERROR_DETECTOR] Reason {any_match.group(1)} terlihat di log "
+                                  f"tapi TIDAK ditangani: {line.strip()[:200]}")
                         continue
 
                     pid = pid_match.group(1)

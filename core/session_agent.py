@@ -52,6 +52,10 @@ WATCHDOG_INTERVAL_SECONDS = 15
 # satu kali `pidof` meleset.
 WATCHDOG_CONFIRM_DELAY_SECONDS = 3
 WATCHDOG_STUCK_RECOVERY_TICKS = 2
+# Restart manual: tunggu PID BARU muncul setelah relaunch (detik).
+RESTART_WAIT_NEW_PID_SECONDS = 25
+# Pastikan PID lama benar-benar mati: berapa kali kill ulang kalau masih ada.
+KILL_VERIFY_MAX_ROUNDS = 3
 WATCHDOG_ALIVE_LOG_EVERY_SECONDS = 300
 # Interval scan username berkala (tampilan heartbeat/panel). Dulu konstanta ini
 # dipakai di _username_scanner_loop tapi TIDAK pernah didefinisikan -> NameError
@@ -950,6 +954,55 @@ async def handle_stop_session(msg: dict, local_device_id: str, do_reset: bool = 
         "ok": True, "reason": "STOPPED",
     }
 
+_restart_tasks: set = set()
+
+
+async def handle_restart_package(msg: dict, local_device_id: str) -> dict:
+    """RESTART_PACKAGE: restart SATU package (bukan seluruh device).
+
+    Memakai _run_package_recovery yang sudah ada (kill PID lama -> pastikan
+    mati -> relaunch -> tunggu PID baru -> verifikasi username -> lobby ->
+    join target -> RUNNING) -- BUKAN sistem recovery kedua. Integrasi dengan
+    watchdog: lock _recovery_in_progress + status RECOVERING di-set SINKRON
+    sebelum await apa pun, jadi watchdog (yang mengabaikan package ber-lock)
+    tidak pernah memicu recovery otomatis kedua saat PID lama hilang."""
+    session_id = str(msg.get("session_id", "")).strip()
+    pkg = str(msg.get("package_name", "")).strip()
+
+    def _result(ok: bool, reason: str) -> dict:
+        return {
+            "type": "COMMAND_RESULT", "command": "RESTART_PACKAGE",
+            "device_id": local_device_id, "session_id": session_id,
+            "package_name": pkg, "ok": ok, "reason": reason,
+        }
+
+    if not session_id or not pkg:
+        return _result(False, "MISSING_FIELDS")
+    info = SESSIONS.get(pkg)
+    if info is None:
+        return _result(False, "NO_LOCAL_SESSION")
+    if str(info.get("session_id")) != session_id:
+        return _result(False, "STALE_SESSION_ID")
+    if pkg in _recovery_in_progress:
+        return _result(True, "ALREADY_IN_PROGRESS")
+    if info.get("status") not in ("ACTIVE", "RECOVERING"):
+        # Masih tahap start awal / sudah STOPPING: bukan untuk di-restart manual.
+        return _result(False, "NOT_RUNNING")
+
+    # --- SINKRON: tidak ada await antara cek lock dan add lock ---
+    _recovery_in_progress.add(pkg)
+    info["_manual_restart"] = True
+    info["status"] = "RECOVERING"
+    info["runtime_status"] = "RESTARTING"
+    info["pid_alive"] = False
+    log.info(f"[{pkg}] MANUAL_RESTART diminta (PID lama: {info.get('pid') or '-'}). "
+             "Hanya package ini yang diproses.")
+    task = asyncio.create_task(_run_package_recovery(pkg, session_id, "MANUAL_RESTART"))
+    _restart_tasks.add(task)
+    task.add_done_callback(_restart_tasks.discard)
+    return _result(True, "RESTART_STARTED")
+
+
 def _pick_pid(pids) -> str:
     """Pilih satu PID deterministik dari himpunan PID hidup."""
     return str(min((int(p) for p in pids), default="")) if pids else ""
@@ -1154,34 +1207,46 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
         while _still_current():
             attempt += 1
             info = SESSIONS[pkg]
+            manual = bool(info.get("_manual_restart"))
             info["status"] = "RECOVERING"
-            info["runtime_status"] = "RECOVERING"
+            # Restart manual punya state sendiri di heartbeat/panel:
+            # RESTARTING -> WAITING_FOR_PID -> (JOINING_GAME ...) -> RUNNING.
+            info["runtime_status"] = "RESTARTING" if manual else "RECOVERING"
 
             if attempt > 1:
                 await asyncio.sleep(_recovery_backoff_delay(attempt - 1))
             if not _still_current():
                 return
 
-            await asyncio.sleep(random.uniform(
-                RECOVERY_PRE_KILL_JITTER_MIN_SECONDS,
-                RECOVERY_PRE_KILL_JITTER_MAX_SECONDS,
-            ))
+            if not manual:  # restart manual dijalankan langsung, tanpa jitter
+                await asyncio.sleep(random.uniform(
+                    RECOVERY_PRE_KILL_JITTER_MIN_SECONDS,
+                    RECOVERY_PRE_KILL_JITTER_MAX_SECONDS,
+                ))
             if not _still_current():
                 return
 
             # Kill TIAP PID hidup milik package ini satu per satu (get_pid
             # lama mengembalikan string gabungan "p1 p2" kalau lebih dari
             # satu proses). Tetap hanya PID package ini -- tidak ada global kill.
-            stale_pids = await asyncio.to_thread(process_manager.get_pids, pkg) or set()
-            for stale_pid in sorted(stale_pids):
-                log.info(f"[{pkg}] recovery: mematikan PID {stale_pid} sebelum relaunch.")
-                await asyncio.to_thread(
-                    process_manager.kill_pid_direct, stale_pid
-                )
-                await asyncio.to_thread(
-                    process_manager.wait_until_process_dead,
-                    stale_pid, 10,
-                )
+            old_pids = set()
+            for _round in range(KILL_VERIFY_MAX_ROUNDS):
+                stale_pids = await asyncio.to_thread(process_manager.get_pids, pkg) or set()
+                if not stale_pids:
+                    break  # PID lama BENAR-BENAR sudah mati
+                old_pids |= set(stale_pids)
+                for stale_pid in sorted(stale_pids):
+                    log.info(f"[{pkg}] recovery: mematikan PID {stale_pid} sebelum relaunch.")
+                    await asyncio.to_thread(
+                        process_manager.kill_pid_direct, stale_pid
+                    )
+                    await asyncio.to_thread(
+                        process_manager.wait_until_process_dead,
+                        stale_pid, 10,
+                    )
+            else:
+                log.warning(f"[{pkg}] recovery: PID lama masih terdeteksi setelah "
+                            f"{KILL_VERIFY_MAX_ROUNDS}x kill; lanjut relaunch.")
 
             if not _still_current():
                 return
@@ -1191,6 +1256,9 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
                 info.get("order_id"), "RECOVERING",
                 reason=trigger_reason,
             )
+            if manual:
+                # _emit_status menimpa runtime_status; kembalikan ke state restart.
+                info["runtime_status"] = "WAITING_FOR_PID"
 
             lobby_ok = await _launch_then_freeform_soon(
                 pkg, get_lobby_intent(), LOBBY_TIMEOUT_SECONDS,
@@ -1206,6 +1274,24 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
             info = SESSIONS[pkg]
             old_pid = info.get("pid")
             info["pid"] = get_pid_quick(pkg) or "-"
+            if manual:
+                # Tunggu PID BARU (bukan PID lama) sebelum lanjut verifikasi.
+                info["runtime_status"] = "WAITING_FOR_PID"
+                deadline = time.monotonic() + RESTART_WAIT_NEW_PID_SECONDS
+                while time.monotonic() < deadline and _still_current():
+                    new_pids = await asyncio.to_thread(process_manager.get_pids, pkg)
+                    fresh = (new_pids or set()) - old_pids
+                    if fresh:
+                        info["pid"] = _pick_pid(fresh)
+                        break
+                    await asyncio.sleep(1)
+                else:
+                    if _still_current():
+                        log.warning(f"[{pkg}] restart: PID baru belum terdeteksi dalam "
+                                    f"{RESTART_WAIT_NEW_PID_SECONDS}s; lanjut, watchdog akan memantau.")
+                if not _still_current():
+                    return
+                info["runtime_status"] = "RESTARTING"
             log.info(f"[{pkg}] Roblox launched (lobby). PID {old_pid or '-'} -> {info['pid']}")
 
             if not await _wait_in_lobby(pkg, session_id, recovery=True):
@@ -1270,7 +1356,12 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
             info["pid_alive"] = info["pid"] != "-"
             info["_pid_misses"] = 0
             info["launch_count"] = info.get("launch_count", 0) + 1
-            log.info(f"[{pkg}] New PID detected: {info['pid']}. Recovery successful. State: RUNNING")
+            if info.pop("_manual_restart", False):
+                info["restart_count"] = info.get("restart_count", 0) + 1
+                info["last_restart_at"] = time.time()
+                log.info(f"[{pkg}] MANUAL_RESTART selesai. New PID: {info['pid']}. State: RUNNING")
+            else:
+                log.info(f"[{pkg}] New PID detected: {info['pid']}. Recovery successful. State: RUNNING")
 
             _ensure_watchdog(pkg)
             _ensure_username_scanner(pkg)
@@ -1296,6 +1387,9 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
         )
     finally:
         _recovery_in_progress.discard(pkg)
+        leftover = SESSIONS.get(pkg)
+        if leftover is not None:
+            leftover.pop("_manual_restart", None)
 
 
 async def _attempt_join_target(

@@ -47,6 +47,41 @@ def _validate_pid(pid, pkg_name):
     return True
 
 
+def get_ram_info():
+    """RAM KESELURUHAN device dari /proc/meminfo (bukan per package).
+
+    Return dict {total_mb, used_mb, available_mb, percent, ts} atau None kalau
+    tidak bisa dibaca. used = MemTotal - MemAvailable (cara yang sama dengan
+    `free`/Android, jadi cache yang bisa dilepas tidak dihitung terpakai).
+    Baca file kecil di /proc -> murni I/O ringan, tanpa subprocess."""
+    try:
+        values = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                if key in ("MemTotal", "MemAvailable", "MemFree", "Buffers", "Cached"):
+                    parts = rest.split()
+                    if parts and parts[0].isdigit():
+                        values[key] = int(parts[0])  # kB
+        total = values.get("MemTotal")
+        if not total:
+            return None
+        available = values.get("MemAvailable")
+        if available is None:  # kernel lama tanpa MemAvailable
+            available = values.get("MemFree", 0) + values.get("Buffers", 0) + values.get("Cached", 0)
+        available = max(0, min(available, total))
+        used = total - available
+        return {
+            "total_mb": int(round(total / 1024)),
+            "used_mb": int(round(used / 1024)),
+            "available_mb": int(round(available / 1024)),
+            "percent": int(round(used * 100 / total)),
+            "ts": time.time(),
+        }
+    except Exception:
+        return None
+
+
 def get_pids(pkg_name):
     """Semua PID hidup milik SATU package (set of str), tervalidasi.
 

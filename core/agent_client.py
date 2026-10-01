@@ -22,6 +22,7 @@ from core import session_agent
 from core import test_agent
 from core import username_scanner
 from core import package_inventory
+from core import process_manager
 
 HEARTBEAT_INTERVAL_SECONDS = 15
 RECONNECT_BACKOFF_SECONDS = [2, 5, 10, 20, 30]
@@ -75,6 +76,19 @@ def _snapshot_packages() -> dict:
         }
 
     snapshot.update(session_agent._snapshot_for_heartbeat())
+
+    # LIVE RAM: RAM KESELURUHAN device (1x baca /proc/meminfo per heartbeat),
+    # ditempel di tiap entry package sebagai field "ram". Dengan cara ini
+    # tidak ada perubahan skema/ws_server: packages_json yang sudah
+    # disimpan bot otomatis membawanya, dan bot membaca dari entry mana pun.
+    try:
+        ram = process_manager.get_ram_info()
+    except Exception:
+        ram = None
+    if ram:
+        for entry in snapshot.values():
+            if isinstance(entry, dict):
+                entry["ram"] = ram
     return snapshot
 
 
@@ -82,6 +96,7 @@ _COMMAND_HANDLERS = {
     "START_SESSION": session_agent.handle_start_session,
     "STOP_SESSION": session_agent.handle_stop_session,
     "SYNC_SESSIONS": session_agent.handle_sync_sessions,
+    "RESTART_PACKAGE": session_agent.handle_restart_package,
     "TEST_AFK_DEVICE": test_agent.handle_test_afk,
     "STOP_TEST_AFK": test_agent.handle_stop_test_afk,
 }

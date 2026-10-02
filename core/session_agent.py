@@ -54,6 +54,17 @@ WATCHDOG_CONFIRM_DELAY_SECONDS = 3
 WATCHDOG_STUCK_RECOVERY_TICKS = 2
 # Restart manual: tunggu PID BARU muncul setelah relaunch (detik).
 RESTART_WAIT_NEW_PID_SECONDS = 25
+# --- Package "hidup tapi tidak benar-benar jalan" (proses cached) ---
+# PID masih ada TAPI proses sudah CACHED (oom_score_adj >= 900): jendela Roblox
+# ditutup / aplikasi di-close dari layar. Dianggap mati hanya setelah N tick
+# berturut-turut + konfirmasi ulang (menghindari false positive yang akan
+# me-kill proses sehat).
+WATCHDOG_CACHED_ADJ_MIN = 900
+WATCHDOG_CACHED_TICKS_BEFORE_RECOVERY = 3
+WATCHDOG_POST_STATUS_GRACE_SECONDS = 60
+# Log diagnostik per package per tick (SEMENTARA, untuk debugging).
+# Set False kalau sudah tidak diperlukan.
+WATCHDOG_DEBUG_LOG = True
 # Pastikan PID lama benar-benar mati: berapa kali kill ulang kalau masih ada.
 KILL_VERIFY_MAX_ROUNDS = 3
 WATCHDOG_ALIVE_LOG_EVERY_SECONDS = 300
@@ -260,6 +271,8 @@ def _snapshot_for_heartbeat() -> dict:
             # Tambahan (additive, bot lama mengabaikan): hasil cek PID nyata
             # terakhir -- sumber kebenaran liveness, bukan status internal.
             "pid_alive": info.get("pid_alive"),
+            "package_alive": info.get("package_alive"),
+            "adj": info.get("adj"),
             "last_pid_check_at": info.get("last_pid_check_at"),
         }
     return snapshot
@@ -1031,6 +1044,29 @@ async def _start_recovery_inline(pkg: str, info: dict, trigger: str) -> None:
         _recovery_in_progress.discard(pkg)
 
 
+def _debug_reconcile_log(pkg: str, info: dict, pids, adj, package_alive: bool) -> None:
+    """Log diagnostik SEMENTARA: expected vs actual per package, satu entri
+    atomik per tick supaya tidak bercampur antar package."""
+    if not WATCHDOG_DEBUG_LOG:
+        return
+    device = info.get("_device_id") or "?"
+    short = pkg.replace("com.roblox.", "")
+    pid_alive = bool(pids)
+    log.info(
+        f"[{device}][{short}]\n"
+        f"  Expected: RUNNING\n"
+        f"  PID: {info.get('pid') or '-'} (pidof: {','.join(sorted(pids)) if pids else 'tidak ada'})\n"
+        f"  PID Alive: {str(pid_alive).upper()}\n"
+        f"  Process adj: {adj if adj is not None else 'n/a'}"
+        f"{' (CACHED)' if adj is not None and adj >= WATCHDOG_CACHED_ADJ_MIN else ''}\n"
+        f"  Package Alive: {str(package_alive).upper()}\n"
+        f"  Session State: {info.get('runtime_status') or info.get('status')}"
+    )
+    if pid_alive is False or package_alive is False:
+        log.warning(f"[{device}][{short}] STATE MISMATCH: sesi masih "
+                    f"{info.get('runtime_status') or info.get('status')} tetapi aktual tidak hidup.")
+
+
 async def _watchdog_tick(pkg: str, info: dict) -> None:
     """Satu siklus pengecekan PID NYATA untuk satu package (expected vs actual)."""
     status = info.get("status")
@@ -1072,12 +1108,54 @@ async def _watchdog_tick(pkg: str, info: dict) -> None:
             new_pid = _pick_pid(pids)
             log.info(f"[{pkg}] PID berubah {recorded or '-'} -> {new_pid} (proses hidup, monitor diperbarui).")
             info["pid"] = new_pid
-        elif time.time() - info.get("_last_alive_log", 0) >= WATCHDOG_ALIVE_LOG_EVERY_SECONDS:
+
+        # --- PACKAGE ALIVE: PID ada belum berarti Roblox benar-benar jalan ---
+        adj = await asyncio.to_thread(process_manager.get_min_oom_adj, pids)
+        info["adj"] = adj
+        cached = adj is not None and adj >= WATCHDOG_CACHED_ADJ_MIN
+        in_grace = (time.time() - (info.get("last_status_at") or 0)) < WATCHDOG_POST_STATUS_GRACE_SECONDS
+        if cached and not in_grace:
+            info["_cached_ticks"] = info.get("_cached_ticks", 0) + 1
+        else:
+            info["_cached_ticks"] = 0
+        package_alive = not (cached and info["_cached_ticks"] >= 1)
+        info["package_alive"] = package_alive
+        _debug_reconcile_log(pkg, info, pids, adj, package_alive)
+
+        if cached and info["_cached_ticks"] >= WATCHDOG_CACHED_TICKS_BEFORE_RECOVERY:
+            log.warning(f"[{pkg}] PID {info['pid']} MASIH ADA tapi proses CACHED (adj={adj}) "
+                        f"{info['_cached_ticks']}x berturut-turut -> Roblox tidak benar-benar jalan "
+                        f"(jendela ditutup/aplikasi di-close). Konfirmasi ulang...")
+            await asyncio.sleep(WATCHDOG_CONFIRM_DELAY_SECONDS)
+            if SESSIONS.get(pkg) is not info or info.get("status") != "ACTIVE" or pkg in _recovery_in_progress:
+                return
+            pids2 = await asyncio.to_thread(process_manager.get_pids, pkg)
+            adj2 = await asyncio.to_thread(process_manager.get_min_oom_adj, pids2) if pids2 else None
+            if pids2 and adj2 is not None and adj2 < WATCHDOG_CACHED_ADJ_MIN:
+                info["_cached_ticks"] = 0
+                info["package_alive"] = True
+                log.info(f"[{pkg}] konfirmasi: proses aktif lagi (adj={adj2}); tidak ada recovery.")
+                return
+            if pids2 is None:
+                log.warning(f"[{pkg}] konfirmasi PID gagal/ambigu; tidak memicu recovery.")
+                return
+            if SESSIONS.get(pkg) is not info or info.get("status") != "ACTIVE" or pkg in _recovery_in_progress:
+                return
+            info["_cached_ticks"] = 0
+            _recovery_in_progress.add(pkg)  # sinkron, tanpa await sejak cek lock terakhir
+            log.warning(f"[{pkg}] Package TIDAK aktif (PID cached). Triggering recovery.")
+            await _start_recovery_inline(pkg, info, "PID_CACHED")
+            return
+
+        if time.time() - info.get("_last_alive_log", 0) >= WATCHDOG_ALIVE_LOG_EVERY_SECONDS:
             info["_last_alive_log"] = time.time()
-            log.info(f"[{pkg}] PID check: ACTIVE (pid={recorded}).")
+            log.info(f"[{pkg}] PID check: ACTIVE (pid={info.get('pid')}, adj={adj}).")
         return
 
     # pids == set(): tidak ada proses. Konfirmasi ulang sebelum recovery.
+    info["package_alive"] = False
+    info["adj"] = None
+    _debug_reconcile_log(pkg, info, pids, None, False)
     log.warning(f"[{pkg}] PID check: NOT FOUND (expected pid={info.get('pid') or '-'}); konfirmasi ulang...")
     await asyncio.sleep(WATCHDOG_CONFIRM_DELAY_SECONDS)
     if SESSIONS.get(pkg) is not info or info.get("status") != "ACTIVE" or pkg in _recovery_in_progress:

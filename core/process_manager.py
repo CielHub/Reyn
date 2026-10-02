@@ -47,6 +47,30 @@ def _validate_pid(pid, pkg_name):
     return True
 
 
+def get_oom_adj(pid):
+    """oom_score_adj proses (int) atau None kalau tidak terbaca.
+
+    Ini tingkat 'seberapa aktif' proses menurut Android:
+      0   = foreground, 100 = visible (jendela terlihat), 200 = perceptible,
+      700 = previous app, 900+ = CACHED (tidak punya jendela/aktivitas aktif).
+    Roblox yang jendelanya ditutup (X di freeform) / di-close dari layar sering
+    TIDAK langsung mati: prosesnya tetap ada (PID masih ketemu `pidof`) tapi
+    jatuh ke 900+. PID saja tidak cukup untuk membuktikan Roblox benar-benar
+    sedang jalan -- adj inilah yang membedakannya."""
+    try:
+        with open(f"/proc/{pid}/oom_score_adj", "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def get_min_oom_adj(pids):
+    """adj TERENDAH (= paling aktif) dari sekumpulan PID satu package. Package
+    dengan beberapa proses dianggap aktif kalau SALAH SATU proses aktif."""
+    values = [v for v in (get_oom_adj(p) for p in (pids or ())) if v is not None]
+    return min(values) if values else None
+
+
 def get_ram_info():
     """RAM KESELURUHAN device dari /proc/meminfo (bukan per package).
 

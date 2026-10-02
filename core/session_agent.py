@@ -250,9 +250,13 @@ async def _emit_status(local_device_id: str, session_id: str, pkg: str, order_id
         )
 
 def _snapshot_for_heartbeat() -> dict:
-    """Heartbeat operasional: state yang dilihat bot berasal dari runtime_status,
-    sedangkan watchdog tetap memakai field internal `status`."""
+    """Heartbeat operasional dengan metadata freshness/liveness package.
+
+    `snapshot_at` diproduksi SEKALI per heartbeat dari clock device, sehingga
+    bot dapat mengukur umur `last_pid_check_at` tanpa bergantung pada clock server.
+    """
     snapshot = {}
+    snapshot_at = time.time()
     for pkg, info in SESSIONS.items():
         # SUPERVISOR: watchdog tidak boleh hilang diam-diam. Heartbeat jalan
         # tiap 15 dtk, jadi ini jaring pengaman murah -- session ACTIVE/
@@ -273,12 +277,15 @@ def _snapshot_for_heartbeat() -> dict:
             "pid_alive": info.get("pid_alive"),
             "package_alive": info.get("package_alive"),
             "adj": info.get("adj"),
+            "liveness_state": info.get("liveness_state", "UNKNOWN"),
             "last_pid_check_at": info.get("last_pid_check_at"),
+            "snapshot_at": snapshot_at,
         }
     return snapshot
 
 def _snapshot_for_sync() -> dict:
-    """Snapshot lengkap untuk SYNC_SESSIONS, termasuk runtime identity."""
+    """Snapshot lengkap untuk SYNC_SESSIONS, termasuk runtime identity + liveness."""
+    snapshot_at = time.time()
     return {
         pkg: {
             "session_id": info.get("session_id", ""),
@@ -289,6 +296,12 @@ def _snapshot_for_sync() -> dict:
             "target": info.get("target", ""),
             "last_status_at": info.get("last_status_at"),
             "status_seq": info.get("status_seq", 0),
+            "pid_alive": info.get("pid_alive"),
+            "package_alive": info.get("package_alive"),
+            "adj": info.get("adj"),
+            "liveness_state": info.get("liveness_state", "UNKNOWN"),
+            "last_pid_check_at": info.get("last_pid_check_at"),
+            "snapshot_at": snapshot_at,
         }
         for pkg, info in SESSIONS.items()
     }
@@ -373,6 +386,12 @@ async def handle_start_session(msg: dict, local_device_id: str) -> dict:
         "crash_count": 0,
         "status_seq": 0,
         "last_status_at": time.time(),
+        # Liveness probe fields. None = belum terverifikasi, bukan RUNNING.
+        "pid_alive": None,
+        "package_alive": None,
+        "adj": None,
+        "liveness_state": "UNKNOWN",
+        "last_pid_check_at": None,
     }
 
     # Username scanner dimulai SEBELUM staged flow supaya heartbeat tidak
@@ -1044,22 +1063,23 @@ async def _start_recovery_inline(pkg: str, info: dict, trigger: str) -> None:
         _recovery_in_progress.discard(pkg)
 
 
-def _debug_reconcile_log(pkg: str, info: dict, pids, adj, package_alive: bool) -> None:
-    """Log diagnostik SEMENTARA: expected vs actual per package, satu entri
-    atomik per tick supaya tidak bercampur antar package."""
+def _debug_reconcile_log(pkg: str, info: dict, pids, adj, package_alive) -> None:
+    """Log diagnostik expected-vs-actual, termasuk liveness tri-state."""
     if not WATCHDOG_DEBUG_LOG:
         return
     device = info.get("_device_id") or "?"
     short = pkg.replace("com.roblox.", "")
-    pid_alive = bool(pids)
+    pid_alive = bool(pids) if pids is not None else None
     log.info(
         f"[{device}][{short}]\n"
         f"  Expected: RUNNING\n"
-        f"  PID: {info.get('pid') or '-'} (pidof: {','.join(sorted(pids)) if pids else 'tidak ada'})\n"
+        f"  PID: {info.get('pid') or '-'} (pidof: {','.join(sorted(pids)) if pids else ('UNKNOWN' if pids is None else 'tidak ada')})\n"
         f"  PID Alive: {str(pid_alive).upper()}\n"
         f"  Process adj: {adj if adj is not None else 'n/a'}"
         f"{' (CACHED)' if adj is not None and adj >= WATCHDOG_CACHED_ADJ_MIN else ''}\n"
         f"  Package Alive: {str(package_alive).upper()}\n"
+        f"  Liveness State: {info.get('liveness_state', 'UNKNOWN')}\n"
+        f"  Last PID Check: {info.get('last_pid_check_at') or 'n/a'}\n"
         f"  Session State: {info.get('runtime_status') or info.get('status')}"
     )
     if pid_alive is False or package_alive is False:
@@ -1068,12 +1088,18 @@ def _debug_reconcile_log(pkg: str, info: dict, pids, adj, package_alive: bool) -
 
 
 async def _watchdog_tick(pkg: str, info: dict) -> None:
-    """Satu siklus pengecekan PID NYATA untuk satu package (expected vs actual)."""
+    """Satu siklus probe liveness package.
+
+    Kontrak tri-state:
+      TRUE  = PID + process aktif dan probe fresh.
+      FALSE = proses sudah dikonfirmasi hilang/cached.
+      None  = belum dapat dibuktikan (probe error / suspected cached).
+
+    Hanya kondisi FALSE yang boleh memicu recovery. Kondisi None tidak boleh
+    diperlakukan sebagai sehat dan juga tidak boleh memicu kill palsu.
+    """
     status = info.get("status")
 
-    # Recovery yang berakhir karena exception melepas lock tapi status tetap
-    # RECOVERING -> tanpa ini package nyangkut selamanya. Dua tick berturut-
-    # turut tanpa recovery aktif = anggap macet, lanjutkan.
     if status == "RECOVERING":
         if pkg in _recovery_in_progress:
             info["_stuck_ticks"] = 0
@@ -1081,7 +1107,7 @@ async def _watchdog_tick(pkg: str, info: dict) -> None:
         info["_stuck_ticks"] = info.get("_stuck_ticks", 0) + 1
         if info["_stuck_ticks"] >= WATCHDOG_STUCK_RECOVERY_TICKS:
             info["_stuck_ticks"] = 0
-            _recovery_in_progress.add(pkg)  # sinkron, sebelum await apa pun
+            _recovery_in_progress.add(pkg)
             log.warning(f"[{pkg}] RECOVERING tanpa recovery aktif -- melanjutkan recovery.")
             await _start_recovery_inline(pkg, info, "RECOVERY_RESUME")
         return
@@ -1093,11 +1119,16 @@ async def _watchdog_tick(pkg: str, info: dict) -> None:
         return
 
     pids = await asyncio.to_thread(process_manager.get_pids, pkg)
-    info["last_pid_check_at"] = time.time()
-
     if pids is None:
-        # Pengecekan gagal/ambigu: BUKAN bukti proses mati.
-        log.warning(f"[{pkg}] PID check gagal/ambigu (tidak dianggap mati); ulangi tick berikutnya.")
+        # Check gagal/ambigu: invalidate liveness terbaru. Jangan update
+        # last_pid_check_at karena tidak ada probe sukses yang baru.
+        info["pid_alive"] = None
+        info["package_alive"] = None
+        info["adj"] = None
+        info["_cached_ticks"] = 0
+        info["liveness_state"] = "UNKNOWN"
+        _debug_reconcile_log(pkg, info, pids, None, None)
+        log.warning(f"[{pkg}] PID check gagal/ambigu (UNKNOWN); last good liveness dipertahankan sebagai timestamp lama.")
         return
 
     if pids:
@@ -1109,71 +1140,172 @@ async def _watchdog_tick(pkg: str, info: dict) -> None:
             log.info(f"[{pkg}] PID berubah {recorded or '-'} -> {new_pid} (proses hidup, monitor diperbarui).")
             info["pid"] = new_pid
 
-        # --- PACKAGE ALIVE: PID ada belum berarti Roblox benar-benar jalan ---
         adj = await asyncio.to_thread(process_manager.get_min_oom_adj, pids)
         info["adj"] = adj
-        cached = adj is not None and adj >= WATCHDOG_CACHED_ADJ_MIN
-        in_grace = (time.time() - (info.get("last_status_at") or 0)) < WATCHDOG_POST_STATUS_GRACE_SECONDS
+        checked_at = time.time()
+        if adj is None:
+            info["_cached_ticks"] = 0
+            info["package_alive"] = None
+            info["liveness_state"] = "UNKNOWN"
+            info["last_pid_check_at"] = checked_at
+            _debug_reconcile_log(pkg, info, pids, adj, None)
+            return
+
+        cached = adj >= WATCHDOG_CACHED_ADJ_MIN
+        in_grace = (checked_at - (info.get("last_status_at") or 0)) < WATCHDOG_POST_STATUS_GRACE_SECONDS
         if cached and not in_grace:
             info["_cached_ticks"] = info.get("_cached_ticks", 0) + 1
         else:
             info["_cached_ticks"] = 0
-        package_alive = not (cached and info["_cached_ticks"] >= 1)
-        info["package_alive"] = package_alive
-        _debug_reconcile_log(pkg, info, pids, adj, package_alive)
 
-        if cached and info["_cached_ticks"] >= WATCHDOG_CACHED_TICKS_BEFORE_RECOVERY:
-            log.warning(f"[{pkg}] PID {info['pid']} MASIH ADA tapi proses CACHED (adj={adj}) "
-                        f"{info['_cached_ticks']}x berturut-turut -> Roblox tidak benar-benar jalan "
-                        f"(jendela ditutup/aplikasi di-close). Konfirmasi ulang...")
-            await asyncio.sleep(WATCHDOG_CONFIRM_DELAY_SECONDS)
-            if SESSIONS.get(pkg) is not info or info.get("status") != "ACTIVE" or pkg in _recovery_in_progress:
-                return
-            pids2 = await asyncio.to_thread(process_manager.get_pids, pkg)
-            adj2 = await asyncio.to_thread(process_manager.get_min_oom_adj, pids2) if pids2 else None
-            if pids2 and adj2 is not None and adj2 < WATCHDOG_CACHED_ADJ_MIN:
-                info["_cached_ticks"] = 0
-                info["package_alive"] = True
-                log.info(f"[{pkg}] konfirmasi: proses aktif lagi (adj={adj2}); tidak ada recovery.")
-                return
-            if pids2 is None:
-                log.warning(f"[{pkg}] konfirmasi PID gagal/ambigu; tidak memicu recovery.")
-                return
-            if SESSIONS.get(pkg) is not info or info.get("status") != "ACTIVE" or pkg in _recovery_in_progress:
-                return
-            info["_cached_ticks"] = 0
-            _recovery_in_progress.add(pkg)  # sinkron, tanpa await sejak cek lock terakhir
-            log.warning(f"[{pkg}] Package TIDAK aktif (PID cached). Triggering recovery.")
-            await _start_recovery_inline(pkg, info, "PID_CACHED")
+        if not cached:
+            info["package_alive"] = True
+            info["liveness_state"] = "ALIVE"
+            info["last_pid_check_at"] = checked_at
+            _debug_reconcile_log(pkg, info, pids, adj, True)
+            if checked_at - info.get("_last_alive_log", 0) >= WATCHDOG_ALIVE_LOG_EVERY_SECONDS:
+                info["_last_alive_log"] = checked_at
+                log.info(f"[{pkg}] PID check: ACTIVE (pid={info.get('pid')}, adj={adj}).")
             return
 
-        if time.time() - info.get("_last_alive_log", 0) >= WATCHDOG_ALIVE_LOG_EVERY_SECONDS:
-            info["_last_alive_log"] = time.time()
-            log.info(f"[{pkg}] PID check: ACTIVE (pid={info.get('pid')}, adj={adj}).")
+        # Cached process belum langsung dianggap mati. Tick awal = SUSPECTED;
+        # baru setelah threshold + recheck menjadi FALSE/CONFIRMED_CACHED.
+        info["package_alive"] = None
+        info["liveness_state"] = (
+            "CONFIRMED_CACHED"
+            if info["_cached_ticks"] >= WATCHDOG_CACHED_TICKS_BEFORE_RECOVERY
+            else "SUSPECTED_CACHED"
+        )
+        info["last_pid_check_at"] = checked_at
+        _debug_reconcile_log(pkg, info, pids, adj, None)
+
+        if info["_cached_ticks"] < WATCHDOG_CACHED_TICKS_BEFORE_RECOVERY:
+            return
+
+        log.warning(
+            f"[{pkg}] PID {info['pid']} MASIH ADA tapi proses CACHED (adj={adj}) "
+            f"{info['_cached_ticks']}x berturut-turut -> konfirmasi ulang sebelum recovery..."
+        )
+        await asyncio.sleep(WATCHDOG_CONFIRM_DELAY_SECONDS)
+        if SESSIONS.get(pkg) is not info or info.get("status") != "ACTIVE" or pkg in _recovery_in_progress:
+            return
+
+        pids2 = await asyncio.to_thread(process_manager.get_pids, pkg)
+        if pids2 is None:
+            info["pid_alive"] = None
+            info["package_alive"] = None
+            info["adj"] = None
+            info["liveness_state"] = "UNKNOWN"
+            _debug_reconcile_log(pkg, info, pids2, None, None)
+            log.warning(f"[{pkg}] konfirmasi cached gagal/ambigu; tidak memicu recovery.")
+            return
+
+        if pids2:
+            adj2 = await asyncio.to_thread(process_manager.get_min_oom_adj, pids2)
+            if adj2 is not None and adj2 < WATCHDOG_CACHED_ADJ_MIN:
+                info["pid_alive"] = True
+                info["pid"] = _pick_pid(pids2)
+                info["adj"] = adj2
+                info["package_alive"] = True
+                info["liveness_state"] = "ALIVE"
+                info["_cached_ticks"] = 0
+                info["last_pid_check_at"] = time.time()
+                _debug_reconcile_log(pkg, info, pids2, adj2, True)
+                log.info(f"[{pkg}] konfirmasi: proses aktif lagi (adj={adj2}); tidak ada recovery.")
+                return
+            if adj2 is None:
+                info["pid_alive"] = True
+                info["adj"] = None
+                info["_cached_ticks"] = 0
+                info["package_alive"] = None
+                info["liveness_state"] = "UNKNOWN"
+                _debug_reconcile_log(pkg, info, pids2, None, None)
+                log.warning(f"[{pkg}] konfirmasi cached: PID ada tetapi adj tidak terbaca; recovery ditunda.")
+                return
+
+            # PID masih ada dan tetap cached setelah konfirmasi -> confirmed dead.
+            info["pid_alive"] = True
+            info["pid"] = _pick_pid(pids2)
+            info["adj"] = adj2
+            info["package_alive"] = False
+            info["liveness_state"] = "CONFIRMED_CACHED"
+            info["last_pid_check_at"] = time.time()
+            _debug_reconcile_log(pkg, info, pids2, adj2, False)
+        else:
+            # PID hilang pada konfirmasi kedua -> confirmed dead.
+            info["pid_alive"] = False
+            info["package_alive"] = False
+            info["adj"] = None
+            info["liveness_state"] = "DEAD"
+            info["last_pid_check_at"] = time.time()
+            _debug_reconcile_log(pkg, info, pids2, None, False)
+
+        if SESSIONS.get(pkg) is not info or info.get("status") != "ACTIVE" or pkg in _recovery_in_progress:
+            return
+        info["_cached_ticks"] = 0
+        _recovery_in_progress.add(pkg)
+        log.warning(f"[{pkg}] Package TIDAK aktif setelah konfirmasi cached/dead. Triggering recovery.")
+        await _start_recovery_inline(pkg, info, "PID_CACHED")
         return
 
-    # pids == set(): tidak ada proses. Konfirmasi ulang sebelum recovery.
-    info["package_alive"] = False
+    # pids == set(): satu kali miss belum cukup untuk recovery. Selama fase
+    # konfirmasi package = UNKNOWN, bukan RUNNING dan bukan langsung DEAD.
+    info["pid_alive"] = None
+    info["package_alive"] = None
     info["adj"] = None
-    _debug_reconcile_log(pkg, info, pids, None, False)
+    info["liveness_state"] = "UNKNOWN"
+    _debug_reconcile_log(pkg, info, pids, None, None)
     log.warning(f"[{pkg}] PID check: NOT FOUND (expected pid={info.get('pid') or '-'}); konfirmasi ulang...")
     await asyncio.sleep(WATCHDOG_CONFIRM_DELAY_SECONDS)
     if SESSIONS.get(pkg) is not info or info.get("status") != "ACTIVE" or pkg in _recovery_in_progress:
         return
-    pids = await asyncio.to_thread(process_manager.get_pids, pkg)
-    if pids is None:
+
+    pids2 = await asyncio.to_thread(process_manager.get_pids, pkg)
+    if pids2 is None:
+        info["pid_alive"] = None
+        info["package_alive"] = None
+        info["adj"] = None
+        info["_cached_ticks"] = 0
+        info["liveness_state"] = "UNKNOWN"
+        _debug_reconcile_log(pkg, info, pids2, None, None)
         log.warning(f"[{pkg}] konfirmasi PID gagal/ambigu; tidak memicu recovery.")
         return
-    if pids:
+
+    if pids2:
         info["pid_alive"] = True
-        info["pid"] = _pick_pid(pids)
+        info["pid"] = _pick_pid(pids2)
+        adj2 = await asyncio.to_thread(process_manager.get_min_oom_adj, pids2)
+        info["adj"] = adj2
+        if adj2 is None:
+            info["package_alive"] = None
+            info["liveness_state"] = "UNKNOWN"
+        elif adj2 >= WATCHDOG_CACHED_ADJ_MIN:
+            info["package_alive"] = None
+            info["liveness_state"] = "SUSPECTED_CACHED"
+            # PID hilang lalu muncul lagi memutus rangkaian cached sebelumnya:
+            # mulai hitungan SUSPECTED baru dari 1.
+            info["_cached_ticks"] = 1
+        else:
+            info["package_alive"] = True
+            info["liveness_state"] = "ALIVE"
+            info["_cached_ticks"] = 0
+        info["last_pid_check_at"] = time.time()
+        _debug_reconcile_log(pkg, info, pids2, adj2, info.get("package_alive"))
         log.info(f"[{pkg}] PID muncul lagi pada konfirmasi (pid={info['pid']}); tidak ada recovery.")
         return
+
+    # Dua probe valid sama-sama tidak menemukan proses -> confirmed dead.
+    info["pid_alive"] = False
+    info["package_alive"] = False
+    info["adj"] = None
+    info["liveness_state"] = "DEAD"
+    info["last_pid_check_at"] = time.time()
+    _debug_reconcile_log(pkg, info, pids2, None, False)
     if SESSIONS.get(pkg) is not info or info.get("status") != "ACTIVE" or pkg in _recovery_in_progress:
         return
 
-    _recovery_in_progress.add(pkg)  # sinkron: tidak ada await sejak cek lock terakhir
-    log.warning(f"[{pkg}] Process appears dead (PID NOT FOUND 2x). Triggering recovery.")
+    _recovery_in_progress.add(pkg)
+    log.warning(f"[{pkg}] Process confirmed dead (PID NOT FOUND 2x). Triggering recovery.")
     await _start_recovery_inline(pkg, info, "PID_CRASH")
 
 
@@ -1431,9 +1563,17 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
             info["status"] = "ACTIVE"
             info["runtime_status"] = "RUNNING"
             info["pid"] = get_pid_quick(pkg) or "-"
-            info["pid_alive"] = info["pid"] != "-"
             info["_pid_misses"] = 0
             info["launch_count"] = info.get("launch_count", 0) + 1
+            # PID baru sudah terdeteksi, tetapi probe liveness lengkap belum
+            # dijalankan lagi. Jangan wariskan status FALSE lama sebagai state
+            # sehat; watchdog akan melakukan probe fresh berikutnya.
+            info["pid_alive"] = None
+            info["package_alive"] = None
+            info["adj"] = None
+            info["liveness_state"] = "UNKNOWN"
+            info["last_pid_check_at"] = None
+            info.pop("_cached_ticks", None)
             if info.pop("_manual_restart", False):
                 info["restart_count"] = info.get("restart_count", 0) + 1
                 info["last_restart_at"] = time.time()
@@ -1628,6 +1768,17 @@ async def reconcile_sync(expected_sessions: list, local_device_id: str) -> dict:
             )
             continue
         pid = _pick_pid(alive)
+        adj = await asyncio.to_thread(process_manager.get_min_oom_adj, alive)
+        sync_check_at = time.time()
+        if adj is None:
+            sync_package_alive = None
+            sync_liveness_state = "UNKNOWN"
+        elif adj >= WATCHDOG_CACHED_ADJ_MIN:
+            sync_package_alive = None
+            sync_liveness_state = "SUSPECTED_CACHED"
+        else:
+            sync_package_alive = True
+            sync_liveness_state = "ALIVE"
 
         expected_username = str(
             entry.get("expected_username")
@@ -1663,6 +1814,11 @@ async def reconcile_sync(expected_sessions: list, local_device_id: str) -> dict:
             "crash_count": 0,
             "status_seq": 0,
             "last_status_at": time.time(),
+            "pid_alive": True,
+            "package_alive": sync_package_alive,
+            "adj": adj,
+            "liveness_state": sync_liveness_state,
+            "last_pid_check_at": sync_check_at,
         }
 
         _ensure_username_scanner(pkg)

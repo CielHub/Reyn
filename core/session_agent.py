@@ -31,6 +31,7 @@ PHASE 8 -- prinsip SYNC_SESSIONS (lihat reconcile_sync() untuk detail):
 import asyncio
 import random
 import time
+import uuid
 
 import datetime
 
@@ -268,6 +269,7 @@ def _snapshot_for_heartbeat() -> dict:
                 pass  # tidak ada event loop berjalan (mis. pemanggilan sinkron)
         snapshot[pkg] = {
             "pid": info.get("pid", "-"),
+            "pid_start_time": info.get("pid_start_time"),
             "state": info.get("runtime_status") or info.get("status", "UNKNOWN"),
             "username": username_scanner.get_cached_username(pkg),
             "session_id": info.get("session_id", ""),
@@ -291,6 +293,7 @@ def _snapshot_for_sync() -> dict:
             "session_id": info.get("session_id", ""),
             "status": info.get("runtime_status") or info.get("status", "UNKNOWN"),
             "pid": info.get("pid", "-"),
+            "pid_start_time": info.get("pid_start_time"),
             "username": username_scanner.get_cached_username(pkg),
             "expected_username": info.get("expected_username", ""),
             "target": info.get("target", ""),
@@ -392,6 +395,7 @@ async def handle_start_session(msg: dict, local_device_id: str) -> dict:
         "adj": None,
         "liveness_state": "UNKNOWN",
         "last_pid_check_at": None,
+        "pid_start_time": None,
     }
 
     # Username scanner dimulai SEBELUM staged flow supaya heartbeat tidak
@@ -857,6 +861,40 @@ async def _username_scanner_loop(pkg: str) -> None:
             username_scanner.forget(pkg)
         log.info(f"SESSION_AGENT: username scanner berhenti untuk {pkg}.")
 
+async def _snapshot_survivor_pids(exclude_pkg: str) -> dict:
+    """Snapshot PID set package ACTIVE lain sebelum operasi target."""
+    snapshot = {}
+    for survivor_pkg, info in list(SESSIONS.items()):
+        if survivor_pkg == exclude_pkg or info.get("status") != "ACTIVE":
+            continue
+        pids = await asyncio.to_thread(process_manager.get_pids, survivor_pkg)
+        snapshot[survivor_pkg] = None if pids is None else set(pids)
+    return snapshot
+
+
+async def _verify_survivor_pids_unchanged(snapshot: dict, phase: str) -> None:
+    """Detect unexpected PID changes in packages that were not targeted."""
+    for survivor_pkg, before in snapshot.items():
+        current = await asyncio.to_thread(process_manager.get_pids, survivor_pkg)
+        if before is None or current is None:
+            log.warning(
+                f"[ISOLATION_CHECK] {phase} survivor={survivor_pkg}: "
+                "PID state UNKNOWN, tidak bisa membuktikan unchanged."
+            )
+            continue
+        current = set(current)
+        if current != before:
+            log.error(
+                f"[CROSS_PACKAGE_IMPACT] {phase} survivor={survivor_pkg}: "
+                f"PID berubah {sorted(before)} -> {sorted(current)}."
+            )
+        else:
+            log.info(
+                f"[ISOLATION_CHECK] {phase} survivor={survivor_pkg}: "
+                f"PID unchanged {sorted(current)}."
+            )
+
+
 async def _finish_kill_and_restore_survivors(
     local_device_id: str,
     session_id: str,
@@ -869,23 +907,56 @@ async def _finish_kill_and_restore_survivors(
         f"[FINISH] session={session_id} package={pkg} -- mulai stop."
     )
 
-    # PID selalu di-resolve ulang. `recorded_pid` hanya informasi diagnostik,
-    # bukan target kill yang dipercaya.
+    survivor_snapshot = await _snapshot_survivor_pids(pkg)
+
     current_pid = await asyncio.to_thread(process_manager.get_pid, pkg)
     if current_pid:
-        killed = await asyncio.to_thread(
-            process_manager.kill_pid_direct, current_pid
+        identity = await asyncio.to_thread(
+            process_manager.get_process_identity, current_pid
         )
-        if killed:
-            log.info(
-                f"[FINISH] session={session_id} package={pkg} "
-                f"pid={current_pid} -- target dipastikan mati."
+        if not identity or identity.get("package") != pkg:
+            log.error(
+                f"[PID_OWNERSHIP] {pkg}: refuse kill pid={current_pid}; "
+                "ownership tidak terverifikasi."
             )
         else:
-            log.error(
-                f"[FINISH] session={session_id} package={pkg} "
-                f"pid={current_pid} -- target gagal dipastikan mati."
+            start_time = identity.get("start_time")
+            log.info(
+                f"[PID_OWNERSHIP] {pkg}: pid={current_pid} "
+                f"start_time={start_time} ownership=VERIFIED."
             )
+            killed = await asyncio.to_thread(
+                process_manager.kill_pid_direct,
+                current_pid,
+                package=pkg,
+                expected_start_time=start_time,
+            )
+            if not killed:
+                log.warning(
+                    f"[KILL] {pkg}: pid={current_pid} SIGTERM/SIGKILL gagal; "
+                    "mencoba target-only force-stop fallback."
+                )
+                fallback = await asyncio.to_thread(
+                    process_manager.hard_force_stop,
+                    pkg,
+                    current_pid,
+                    start_time,
+                )
+                log.info(
+                    f"[FORCE_STOP_FALLBACK] {pkg}: "
+                    f"{'OK' if fallback else 'GAGAL'}."
+                )
+                killed = bool(fallback)
+            if killed:
+                log.info(
+                    f"[KILL] session={session_id} package={pkg} "
+                    f"pid={current_pid} -- target dipastikan mati."
+                )
+            else:
+                log.error(
+                    f"[KILL] session={session_id} package={pkg} "
+                    f"pid={current_pid} -- target gagal dipastikan mati."
+                )
     else:
         log.info(
             f"[FINISH] session={session_id} package={pkg} "
@@ -1366,41 +1437,89 @@ async def _error_event_consumer_loop() -> None:
 
 async def _handle_disconnect_event(event: dict) -> None:
     pid = str(event.get("pid") or "").strip()
+    pkg = str(event.get("package") or "").strip()
     reason = event.get("reason")
-    if not pid:
+    incident_id = str(event.get("incident_id") or uuid.uuid4().hex).strip()
+    event_start_time = event.get("pid_start_time")
+
+    if not pid or not pkg or event_start_time is None:
+        log.warning(
+            f"[ERROR_EVENT] drop unscoped event pid={pid or '-'} "
+            f"package={pkg or '-'} reason={reason}."
+        )
         return
 
-    for pkg, info in list(SESSIONS.items()):
-        if (
-            info.get("status") == "ACTIVE"
-            and str(info.get("pid") or "") == pid
-            and pkg not in _recovery_in_progress
-        ):
-            session_id = info.get("session_id", "")
-            # Lock + status di-set SINKRON sebelum await apa pun, supaya
-            # watchdog tidak melihat 'RECOVERING tanpa lock' lalu memulai
-            # recovery kedua untuk package yang sama (race).
-            _recovery_in_progress.add(pkg)
-            info["status"] = "RECOVERING"
-            info["runtime_status"] = "RECOVERING"
-            info["pid_alive"] = False
-            await _emit_status(
-                info.get("_device_id", ""),
-                session_id,
-                pkg,
-                info.get("order_id"),
-                "RECOVERING",
-                reason=f"LOGCAT_{reason}",
-            )
-            asyncio.create_task(
-                _run_package_recovery(
-                    pkg, session_id, f"LOGCAT_{reason}"
-                )
-            )
-            return
+    info = SESSIONS.get(pkg)
+    if info is None or info.get("status") != "ACTIVE":
+        return
+    if pkg in _recovery_in_progress:
+        return
+
+    identity = await asyncio.to_thread(
+        process_manager.get_process_identity, pid
+    )
+    if not identity:
+        log.warning(
+            f"[PID_OWNERSHIP] incident={incident_id} {pkg}: "
+            f"pid={pid} sudah tidak bisa diverifikasi; watchdog/recovery lain akan menangani."
+        )
+        return
+    if identity.get("package") != pkg:
+        log.error(
+            f"[PID_OWNERSHIP] incident={incident_id}: pid={pid} "
+            f"event_package={pkg} actual_package={identity.get('package')}; DROP."
+        )
+        return
+    if int(identity.get("start_time", -1)) != int(event_start_time):
+        log.warning(
+            f"[PID_OWNERSHIP] incident={incident_id} {pkg}: pid={pid} "
+            f"start_time berubah {event_start_time} -> {identity.get('start_time')}; DROP."
+        )
+        return
+
+    current_tracked_pid = str(info.get("pid") or "").strip()
+    if current_tracked_pid and current_tracked_pid != pid:
+        log.warning(
+            f"[ERROR_EVENT] incident={incident_id} {pkg}: event pid={pid} "
+            f"bukan PID session saat ini ({current_tracked_pid}); DROP."
+        )
+        return
+
+    session_id = info.get("session_id", "")
+    info["last_error_incident_id"] = incident_id
+    info["last_error_reason"] = reason
+    _recovery_in_progress.add(pkg)
+    info["status"] = "RECOVERING"
+    info["runtime_status"] = "RECOVERING"
+    info["pid_alive"] = False
+    log.warning(
+        f"[RECOVERY_TARGET] incident={incident_id} package={pkg} "
+        f"session={session_id} pid={pid} reason={reason} target=ONLY_THIS_PACKAGE"
+    )
+    await _emit_status(
+        info.get("_device_id", ""),
+        session_id,
+        pkg,
+        info.get("order_id"),
+        "RECOVERING",
+        reason=f"LOGCAT_{reason}",
+        incident_id=incident_id,
+        error_pid=pid,
+        error_pid_start_time=event_start_time,
+    )
+    asyncio.create_task(
+        _run_package_recovery(
+            pkg, session_id, f"LOGCAT_{reason}", incident_id=incident_id
+        )
+    )
 
 
-async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) -> None:
+async def _run_package_recovery(
+    pkg: str,
+    session_id: str,
+    trigger_reason: str,
+    incident_id: str | None = None,
+) -> None:
     def _still_current() -> bool:
         current = SESSIONS.get(pkg)
         return bool(current and current.get("session_id") == session_id)
@@ -1436,30 +1555,72 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
             if not _still_current():
                 return
 
-            # Kill TIAP PID hidup milik package ini satu per satu (get_pid
-            # lama mengembalikan string gabungan "p1 p2" kalau lebih dari
-            # satu proses). Tetap hanya PID package ini -- tidak ada global kill.
-            old_pids = set()
-            for _round in range(KILL_VERIFY_MAX_ROUNDS):
-                stale_pids = await asyncio.to_thread(process_manager.get_pids, pkg) or set()
-                if not stale_pids:
-                    break  # PID lama BENAR-BENAR sudah mati
-                old_pids |= set(stale_pids)
-                for stale_pid in sorted(stale_pids):
-                    log.info(f"[{pkg}] recovery: mematikan PID {stale_pid} sebelum relaunch.")
-                    await asyncio.to_thread(
-                        process_manager.kill_pid_direct, stale_pid
-                    )
-                    await asyncio.to_thread(
-                        process_manager.wait_until_process_dead,
-                        stale_pid, 10,
-                    )
-            else:
-                log.warning(f"[{pkg}] recovery: PID lama masih terdeteksi setelah "
-                            f"{KILL_VERIFY_MAX_ROUNDS}x kill; lanjut relaunch.")
+            survivor_snapshot = await _snapshot_survivor_pids(pkg)
 
-            if not _still_current():
-                return
+            # Resolve and kill only PIDs currently owned by this package.
+            old_pids = set()
+            stale_pids = await asyncio.to_thread(
+                process_manager.get_pids, pkg
+            )
+            if stale_pids is None:
+                log.warning(
+                    f"[PID_OWNERSHIP] {pkg}: get_pids UNKNOWN; "
+                    "recovery ditunda agar tidak men-kill PID yang tidak terverifikasi."
+                )
+                continue
+
+            for stale_pid in sorted(stale_pids):
+                identity = await asyncio.to_thread(
+                    process_manager.get_process_identity, stale_pid
+                )
+                if not identity or identity.get("package") != pkg:
+                    log.error(
+                        f"[PID_OWNERSHIP] incident={incident_id or '-'} "
+                        f"{pkg}: refuse kill pid={stale_pid}; ownership mismatch."
+                    )
+                    continue
+
+                start_time = identity.get("start_time")
+                old_pids.add(stale_pid)
+                log.info(
+                    f"[PID_OWNERSHIP] incident={incident_id or '-'} "
+                    f"{pkg}: pid={stale_pid} start_time={start_time} ownership=VERIFIED."
+                )
+
+                killed = await asyncio.to_thread(
+                    process_manager.kill_pid_direct,
+                    stale_pid,
+                    package=pkg,
+                    expected_start_time=start_time,
+                )
+                if killed:
+                    log.info(
+                        f"[KILL] incident={incident_id or '-'} "
+                        f"{pkg}: pid={stale_pid} killed=OK."
+                    )
+                    continue
+
+                log.warning(
+                    f"[KILL] incident={incident_id or '-'} "
+                    f"{pkg}: pid={stale_pid} signal kill gagal; "
+                    "mencoba target-only force-stop fallback."
+                )
+                fallback = await asyncio.to_thread(
+                    process_manager.hard_force_stop,
+                    pkg,
+                    stale_pid,
+                    start_time,
+                )
+                log.info(
+                    f"[FORCE_STOP_FALLBACK] incident={incident_id or '-'} "
+                    f"{pkg}: {'OK' if fallback else 'GAGAL'}."
+                )
+                if fallback:
+                    break
+                log.error(
+                    f"[KILL] incident={incident_id or '-'} "
+                    f"{pkg}: target pid={stale_pid} gagal dihentikan."
+                )
 
             await _emit_status(
                 info.get("_device_id", ""), session_id, pkg,
@@ -1563,6 +1724,7 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
             info["status"] = "ACTIVE"
             info["runtime_status"] = "RUNNING"
             info["pid"] = get_pid_quick(pkg) or "-"
+            info["pid_start_time"] = None
             info["_pid_misses"] = 0
             info["launch_count"] = info.get("launch_count", 0) + 1
             # PID baru sudah terdeteksi, tetapi probe liveness lengkap belum
@@ -1586,6 +1748,15 @@ async def _run_package_recovery(pkg: str, session_id: str, trigger_reason: str) 
             _ensure_error_watcher()
 
             await _activate_freeform_and_restore_siblings(pkg, session_id)
+            await _verify_survivor_pids_unchanged(
+                survivor_snapshot,
+                phase=f"recovery/{pkg}/attempt-{attempt}",
+            )
+            log.info(
+                f"[RECOVERY_COMPLETE] incident={incident_id or '-'} "
+                f"package={pkg} session={session_id} new_pid={info['pid']} "
+                "state=RUNNING."
+            )
             await _emit_status(
                 info.get("_device_id", ""), session_id, pkg,
                 info.get("order_id"), "RUNNING",
@@ -1768,6 +1939,14 @@ async def reconcile_sync(expected_sessions: list, local_device_id: str) -> dict:
             )
             continue
         pid = _pick_pid(alive)
+        pid_identity = await asyncio.to_thread(
+            process_manager.get_process_identity, pid
+        )
+        pid_start_time = (
+            pid_identity.get("start_time")
+            if pid_identity and pid_identity.get("package") == pkg
+            else None
+        )
         adj = await asyncio.to_thread(process_manager.get_min_oom_adj, alive)
         sync_check_at = time.time()
         if adj is None:
@@ -1810,6 +1989,7 @@ async def reconcile_sync(expected_sessions: list, local_device_id: str) -> dict:
             "status": internal_status,
             "runtime_status": runtime_status,
             "pid": pid,
+            "pid_start_time": pid_start_time,
             "launch_count": 1,
             "crash_count": 0,
             "status_seq": 0,

@@ -21,30 +21,79 @@ def get_pid(pkg_name):
         return ""
 
 
-def _validate_pid(pid, pkg_name):
-    """Validasi bahwa PID hasil `pidof` memang proses utama package ini dan
-    belum zombie. Return True/False; None kalau /proc tidak bisa dibaca
-    (jangan menolak PID hanya karena tidak bisa diverifikasi)."""
+def get_process_identity(pid):
+    """Return process identity for one PID.
+
+    Identity is stronger than PID existence:
+      - package is read from /proc/<pid>/cmdline and must exactly match when
+        package ownership is required.
+      - start_time is field 22 from /proc/<pid>/stat (kernel clock ticks).
+        This prevents PID-reuse races.
+    """
+    pid = str(pid).strip()
+    if not pid.isdigit():
+        return None
+
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            cmd = f.read().split(b"\x00", 1)[0].decode("utf-8", "ignore").strip()
-    except FileNotFoundError:
-        return False  # proses sudah hilang di antara pidof dan cek ini
-    except Exception:
-        return None
-    if cmd and cmd != pkg_name:
-        return False
-    try:
+            package = f.read().split(b"\x00", 1)[0].decode(
+                "utf-8", "ignore"
+            ).strip()
+
         with open(f"/proc/{pid}/stat", "rb") as f:
             stat = f.read().decode("utf-8", "ignore")
-        state = stat.rsplit(")", 1)[1].split()[0]
+
+        _, rest = stat.rsplit(")", 1)
+        fields = rest.split()
+        if len(fields) < 20:
+            return None
+
+        state = fields[0]
         if state in ("Z", "X"):
-            return False
+            return None
+
+        start_time = int(fields[19])
+        return {
+            "pid": pid,
+            "package": package,
+            "start_time": start_time,
+        }
     except FileNotFoundError:
-        return False
+        return None
+    except (ValueError, IndexError):
+        return None
     except Exception:
-        pass
+        return None
+
+
+def is_pid_owned_by_package(pid, pkg_name, expected_start_time=None):
+    """Return True only when PID ownership is proven exactly."""
+    pkg_name = str(pkg_name or "").strip()
+    if not pkg_name:
+        return False
+
+    identity = get_process_identity(pid)
+    if identity is None or identity.get("package") != pkg_name:
+        return False
+
+    if expected_start_time is not None:
+        try:
+            return int(identity["start_time"]) == int(expected_start_time)
+        except (TypeError, ValueError, KeyError):
+            return False
+
     return True
+
+
+def _validate_pid(pid, pkg_name):
+    """Validate a pidof result against exact package ownership and state."""
+    identity = get_process_identity(pid)
+    if identity is None:
+        return False
+
+    package = identity.get("package") or ""
+    return not package or package == pkg_name
+
 
 
 def get_oom_adj(pid):
@@ -252,47 +301,86 @@ def graceful_kill(pid, package=None):
 
     return not pid_exists(pid), False
 
-def kill_pid_direct(pid, verify_timeout=3.0):
-    """[FINISH LOGIC BARU] Kill SATU PID target pakai `kill` biasa (BUKAN
-    `am force-stop`) -- dipakai session_agent.handle_stop_session sebagai
-    pengganti penuh alur lama yang tidak pernah kill sama sekali.
+def _wait_until_pid_not_owned(pid, package, expected_start_time, timeout=5.0):
+    """Wait until the exact original PID identity is gone or replaced."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        identity = get_process_identity(pid)
+        if identity is None:
+            if not pid_exists(pid):
+                return True
+        else:
+            if (
+                identity.get("package") != package
+                or int(identity.get("start_time", -1)) != int(expected_start_time)
+            ):
+                return True
+        time.sleep(0.2)
+    return False
 
-    Kenapa bukan `am force-stop`: command itu operasi level Activity
-    Manager yang broadcast lebih luas dan (di host floating-window/
-    cloud-phone) bisa memicu efek visual ke package LAIN yang sama sekali
-    tidak disentuh proses/PID-nya. `kill <pid>` di sini HANYA menyentuh
-    proses tunggal pemilik PID tsb -- efek "package lain jadi
-    bubble/minimized" yang tetap mungkin terjadi adalah efek window
-    manager host terhadap floating window yang kosong, bukan hasil dari
-    proses/PID package lain ikut mati (lihat _finish_kill_and_restore_survivors
-    di session_agent.py untuk langkah pemulihannya).
 
-    Default TIDAK langsung "kill -9": kirim SIGTERM (`kill` polos) dulu,
-    baru eskalasi ke SIGKILL kalau target ternyata masih hidup setelah
-    verify_timeout -- sesuai instruksi supaya "kill -9" hanya jadi
-    fallback, bukan default.
+def kill_pid_direct(
+    pid,
+    verify_timeout=3.0,
+    package=None,
+    expected_start_time=None,
+):
+    """Kill one PID with ownership/start-time validation.
 
-    Return True kalau PID target sudah dipastikan mati (lewat pid_exists()),
-    False kalau masih hidup setelah kedua percobaan.
+    SIGTERM is attempted first, followed by SIGKILL only after re-validation.
+    When package is supplied, the function refuses to signal the PID unless
+    /proc proves exact package ownership and matching start time.
+
+    This function never performs a global kill and never calls am force-stop.
+    Callers needing the Android package-manager fallback must explicitly call
+    hard_force_stop after re-validating the target.
     """
-    if not pid:
+    pid = str(pid).strip()
+    if not pid or not pid.isdigit():
         return False
+
+    if package:
+        identity = get_process_identity(pid)
+        if identity is None or identity.get("package") != package:
+            return False
+        if expected_start_time is None:
+            expected_start_time = identity.get("start_time")
+        if not is_pid_owned_by_package(
+            pid, package, expected_start_time=expected_start_time
+        ):
+            return False
 
     subprocess.run(
         ["su", "-c", f"kill {pid}"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    if wait_until_process_dead(pid, timeout=verify_timeout):
+
+    if package:
+        if _wait_until_pid_not_owned(
+            pid, package, expected_start_time, timeout=verify_timeout
+        ):
+            return True
+    elif wait_until_process_dead(pid, timeout=verify_timeout):
         return True
 
-    # Fallback: target masih hidup setelah `kill` polos -- eskalasi ke SIGKILL.
+    if package and not is_pid_owned_by_package(
+        pid, package, expected_start_time=expected_start_time
+    ):
+        return True
+
     subprocess.run(
         ["su", "-c", f"kill -9 {pid}"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+    if package:
+        return _wait_until_pid_not_owned(
+            pid, package, expected_start_time, timeout=2.0
+        )
     return wait_until_process_dead(pid, timeout=2.0)
+
 
 
 def restore_foreground(package):
@@ -357,19 +445,44 @@ def clear_package_data(package):
     return result.returncode == 0 and "success" in output
 
 
-def hard_force_stop(package):
-    """Hard-stop a package through Android's package manager.
+def hard_force_stop(package, expected_pid=None, expected_start_time=None):
+    """Hard-stop exactly one package, optionally guarded by PID identity.
 
-    Used by the highest recovery tier only, after lighter relaunch/cache
-    attempts have failed. Returns True when the command succeeds.
+    With expected_pid, the package is force-stopped only after /proc proves
+    that PID still belongs to the exact target package and process start time.
     """
+    package = str(package or "").strip()
     if not package:
         return False
+
+    expected_pid = str(expected_pid or "").strip()
+    if expected_pid:
+        if not is_pid_owned_by_package(
+            expected_pid,
+            package,
+            expected_start_time=expected_start_time,
+        ):
+            return False
 
     result = subprocess.run(
         ["su", "-c", f"am force-stop {package}"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    return result.returncode == 0
+    if result.returncode != 0:
+        return False
 
+    if not expected_pid:
+        return True
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        pids = get_pids(package)
+        if pids == set():
+            return True
+        if pids is None:
+            time.sleep(0.2)
+            continue
+        time.sleep(0.2)
+
+    return False

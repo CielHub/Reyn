@@ -12,6 +12,9 @@ import threading
 import queue
 import re
 import time
+import uuid
+
+from core import process_manager
 
 # ==========================================================
 # EVENT QUEUE
@@ -19,7 +22,7 @@ import time
 
 _event_queue = queue.Queue()
 
-# Debounce per PID
+# Debounce per PID identity + reason.
 _last_event = {}
 
 # Lama debounce (detik)
@@ -120,20 +123,27 @@ class ErrorDetector:
                         continue
 
                     pid = pid_match.group(1)
-                    now = time.time()
-                    last = _last_event.get(pid, 0)
+                    identity = process_manager.get_process_identity(pid)
+                    # Do not enqueue an event when PID ownership cannot be proven.
+                    if not identity or not identity.get("package"):
+                        continue
 
-                    # Abaikan event PID yang sama selama debounce time
+                    reason = int(reason_match.group(1))
+                    event_key = (pid, identity["start_time"], reason)
+                    now = time.time()
+                    last = _last_event.get(event_key, 0)
                     if now - last < DEBOUNCE_SECONDS:
                         continue
 
-                    _last_event[pid] = now
-
+                    _last_event[event_key] = now
                     event = {
                         "pid": pid,
-                        "reason": int(reason_match.group(1)),
+                        "package": identity["package"],
+                        "pid_start_time": identity["start_time"],
+                        "reason": reason,
+                        "incident_id": uuid.uuid4().hex,
                         "timestamp": now,
-                        "raw": line.strip()
+                        "raw": line.strip(),
                     }
 
                     _event_queue.put(event)
@@ -181,4 +191,3 @@ def drain_events():
             _event_queue.get_nowait()
         except queue.Empty:
             break
-        

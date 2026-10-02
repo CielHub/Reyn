@@ -9,6 +9,8 @@ import re
 import subprocess
 import time
 
+from core import process_manager
+
 # LIFECYCLE REVISION (Masalah #1 -- lihat CARRERA_HUB_IMPLEMENTATION_PROMPT_V2):
 # ini SATU-SATUNYA signal negatif (kegagalan) yang dianggap reliable di
 # project ini, karena regex yang SAMA PERSIS sudah terbukti bekerja di
@@ -22,18 +24,9 @@ _DISCONNECT_REASON_PATTERN = re.compile(r"reason\s*:\s*(266|267|277|279|280)", r
 
 
 def _get_package_pids(pkg_name):
-    """Return all current PIDs for the requested package."""
-    try:
-        result = subprocess.run(
-            ['pidof', pkg_name],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            errors='replace',
-        )
-    except Exception:
-        return set()
-    return {pid for pid in (result.stdout or '').strip().split() if pid.isdigit()}
+    """Return validated current PIDs for the requested package."""
+    pids = process_manager.get_pids(pkg_name)
+    return pids if pids is not None else set()
 
 
 def _extract_logcat_pid(line):
@@ -53,15 +46,35 @@ def has_recent_disconnect_signal(pkg_name, since_time_str, timeout_seconds=3, pi
     if not tracked_pids:
         return False, None
 
-    try:
-        result = subprocess.run(
-            ['logcat', '-d', '-T', since_time_str, '-v', 'threadtime'],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            errors='replace',
+    # Prefer PID-targeted logcat so unrelated Roblox clone output does not
+    # enter the scan in the first place. Fall back for ROMs without --pid.
+    commands = []
+    if pid is not None and str(pid).strip().isdigit():
+        commands.append(
+            ['logcat', '-d', f'--pid={str(pid).strip()}', '-T', since_time_str, '-v', 'threadtime']
         )
-    except Exception:
+    commands.append(
+        ['logcat', '-d', '-T', since_time_str, '-v', 'threadtime']
+    )
+
+    result = None
+    for index, cmd in enumerate(commands):
+        try:
+            candidate = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                errors='replace',
+            )
+        except Exception:
+            continue
+        if index == 0 and candidate.returncode != 0:
+            continue
+        result = candidate
+        break
+
+    if result is None:
         return False, None
 
     for line in (result.stdout or '').splitlines():

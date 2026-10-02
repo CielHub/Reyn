@@ -1532,14 +1532,24 @@ async def reconcile_sync(expected_sessions: list, local_device_id: str) -> dict:
                 )
                 continue
 
-        pid = process_manager.get_pid(pkg)
-        if not pid:
+        # Cek PID tervalidasi + retry singkat: satu `pidof` yang meleset
+        # (timeout/transient) dulu membuat package yang MASIH HIDUP dilewati
+        # permanen -> tidak pernah dipantau watchdog -> panel "Tidak terpantau".
+        alive = None
+        for _attempt in range(3):
+            alive = await asyncio.to_thread(process_manager.get_pids, pkg)
+            if alive:
+                break
+            if _attempt < 2:
+                await asyncio.sleep(1)
+        if not alive:
             log.warning(
                 f"SESSION_AGENT: SYNC -- bot mengharapkan {pkg} "
                 f"(session {expected_session_id}) tetapi proses tidak hidup; "
                 f"TIDAK auto-launch."
             )
             continue
+        pid = _pick_pid(alive)
 
         expected_username = str(
             entry.get("expected_username")
@@ -1548,7 +1558,10 @@ async def reconcile_sync(expected_sessions: list, local_device_id: str) -> dict:
         ).strip()
         target = str(entry.get("target", "") or "").strip()
 
-        if desired_status in running:
+        if desired_status in running or desired_status == "RECOVERING":
+            # RECOVERING di DB bot + proses MASIH HIDUP di device = package
+            # efektif berjalan (task recovery lama ikut hilang bersama agent
+            # yang restart). Adopt sebagai ACTIVE supaya watchdog memantau lagi.
             internal_status = "ACTIVE"
             runtime_status = "RUNNING"
         elif desired_status in transitional:

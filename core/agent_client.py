@@ -221,12 +221,38 @@ async def _package_inventory_loop() -> None:
         await asyncio.sleep(package_inventory.INVENTORY_SCAN_INTERVAL_SECONDS)
 
 
+def _safe_snapshot_packages() -> dict:
+    """Exception saat menyusun snapshot TIDAK boleh mematikan heartbeat (dulu
+    exception di sini membunuh task heartbeat -> koneksi putus -> REGISTER
+    ulang -> packages_json direset -> panel 'Tidak terpantau'). Kalau snapshot
+    penuh gagal, kirim versi minimal: inventory + RAM."""
+    try:
+        return _snapshot_packages()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.error("AGENT: gagal menyusun snapshot heartbeat penuh; kirim versi minimal.", exc_info=True)
+    try:
+        minimal = {
+            pkg: {"pid": "-", "state": "IDLE", "runtime_status": "IDLE", "username": None}
+            for pkg in package_inventory.get_cached_packages()
+        }
+        ram = process_manager.get_ram_info()
+        if ram:
+            for entry in minimal.values():
+                entry["ram"] = ram
+        return minimal
+    except Exception:
+        log.error("AGENT: snapshot minimal juga gagal; heartbeat kosong.", exc_info=True)
+        return {}
+
+
 async def _heartbeat_loop(ws, device_id: str) -> None:
     while True:
         await ws.send(json.dumps({
             "type": "HEARTBEAT",
             "device_id": device_id,
-            "packages": _snapshot_packages(),
+            "packages": _safe_snapshot_packages(),
         }))
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
 

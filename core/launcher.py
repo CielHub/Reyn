@@ -17,7 +17,7 @@ from core.join_verifier import verify_join
 # (berhenti nunggu lebih cepat kalau sudah ada bukti kick asli), bukan sebagai
 # signal sukses.
 _FLOG_NETWORK_PATTERN = re.compile(r"\[flog::network\]", re.IGNORECASE)
-_DISCONNECT_REASON_PATTERN = re.compile(r"reason\s*:\s*(266|267|277|279|280)", re.IGNORECASE)
+_DISCONNECT_REASON_PATTERN = re.compile(r"reason\s*:\s*(266|267|277|279|280|285)", re.IGNORECASE)
 
 # Android `logcat -v threadtime` format:
 # MM-DD HH:MM:SS.mmm PID TID LEVEL TAG: message

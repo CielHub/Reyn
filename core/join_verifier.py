@@ -20,7 +20,7 @@ from core import process_manager
 # bergantung pada error_detector.py (yang punya thread/queue sendiri untuk
 # use-case berbeda) -- kalau salah satu diubah, cek juga yang satunya.
 _FLOG_NETWORK_PATTERN = re.compile(r"\[FLog::Network\]", re.IGNORECASE)
-_DISCONNECT_REASON_PATTERN = re.compile(r"reason\s*:\s*(266|267|277|279|280)", re.IGNORECASE)
+_DISCONNECT_REASON_PATTERN = re.compile(r"reason\s*:\s*(266|267|277|279|280|285)", re.IGNORECASE)
 
 
 def _get_package_pids(pkg_name):

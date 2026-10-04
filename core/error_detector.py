@@ -41,11 +41,12 @@ NETWORK_PATTERN = re.compile(
     r"\[FLog::Network\]"
 )
 
+# 285 = disconnect/error event seen in Roblox FLog::Network; treat as recoverable.
 # 287 = "Koneksi Terputus ... Server telah dimatikan" (server shutdown). Pada
 # dialog ini proses Roblox TETAP HIDUP (PID ada), jadi watchdog PID tidak bisa
 # menangkapnya -- satu-satunya sinyal adalah baris log ini.
 REASON_PATTERN = re.compile(
-    r"reason\s*:\s*(266|267|277|279|280|287)",
+    r"reason\s*:\s*(266|267|277|279|280|285|287)",
     re.IGNORECASE
 )
 

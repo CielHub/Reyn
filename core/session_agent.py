@@ -228,8 +228,13 @@ async def _sleep_or_cancel(seconds: float, cancel_event=None) -> bool:
 
 
 async def _kill_package_and_verify(pkg: str, max_rounds: int = KILL_VERIFY_MAX_ROUNDS) -> bool:
-    """Terminate every VERIFIED PID of one package and prove that package has no
-    remaining PID. Never converts an unknown probe (None) into success."""
+    """Compatibility helper for explicit terminal package cleanup only.
+
+    IMPORTANT: automatic error recovery must use `_kill_exact_pid_and_verify()`
+    and must never sweep all PIDs belonging to a package. This helper remains
+    available for START/STOP terminal cleanup paths where package-wide cleanup
+    is explicitly requested.
+    """
     pkg = str(pkg or "").strip()
     if not process_manager.is_valid_package_name(pkg):
         return False
@@ -248,9 +253,55 @@ async def _kill_package_and_verify(pkg: str, max_rounds: int = KILL_VERIFY_MAX_R
                 process_manager.kill_pid_direct,
                 pid, package=pkg, expected_start_time=identity.get("start_time")
             )
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.2)
     final = await asyncio.to_thread(process_manager.get_pids, pkg)
     return final == set()
+
+
+async def _kill_exact_pid_and_verify(pkg: str, pid: str, expected_start_time=None) -> bool:
+    """Terminate EXACTLY one process selected by the triggering recovery event.
+
+    No package-wide PID enumeration, no sibling interaction, no SIGKILL and no
+    force-stop. If the original PID is already gone, it is considered safe to
+    continue recovery because there is nothing left to terminate. If the PID
+    was reused by another process identity, refuse to touch it.
+    """
+    pkg = str(pkg or "").strip()
+    pid = str(pid or "").strip()
+    if not process_manager.is_valid_package_name(pkg) or not pid.isdigit():
+        return False
+
+    identity = await asyncio.to_thread(process_manager.get_process_identity, pid)
+    if identity is None:
+        # Target is already gone. Do NOT search for a replacement PID.
+        exists = await asyncio.to_thread(process_manager.pid_exists, pid)
+        return not exists
+
+    if identity.get("package") != pkg:
+        log.error(
+            f"[PID_OWNERSHIP] {pkg}: exact recovery pid={pid} belongs to "
+            f"{identity.get('package')!r}; refusing to kill."
+        )
+        return False
+
+    actual_start = identity.get("start_time")
+    if expected_start_time is not None:
+        try:
+            if int(actual_start) != int(expected_start_time):
+                log.warning(
+                    f"[PID_OWNERSHIP] {pkg}: exact recovery pid={pid} start_time "
+                    f"changed {expected_start_time} -> {actual_start}; refusing to kill."
+                )
+                return False
+        except (TypeError, ValueError):
+            return False
+
+    return await asyncio.to_thread(
+        process_manager.kill_pid_direct,
+        pid,
+        package=pkg,
+        expected_start_time=actual_start,
+    )
 
 
 def register_sender(callback) -> None:
@@ -727,7 +778,7 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
         if not _still_current():
             return
 
-        await _activate_freeform_and_restore_siblings(pkg, session_id)
+        await _activate_freeform_for_target(pkg, session_id)
         if not _still_current():
             return
 
@@ -757,88 +808,49 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
                 local_device_id, session_id, pkg, order_id, "UNHANDLED_EXCEPTION"
             )
 
-async def _activate_freeform_and_restore_siblings(pkg: str, session_id: str) -> None:
-    """
-    SATU-SATUNYA titik pkg diubah ke Freeform. Dipanggil setelah Roblox
-    dipastikan aktif (lobby_ok / join_status sukses -- proses SUDAH
-    launch_and_wait(..., defer_freeform=True), yaitu launch NORMAL tanpa
-    windowingMode dipaksakan saat masih transisi/splash).
+async def _activate_freeform_for_target(pkg: str, session_id: str) -> None:
+    """Best-effort Freeform activation for ONE target package.
 
-    Urutan sesuai permintaan:
-    LAUNCH NORMAL (selesai sebelum dipanggil) -> ROBLOX AKTIF (selesai
-    sebelum dipanggil) -> UBAH KE FREEFORM -> VERIFY WINDOW BENAR-BENAR
-    MUNCUL (activate_freeform() -- cek dumpsys window windows, bukan cuma
-    task/activity metadata) -> setelah target lifecycle selesai, BANGKITKAN
-    kembali package LAIN yang masih ACTIVE lewat `monkey -p <package> 1`
-    (process_manager.restore_foreground) SATU PER SATU. Restoration ini tetap
-    dijalankan walaupun activate_freeform() gagal (mis. Android 10) dan
-    murni bring-to-front, TIDAK pernah kill/restart/rejoin package lain.
+    Isolation rule: this function ONLY changes the target package's windowing
+    state. It never brings sibling packages to foreground. Survivor restoration
+    is handled separately after a target kill/recovery operation completes.
 
-    Dipanggil untuk package yang sama di lebih dari satu tahap (lobby DAN
-    setelah join target) supaya kalau ada transisi task lanjutan saat join,
-    window-nya tetap diverifikasi ulang -- idempotent & aman dipanggil
-    berkali-kali untuk package yang sama.
-
-    Gagal di sini TIDAK PERNAH menghentikan session (freeform murni
-    kosmetik/kenyamanan operator, bukan syarat validitas joki) -- cuma
-    di-log.
+    On Android 10 ``activate_freeform()`` is expected to be unavailable; that
+    is cosmetic and must never trigger any operation on another package.
     """
     try:
         ok, task_id = await asyncio.to_thread(activate_freeform, pkg)
     except Exception:
-        log.error(f"SESSION_AGENT: exception saat activate_freeform {pkg}.", exc_info=True)
+        log.error(
+            f"SESSION_AGENT: exception saat activate_freeform {pkg}.",
+            exc_info=True,
+        )
         ok, task_id = False, None
 
     current = SESSIONS.get(pkg)
     if not current or str(current.get("session_id")) != str(session_id):
         return
-    if str(current.get("status") or "").upper() in {"STOPPING", "STOPPED", "FAILED", "START_FAILED"}:
+    if str(current.get("status") or "").upper() in {
+        "STOPPING", "STOPPED", "FAILED", "START_FAILED"
+    }:
         return
 
     if not ok:
-        # Freeform support is optional. Even when this target cannot be moved
-        # into Freeform (notably Android 10), launching/closing the target may
-        # still cause Zetsu/window-manager to hide sibling windows. Survivor
-        # restoration therefore MUST continue independently of target Freeform.
         log.warning(
-            f"SESSION_AGENT: {pkg} (session {session_id}) belum kekonfirmasi "
-            "Freeform+tampil -- lanjut tanpa Freeform, tetapi tetap restore "
-            "sibling ACTIVE agar window package lain tidak hilang."
+            f"SESSION_AGENT: {pkg} (session {session_id}) Freeform tidak "
+            f"terverifikasi (taskId={task_id or '-'}); lanjut tanpa Freeform."
         )
-        was_registered = False
-    else:
-        log.info(
-            f"SESSION_AGENT: {pkg} (session {session_id}) Freeform terverifikasi "
-            f"tampil (taskId={task_id})."
-        )
-        was_registered = pkg in _FREEFORM_REGISTRY
-        _FREEFORM_REGISTRY[pkg] = {
-            "session_id": session_id, "task_id": task_id, "state": "VISIBLE"
-        }
+        return
 
-    # Sibling: package LAIN yang masih ACTIVE di SESSIONS. Restoration ini
-    # sengaja tidak bergantung pada _FREEFORM_REGISTRY supaya Android 10 /
-    # host window manager tetap bisa dipulihkan walaupun target Freeform gagal.
-    device_id = str((SESSIONS.get(pkg) or {}).get("_device_id") or "")
-    async with _get_device_restore_lock(device_id):
-        siblings = [
-            p for p, sibling_info in list(SESSIONS.items())
-            if p != pkg and sibling_info.get("status") == "ACTIVE"
-        ]
-        if not siblings:
-            return
-
-        log.info(
-            f"SESSION_AGENT: {pkg} {'re-verify' if was_registered else 'target lifecycle'} "
-            f"-- bangkitkan {len(siblings)} package sibling ACTIVE: {siblings}"
-        )
-        for sibling_pkg in siblings:
-            if sibling_pkg not in SESSIONS or SESSIONS[sibling_pkg].get("status") != "ACTIVE":
-                continue
-            restored = await asyncio.to_thread(process_manager.restore_foreground, sibling_pkg)
-            log.info(f"SESSION_AGENT: restore foreground sibling {sibling_pkg} (rotasi freeform): "
-                     f"{'OK' if restored else 'GAGAL'}")
-            await asyncio.sleep(_FREEFORM_RESTORE_STEP_DELAY_SECONDS)
+    _FREEFORM_REGISTRY[pkg] = {
+        "session_id": session_id,
+        "task_id": task_id,
+        "state": "VISIBLE",
+    }
+    log.info(
+        f"SESSION_AGENT: {pkg} (session {session_id}) Freeform terverifikasi "
+        f"tampil (taskId={task_id})."
+    )
 
 
 async def _launch_then_freeform_soon(
@@ -871,7 +883,7 @@ async def _launch_then_freeform_soon(
         if not await _sleep_or_cancel(FREEFORM_ACTIVATION_DELAY_SECONDS, cancel_event):
             return
         try:
-            await _activate_freeform_and_restore_siblings(pkg, session_id)
+            await _activate_freeform_for_target(pkg, session_id)
         except Exception:
             log.error(
                 f"SESSION_AGENT: exception freeform timer {pkg}.",
@@ -1285,7 +1297,15 @@ async def handle_restart_package(msg: dict, local_device_id: str) -> dict:
     info["pid_alive"] = False
     log.info(f"[{pkg}] MANUAL_RESTART diminta (PID lama: {info.get('pid') or '-'}). "
              "Hanya package ini yang diproses.")
-    task = asyncio.create_task(_run_package_recovery(pkg, session_id, "MANUAL_RESTART"))
+    task = asyncio.create_task(
+        _run_package_recovery(
+            pkg,
+            session_id,
+            "MANUAL_RESTART",
+            target_pid=str(info.get("pid") or "").strip(),
+            target_pid_start_time=info.get("pid_start_time"),
+        )
+    )
     _restart_tasks.add(task)
     task.add_done_callback(_restart_tasks.discard)
     return _result(True, "RESTART_STARTED")
@@ -1479,7 +1499,10 @@ async def _watchdog_tick(pkg: str, info: dict) -> None:
                 log.warning(f"[{pkg}] konfirmasi cached: PID ada tetapi adj tidak terbaca; recovery ditunda.")
                 return
 
-            # PID masih ada dan tetap cached setelah konfirmasi -> confirmed dead.
+            # PID masih ada dan tetap cached setelah konfirmasi. Jangan menganggap
+            # kondisi ini sebagai crash: pada Android/Zetsu, sibling window dapat
+            # masuk cached state akibat operasi package lain. Auto-recovery di sini
+            # akan menyentuh sibling dan melanggar isolation.
             info["pid_alive"] = True
             info["pid"] = _pick_pid(pids2)
             info["adj"] = adj2
@@ -1487,6 +1510,11 @@ async def _watchdog_tick(pkg: str, info: dict) -> None:
             info["liveness_state"] = "CONFIRMED_CACHED"
             info["last_pid_check_at"] = time.time()
             _debug_reconcile_log(pkg, info, pids2, adj2, False)
+            log.warning(
+                f"[{pkg}] proses tetap CACHED setelah konfirmasi; "
+                "auto-recovery dilewati untuk menjaga package isolation."
+            )
+            return
         else:
             # PID hilang pada konfirmasi kedua -> confirmed dead.
             info["pid_alive"] = False
@@ -1500,8 +1528,8 @@ async def _watchdog_tick(pkg: str, info: dict) -> None:
             return
         info["_cached_ticks"] = 0
         _recovery_in_progress.add(pkg)
-        log.warning(f"[{pkg}] Package TIDAK aktif setelah konfirmasi cached/dead. Triggering recovery.")
-        await _start_recovery_inline(pkg, info, "PID_CACHED")
+        log.warning(f"[{pkg}] Process confirmed dead (PID NOT FOUND 2x). Triggering recovery.")
+        await _start_recovery_inline(pkg, info, "PID_CRASH")
         return
 
     # pids == set(): satu kali miss belum cukup untuk recovery. Selama fase
@@ -1671,6 +1699,10 @@ async def _handle_disconnect_event(event: dict) -> None:
         return
 
     session_id = info.get("session_id", "")
+    # Pin the recovery to the exact process that emitted the error. This is
+    # stronger than re-enumerating every PID of the package later.
+    info["pid"] = pid
+    info["pid_start_time"] = event_start_time
     info["last_error_incident_id"] = incident_id
     info["last_error_reason"] = reason
     _recovery_in_progress.add(pkg)
@@ -1694,7 +1726,12 @@ async def _handle_disconnect_event(event: dict) -> None:
     )
     asyncio.create_task(
         _run_package_recovery(
-            pkg, session_id, f"LOGCAT_{reason}", incident_id=incident_id
+            pkg,
+            session_id,
+            f"LOGCAT_{reason}",
+            incident_id=incident_id,
+            target_pid=pid,
+            target_pid_start_time=event_start_time,
         )
     )
 
@@ -1704,6 +1741,8 @@ async def _run_package_recovery(
     session_id: str,
     trigger_reason: str,
     incident_id: str | None = None,
+    target_pid: str | None = None,
+    target_pid_start_time=None,
 ) -> None:
     cancel_event = _start_cancel_events.get(pkg)
 
@@ -1763,61 +1802,45 @@ async def _run_package_recovery(
             if not _still_current():
                 return
 
-            survivor_snapshot = await _snapshot_survivor_pids(pkg)
-            if not _still_current():
-                return
-
-            # Resolve and kill only PIDs currently owned by this package.
-            old_pids = set()
-            stale_pids = await asyncio.to_thread(
-                process_manager.get_pids, pkg
+            # ERROR RECOVERY: kill exactly the PID that produced the event (or
+            # the session's currently tracked PID for watchdog/manual recovery).
+            # NEVER enumerate and kill all PIDs for the package.
+            old_pid = str(info.get("pid") or "").strip()
+            old_pids = {old_pid} if manual and old_pid.isdigit() else set()
+            recovery_pid = str(target_pid or old_pid).strip()
+            recovery_start_time = (
+                target_pid_start_time
+                if target_pid_start_time is not None
+                else info.get("pid_start_time")
             )
-            if not _still_current():
-                return
-            if stale_pids is None:
-                log.warning(
-                    f"[PID_OWNERSHIP] {pkg}: get_pids UNKNOWN; "
-                    "recovery ditunda agar tidak men-kill PID yang tidak terverifikasi."
-                )
-                continue
 
-            for stale_pid in sorted(stale_pids):
-                if not _still_current():
-                    return
-                identity = await asyncio.to_thread(
-                    process_manager.get_process_identity, stale_pid
-                )
-                if not identity or identity.get("package") != pkg:
-                    log.error(
-                        f"[PID_OWNERSHIP] incident={incident_id or '-'} "
-                        f"{pkg}: refuse kill pid={stale_pid}; ownership mismatch."
-                    )
-                    continue
-
-                start_time = identity.get("start_time")
-                old_pids.add(stale_pid)
+            if recovery_pid and recovery_pid.isdigit():
                 log.info(
-                    f"[PID_OWNERSHIP] incident={incident_id or '-'} "
-                    f"{pkg}: pid={stale_pid} start_time={start_time} ownership=VERIFIED."
+                    f"[RECOVERY_TARGET] incident={incident_id or '-'} {pkg}: "
+                    f"exact_pid={recovery_pid} start_time={recovery_start_time or '-'}; "
+                    "zero-touch sibling."
                 )
-
-                killed = await asyncio.to_thread(
-                    process_manager.kill_pid_direct,
-                    stale_pid,
-                    package=pkg,
-                    expected_start_time=start_time,
+                killed = await _kill_exact_pid_and_verify(
+                    pkg, recovery_pid, recovery_start_time
                 )
-                if killed:
-                    log.info(
-                        f"[KILL] incident={incident_id or '-'} "
-                        f"{pkg}: pid={stale_pid} killed=OK."
+                if not killed:
+                    log.error(
+                        f"[KILL] incident={incident_id or '-'} {pkg}: "
+                        f"exact pid={recovery_pid} gagal dihentikan dengan SIGTERM. "
+                        "Tidak memilih PID lain, tidak SIGKILL, tidak force-stop."
                     )
                     continue
-
-                log.error(
-                    f"[KILL] incident={incident_id or '-'} "
-                    f"{pkg}: pid={stale_pid} gagal dihentikan setelah ownership-checked SIGTERM; "
-                    "TIDAK memakai am force-stop agar tidak memberi efek samping ke sibling/window manager."
+                log.info(
+                    f"[KILL] incident={incident_id or '-'} {pkg}: "
+                    f"exact pid={recovery_pid} killed=OK."
+                )
+            else:
+                # Process is already gone or watchdog has no trustworthy PID.
+                # Recovery may relaunch the target, but it must not guess another
+                # process to kill.
+                log.info(
+                    f"[RECOVERY_TARGET] incident={incident_id or '-'} {pkg}: "
+                    "no exact PID available; launch-only recovery, zero-touch sibling."
                 )
 
             if not _still_current():
@@ -1957,19 +1980,10 @@ async def _run_package_recovery(
             _ensure_username_scanner(pkg)
             _ensure_error_watcher()
 
-            # Survivor restoration MUST NOT depend on target Freeform success.
-            # Android 10 is intentionally outside activate_freeform(), while
-            # Zetsu/window-manager may still hide sibling windows when the target
-            # package is killed. Restore each survivor independently and verify
-            # its PID set.
-            await _restore_survivors_after_target_operation(
-                info.get("_device_id", ""),
-                pkg,
-                survivor_snapshot,
-                phase=f"recovery/{pkg}/attempt-{attempt}",
-            )
-            if not _still_current():
-                return
+            # Error recovery owns the TARGET package only. It must never issue
+            # commands to sibling packages, including foreground/restore actions.
+            # Any sibling window/process impact is logged by the watchdog/diagnostic
+            # layer and is deliberately not repaired from this recovery task.
             log.info(
                 f"[RECOVERY_COMPLETE] incident={incident_id or '-'} "
                 f"package={pkg} session={session_id} new_pid={info['pid']} "

@@ -473,10 +473,13 @@ def clear_package_data(package):
 
 
 def hard_force_stop(package, expected_pid=None, expected_start_time=None):
-    """Hard-stop exactly one package, optionally guarded by PID identity.
+    """Explicit emergency stop for exactly one package.
 
-    With expected_pid, the package is force-stopped only after /proc proves
-    that PID still belongs to the exact target package and process start time.
+    IMPORTANT: normal session/recovery flows MUST NOT use this helper.
+    Android's ActivityManager/package-manager stop can have ROM/window-manager
+    side effects around floating/clone environments. Keep it available only for
+    an explicit operator action after normal ownership-checked SIGTERM/SIGKILL
+    has failed and the operator accepts those platform-level side effects.
     """
     package = str(package or "").strip()
     if not is_valid_package_name(package):

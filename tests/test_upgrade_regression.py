@@ -61,3 +61,92 @@ class UpgradeRegressionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class IsolationRegressionTests(unittest.TestCase):
+    def test_restore_helper_excludes_target_and_restores_active_survivor(self):
+        async def scenario():
+            from core import session_agent
+            calls = []
+            old_sessions = session_agent.SESSIONS.copy()
+            old_restore = session_agent.process_manager.restore_foreground
+            old_get_pids = session_agent.process_manager.get_pids
+            try:
+                session_agent.SESSIONS.clear()
+                session_agent.SESSIONS.update({
+                    'pkg.target': {'session_id': 's1', 'status': 'RECOVERING', '_device_id': 'D'},
+                    'pkg.survivor': {'session_id': 's2', 'status': 'ACTIVE', '_device_id': 'D'},
+                })
+
+                session_agent.process_manager.restore_foreground = lambda pkg: calls.append(('restore', pkg)) or True
+                session_agent.process_manager.get_pids = lambda pkg: {'200'}
+
+                await session_agent._restore_survivors_after_target_operation(
+                    'D', 'pkg.target', {'pkg.target': {'100'}, 'pkg.survivor': {'200'}}, 'test'
+                )
+            finally:
+                session_agent.process_manager.restore_foreground = old_restore
+                session_agent.process_manager.get_pids = old_get_pids
+                session_agent.SESSIONS.clear()
+                session_agent.SESSIONS.update(old_sessions)
+
+            self.assertEqual(calls, [('restore', 'pkg.survivor')])
+
+        asyncio.run(scenario())
+
+
+    def test_dead_survivor_is_not_relaunched_during_restore(self):
+        async def scenario():
+            from core import session_agent
+            calls = []
+            old_sessions = session_agent.SESSIONS.copy()
+            old_restore = session_agent.process_manager.restore_foreground
+            old_get_pids = session_agent.process_manager.get_pids
+            try:
+                session_agent.SESSIONS.clear()
+                session_agent.SESSIONS.update({
+                    'pkg.target': {'session_id': 's1', 'status': 'RECOVERING', '_device_id': 'D'},
+                    'pkg.survivor': {'session_id': 's2', 'status': 'ACTIVE', '_device_id': 'D'},
+                })
+                session_agent.process_manager.restore_foreground = lambda pkg: calls.append(pkg) or True
+                session_agent.process_manager.get_pids = lambda pkg: set()
+
+                await session_agent._restore_survivors_after_target_operation(
+                    'D', 'pkg.target', {'pkg.survivor': {'200'}}, 'test-dead'
+                )
+            finally:
+                session_agent.process_manager.restore_foreground = old_restore
+                session_agent.process_manager.get_pids = old_get_pids
+                session_agent.SESSIONS.clear()
+                session_agent.SESSIONS.update(old_sessions)
+
+            self.assertEqual(calls, [])
+
+        asyncio.run(scenario())
+
+    def test_freeform_failure_still_restores_active_sibling(self):
+        async def scenario():
+            from core import session_agent
+            calls = []
+            old_sessions = session_agent.SESSIONS.copy()
+            old_activate = session_agent.activate_freeform
+            old_restore = session_agent.process_manager.restore_foreground
+            old_sleep = session_agent.asyncio.sleep
+            try:
+                session_agent.SESSIONS.clear()
+                session_agent.SESSIONS.update({
+                    'pkg.target': {'session_id': 's1', 'status': 'STARTING', '_device_id': 'D'},
+                    'pkg.survivor': {'session_id': 's2', 'status': 'ACTIVE', '_device_id': 'D'},
+                })
+                session_agent.activate_freeform = lambda pkg: (False, None)
+                session_agent.process_manager.restore_foreground = lambda pkg: calls.append(pkg) or True
+
+                await session_agent._activate_freeform_and_restore_siblings('pkg.target', 's1')
+            finally:
+                session_agent.activate_freeform = old_activate
+                session_agent.process_manager.restore_foreground = old_restore
+                session_agent.SESSIONS.clear()
+                session_agent.SESSIONS.update(old_sessions)
+
+            self.assertEqual(calls, ['pkg.survivor'])
+
+        asyncio.run(scenario())

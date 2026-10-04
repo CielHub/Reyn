@@ -242,89 +242,30 @@ def wait_until_process_dead(pid, timeout=5.0):
     return False
 
 def graceful_kill(pid, package=None):
-    """Kill SATU proses (pid) secara bertahap: SIGTERM -> SIGKILL -> (last
-    resort) `am force-stop` kalau proses masih bertahan.
+    """Terminate exactly one PID with SIGTERM (`kill -15`).
 
-    LIFECYCLE REVISION (Masalah #2, lihat CARRERA_HUB_IMPLEMENTATION_PROMPT_V2):
-    audit isolasi package/session (session_agent.handle_stop_session ->
-    sini) sudah dikonfirmasi BENAR -- fungsi ini SELALU dipanggil dengan PID
-    spesifik hasil resolve TERBARU untuk SATU package, tidak pernah pid/nama
-    package gabungan. `kill -15`/`kill -9` di atas PID tunggal TIDAK bisa
-    menyentuh proses package lain.
+    The client intentionally does NOT escalate to a hard kill or `am force-stop`.
+    On the target Android 10 / clone environment, SIGTERM has been verified
+    manually to stop only the targeted Roblox clone while leaving sibling
+    packages alive. If the process refuses to exit, return False so the
+    caller can decide how to handle the failure without risking sibling
+    termination.
 
-    Satu-satunya langkah di sini yang punya jangkauan LEBIH LUAS dari sekadar
-    "matikan proses ini" adalah `am force-stop {package}` (STEP 3) -- ini
-    operasi level Activity Manager Android (bukan sekadar kill), yang juga
-    membersihkan task stack/service/alarm milik package tsb dan memicu
-    broadcast sistem. Di lingkungan floating-window/cloud-phone, broadcast
-    inilah yang paling mungkin membuat window package LAIN (yang sama sekali
-    tidak disentuh proses/PID-nya) ikut ter-refresh/minimize oleh host
-    window manager -- ini limitasi HOST, bukan cross-package kill di kode
-    ini (lihat catatan [WINDOW] di session_agent.py).
-
-    Karena itu, force-stop SENGAJA dibuat seketat mungkin sebagai upaya
-    terakhir: re-verifikasi proses masih hidup lewat DUA cara independen
-    (kill -0 DAN pidof) plus jeda tambahan, supaya tidak eskalasi ke
-    force-stop kalau SIGKILL sebenarnya sudah berhasil tapi belum
-    kebaca cepat oleh satu metode cek saja.
-
-    Return: (killed: bool, used_force_stop: bool) -- used_force_stop dipakai
-    caller untuk log [WINDOW] kalau limitasi host di atas kemungkinan
-    kena trigger.
+    Return: (killed: bool, used_force_stop: bool). The second value is kept
+    for backward compatibility and is always False.
     """
-    if not pid:
+    pid = str(pid or "").strip()
+    if not pid.isdigit():
         return False, False
 
-    # ====================================================
-    # STEP 1: SIGTERM
-    # ====================================================
     subprocess.run(
         ["su", "-c", f"kill -15 {pid}"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
 
-    for _ in range(35):      # Tunggu sampai maksimal 7 detik
-        if not pid_exists(pid):
-            return True, False
-        time.sleep(0.2)
-
-    # ====================================================
-    # STEP 2: SIGKILL
-    # ====================================================
-    subprocess.run(
-        ["su", "-c", f"kill -9 {pid}"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    for _ in range(10):
-        if not pid_exists(pid):
-            return True, False
-        time.sleep(0.2)
-
-    # Cek independen kedua (/proc/<pid>, bukan cuma kill -0) + jeda kecil
-    # sebelum eskalasi -- mengurangi false-trigger ke force-stop kalau
-    # SIGKILL sebenarnya sudah berhasil tapi belum kebaca cepat oleh satu
-    # metode saja.
-    time.sleep(0.5)
-    if not pid_exists(pid) and not _proc_dir_exists(pid):
-        return True, False
-
-    # ====================================================
-    # STEP 3: Fallback (am force-stop) -- LAST RESORT, lihat catatan di
-    # docstring soal potensi efek samping window package lain di host.
-    # ====================================================
-    if package:
-        subprocess.run(
-            ["su", "-c", f"am force-stop {shlex.quote(package)}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        time.sleep(1)
-        return (not pid_exists(pid)), True
-
-    return not pid_exists(pid), False
+    killed = wait_until_process_dead(pid, timeout=7.0)
+    return killed, False
 
 def _wait_until_pid_not_owned(pid, package, expected_start_time, timeout=5.0):
     """Wait until the exact original PID identity is gone or replaced."""
@@ -346,25 +287,28 @@ def _wait_until_pid_not_owned(pid, package, expected_start_time, timeout=5.0):
 
 def kill_pid_direct(
     pid,
-    verify_timeout=3.0,
+    verify_timeout=7.0,
     package=None,
     expected_start_time=None,
 ):
-    """Kill one PID with ownership/start-time validation.
+    """Kill one PID using SIGTERM (`kill -15`) only.
 
-    SIGTERM is attempted first, followed by SIGKILL only after re-validation.
-    When package is supplied, the function refuses to signal the PID unless
-    /proc proves exact package ownership and matching start time.
+    Ownership/start-time validation is performed before signaling when a
+    package is supplied. There is intentionally NO hard-kill fallback and NO
+    `am force-stop` fallback because hard-killing a Roblox clone on the target
+    Android 10 environment has been observed to affect sibling clones.
 
-    This function never performs a global kill and never calls am force-stop.
-    Callers needing the Android package-manager fallback must explicitly call
-    hard_force_stop after re-validating the target.
+    Returns True only when the exact PID is gone/replaced by a different
+    process identity within the verification timeout.
     """
-    pid = str(pid).strip()
+    pid = str(pid or "").strip()
     if not pid or not pid.isdigit():
         return False
 
     if package:
+        package = str(package).strip()
+        if not is_valid_package_name(package):
+            return False
         identity = get_process_identity(pid)
         if identity is None or identity.get("package") != package:
             return False
@@ -376,37 +320,16 @@ def kill_pid_direct(
             return False
 
     subprocess.run(
-        ["su", "-c", f"kill {pid}"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    if package:
-        if _wait_until_pid_not_owned(
-            pid, package, expected_start_time, timeout=verify_timeout
-        ):
-            return True
-    elif wait_until_process_dead(pid, timeout=verify_timeout):
-        return True
-
-    if package and not is_pid_owned_by_package(
-        pid, package, expected_start_time=expected_start_time
-    ):
-        return True
-
-    subprocess.run(
-        ["su", "-c", f"kill -9 {pid}"],
+        ["su", "-c", f"kill -15 {pid}"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
 
     if package:
         return _wait_until_pid_not_owned(
-            pid, package, expected_start_time, timeout=2.0
+            pid, package, expected_start_time, timeout=verify_timeout
         )
-    return wait_until_process_dead(pid, timeout=2.0)
-
-
+    return wait_until_process_dead(pid, timeout=verify_timeout)
 
 def restore_foreground(package):
     """[FINISH LOGIC BARU] Bawa SATU package floating-window yang masih
@@ -445,14 +368,14 @@ def clear_package_data(package):
     clear-data (data/login/progress package tetap utuh). Fungsi ini
     dibiarkan ada (tidak dipakai caller manapun saat ini) untuk kebutuhan
     lain di masa depan yang memang butuh clear-data eksplisit -- HANYA
-    SETELAH proses package tsb dipastikan mati lewat graceful_kill() +
+    SETELAH proses package tsb dipastikan mati lewat kill_pid_direct() +
     verifikasi tambahan di pemanggil (jangan pernah clear-data proses yang
     masih hidup -- state package saat itu tidak terdefinisi).
 
     Scoped ke SATU package by design: `pm clear <package>` Android hanya
     menerima satu nama package persis, tidak ada bentuk wildcard/global di
     command ini -- tidak ada jalur di fungsi ini yang bisa menyentuh
-    package lain, sama seperti graceful_kill() di atas.
+    package lain, sama seperti kill_pid_direct() di atas.
 
     Return True hanya kalau PackageManager benar-benar melaporkan sukses
     (returncode 0 DAN output mengandung 'Success') -- returncode 0 saja
@@ -478,7 +401,7 @@ def hard_force_stop(package, expected_pid=None, expected_start_time=None):
     IMPORTANT: normal session/recovery flows MUST NOT use this helper.
     Android's ActivityManager/package-manager stop can have ROM/window-manager
     side effects around floating/clone environments. Keep it available only for
-    an explicit operator action after normal ownership-checked SIGTERM/SIGKILL
+    an explicit operator action after normal ownership-checked SIGTERM
     has failed and the operator accepts those platform-level side effects.
     """
     package = str(package or "").strip()

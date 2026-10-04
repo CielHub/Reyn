@@ -1816,7 +1816,7 @@ async def _run_package_recovery(
 
                 log.error(
                     f"[KILL] incident={incident_id or '-'} "
-                    f"{pkg}: pid={stale_pid} gagal dihentikan setelah ownership-checked SIGTERM/SIGKILL; "
+                    f"{pkg}: pid={stale_pid} gagal dihentikan setelah ownership-checked SIGTERM; "
                     "TIDAK memakai am force-stop agar tidak memberi efek samping ke sibling/window manager."
                 )
 

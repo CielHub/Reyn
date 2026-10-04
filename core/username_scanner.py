@@ -72,6 +72,30 @@ def _warn_throttled(pkg: str, msg: str, **kw) -> None:
         log.warning(msg, **kw)
 
 
+def scan_username_result_blocking(pkg_name):
+    """Return a structured result from the same canonical scanner/cache path.
+
+    ``read_ok`` refers to the latest filesystem read, not whether a cached
+    username exists. This lets callers distinguish a fresh verified identity
+    from a temporary read failure.
+    """
+    username = scan_username_blocking(pkg_name)
+    entry = dict(_cache.get(pkg_name) or {})
+    return {
+        "username": entry.get("username") if entry.get("read_ok") else None,
+        "read_ok": bool(entry.get("read_ok")),
+        "scanned_at": float(entry.get("scanned_at") or time.time()),
+    }
+
+def get_cached_identity(pkg: str) -> dict:
+    """Cheap heartbeat-safe read of the latest username verification state."""
+    entry = dict(_cache.get(pkg) or {})
+    return {
+        "username": entry.get("username"),
+        "read_ok": bool(entry.get("read_ok")),
+        "scanned_at": float(entry.get("scanned_at") or 0),
+    }
+
 def scan_username_blocking(pkg: str):
     """Baca username Roblox yang sedang login dan update cache lokal.
 

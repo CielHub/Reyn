@@ -11,6 +11,7 @@ SESSION_STATUS tidak pernah mengirim lewat websocket stale.
 import asyncio
 import json
 import threading
+import time
 
 try:
     import websockets
@@ -39,6 +40,8 @@ _agent_state = {"status": "OFFLINE", "device_id": "", "reason": ""}
 # Hanya websocket generation terbaru yang boleh dipakai sender runtime.
 _connection_generation = 0
 _active_ws = None
+_COMMAND_RESULT_CACHE = {}
+_COMMAND_RESULT_CACHE_TTL = 600
 
 
 def set_stats_reference(stats: dict) -> None:
@@ -103,11 +106,28 @@ _COMMAND_HANDLERS = {
 
 
 async def _handle_incoming_command(ws, msg: dict, device_id: str, task_registry: set) -> None:
-    msg_type = msg.get("type")
+    msg_type = str(msg.get("type") or "").strip()
     handler = _COMMAND_HANDLERS.get(msg_type)
     if not handler:
         log.info(f"AGENT: command '{msg_type}' belum didukung, diabaikan.")
         return
+
+    command_id = str(msg.get("command_id") or "").strip()[:128]
+    now = time.time() if 'time' in globals() else None
+    if command_id:
+        cached = _COMMAND_RESULT_CACHE.get(command_id)
+        if cached and now and now - cached[0] < _COMMAND_RESULT_CACHE_TTL:
+            try:
+                await ws.send(json.dumps(cached[1]))
+            except Exception:
+                pass
+            return
+        # ACK is deliberately sent before execution so the server knows the
+        # command was accepted even when the worker takes a long time.
+        try:
+            await ws.send(json.dumps({"type":"COMMAND_ACK","device_id":device_id,"command_id":command_id}))
+        except Exception:
+            pass
 
     try:
         result = await handler(msg, device_id)
@@ -115,9 +135,22 @@ async def _handle_incoming_command(ws, msg: dict, device_id: str, task_registry:
         raise
     except Exception:
         log.error(f"AGENT: exception saat proses command '{msg_type}'.", exc_info=True)
-        return
+        result = {
+            "type":"COMMAND_RESULT","command":msg_type,"device_id":device_id,
+            "session_id":msg.get("session_id"),"package_name":msg.get("package_name"),
+            "ok":False,"reason":"UNHANDLED_EXCEPTION",
+        }
 
     if result:
+        if command_id:
+            result = dict(result)
+            result["command_id"] = command_id
+            if now:
+                _COMMAND_RESULT_CACHE[command_id] = (now, result)
+                cutoff = now - _COMMAND_RESULT_CACHE_TTL
+                for key, value in list(_COMMAND_RESULT_CACHE.items()):
+                    if value[0] < cutoff:
+                        _COMMAND_RESULT_CACHE.pop(key, None)
         try:
             await ws.send(json.dumps(result))
         except asyncio.CancelledError:

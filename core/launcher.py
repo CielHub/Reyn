@@ -8,6 +8,7 @@ import subprocess
 import time
 import datetime
 import select
+import shlex
 from core.logger import log
 from core.join_verifier import verify_join
 
@@ -98,7 +99,7 @@ def _run_shell(args, use_su=False, timeout=10):
     """Jalankan satu command shell, opsional lewat `su -c "..."` (device sudah root)."""
     try:
         if use_su:
-            joined = " ".join(args)
+            joined = shlex.join([str(arg) for arg in args])
             return subprocess.run(['su', '-c', joined], capture_output=True, text=True,
                                    errors='replace', timeout=timeout)
         return subprocess.run(args, capture_output=True, text=True, errors='replace', timeout=timeout)
@@ -677,7 +678,7 @@ def launch_normal(pkg_name, intent_url):
     return True, start_time_str
 
 
-def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_join_signal=False):
+def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_join_signal=False, cancel_event=None):
     """Smart Wait -- DIPISAH dari launch_normal() (lihat docstring-nya) supaya
     bisa dijalankan BERBARENGAN dengan aktivasi Freeform lewat timer, bukan
     jadi syarat sebelum Freeform boleh diaktifkan. Isi logika Smart
@@ -714,6 +715,9 @@ def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_jo
 
     try:
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                log.info(f"SMART WAIT: {pkg_name} dibatalkan oleh lifecycle STOP.")
+                return ("FAILED", "CANCELLED") if require_join_signal else False
             elapsed = time.time() - start_time
             if elapsed >= timeout_seconds:
                 log.warning(f"FALLBACK: Logcat timeout. Menggunakan Dumb Wait untuk {pkg_name}.")
@@ -817,9 +821,9 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     FIX (Lobby-trigger tidak sampai ke app): `am start` di bawah SELALU
     memakai `--activity-single-top`. Tanpa flag ini, kalau activity package
     kebetulan SUDAH di posisi paling atas (mis. package masih di tengah
-    game saat di-trigger balik ke Lobby), Android hanya membalas "brought
-    to the front" TANPA pernah mengirim intent-nya ke app (onNewIntent()
-    tidak terpanggil) -- akibatnya Roblox tidak pernah tahu ada perintah
+    game saat di-trigger balik ke Lobby), Android hanya membalas "brought to
+    the front" TANPA pernah mengirim intent-nya ke app (onNewIntent() tidak
+    terpanggil) -- akibatnya Roblox tidak pernah tahu ada perintah
     `roblox://` baru dan tetap diam di layar lama, padahal verify_join()
     (cuma cek proses hidup + foreground) tetap melaporkan sukses (false
     positive). Dengan flag ini, intent TETAP dikirim lewat onNewIntent()
@@ -1068,5 +1072,3 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     log.warning(f"[VERIFY] {pkg_name}: proses hidup (pid={final_pid}), tidak ada keyword join "
                 f"MAUPUN bukti kegagalan dalam {timeout_seconds}s -- UNCERTAIN, perlu grace-check.")
     return ("UNCERTAIN", "NO_JOIN_SIGNAL_TIMEOUT")
-
-    

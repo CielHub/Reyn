@@ -821,9 +821,9 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     FIX (Lobby-trigger tidak sampai ke app): `am start` di bawah SELALU
     memakai `--activity-single-top`. Tanpa flag ini, kalau activity package
     kebetulan SUDAH di posisi paling atas (mis. package masih di tengah
-    game saat di-trigger balik ke Lobby), Android hanya membalas "brought to
-    the front" TANPA pernah mengirim intent-nya ke app (onNewIntent() tidak
-    terpanggil) -- akibatnya Roblox tidak pernah tahu ada perintah
+    game saat di-trigger balik ke Lobby), Android hanya membalas "brought
+    to the front" TANPA pernah mengirim intent-nya ke app (onNewIntent()
+    tidak terpanggil) -- akibatnya Roblox tidak pernah tahu ada perintah
     `roblox://` baru dan tetap diam di layar lama, padahal verify_join()
     (cuma cek proses hidup + foreground) tetap melaporkan sukses (false
     positive). Dengan flag ini, intent TETAP dikirim lewat onNewIntent()
@@ -1072,3 +1072,5 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     log.warning(f"[VERIFY] {pkg_name}: proses hidup (pid={final_pid}), tidak ada keyword join "
                 f"MAUPUN bukti kegagalan dalam {timeout_seconds}s -- UNCERTAIN, perlu grace-check.")
     return ("UNCERTAIN", "NO_JOIN_SIGNAL_TIMEOUT")
+
+    

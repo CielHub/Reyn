@@ -63,10 +63,21 @@ def load_config(config_path="config.conf"):
 
 
 def save_config(config_data, config_path="config.conf"):
-    with open(config_path, 'w') as f:
+    directory = os.path.dirname(os.path.abspath(config_path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    temp_path = config_path + ".tmp"
+    with open(temp_path, 'w', encoding='utf-8') as f:
         for key, value in config_data.items():
             if isinstance(value, str):
-                f.write(f'{key}="{value}"\n')
+                escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                f.write(f'{key}="{escaped}"\n')
             else:
                 f.write(f'{key}={value}\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_path, config_path)
+    try:
+        os.chmod(config_path, 0o600)
+    except OSError:
+        pass
     log.info("CONFIG: Konfigurasi berhasil disimpan.")

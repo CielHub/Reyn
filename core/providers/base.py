@@ -25,4 +25,3 @@ class BaseUpdateProvider(ABC):
         Mengeksekusi proses update secara aman dan mengembalikan hasilnya.
         """
         pass
-      

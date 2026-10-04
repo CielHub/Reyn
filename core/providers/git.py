@@ -34,4 +34,3 @@ class GitProvider(BaseUpdateProvider):
         #     error_code=UpdateErrorCode.LOCAL_MODIFICATION
         # )
         pass
-      

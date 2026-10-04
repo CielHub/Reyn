@@ -6,18 +6,30 @@ Tanggung Jawab:
 - Menangani terminasi/kill (Graceful Terminate).
 """
 
+import re
+import shlex
 import subprocess
 import time
 
+_PACKAGE_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+
+def is_valid_package_name(pkg_name) -> bool:
+    return bool(_PACKAGE_RE.fullmatch(str(pkg_name or "").strip()))
+
+
 def get_pid(pkg_name):
-    # timeout ditambahkan: `pidof` yang menggantung tidak boleh membekukan
-    # caller (watchdog/recovery/sync). Perilaku lain TIDAK berubah.
+    pkg_name = str(pkg_name or "").strip()
+    if not is_valid_package_name(pkg_name):
+        return ""
     try:
         result = subprocess.run(
             ['pidof', pkg_name], capture_output=True, text=True, timeout=5
         )
-        return result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        for pid in (result.stdout or "").split():
+            if _validate_pid(pid, pkg_name):
+                return pid
+        return ""
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return ""
 
 
@@ -92,7 +104,7 @@ def _validate_pid(pid, pkg_name):
         return False
 
     package = identity.get("package") or ""
-    return not package or package == pkg_name
+    return bool(pkg_name and package and package == pkg_name)
 
 
 
@@ -166,6 +178,9 @@ def get_pids(pkg_name):
                        recovery palsu (yang akan kill proses yang hidup).
     """
     try:
+        pkg_name = str(pkg_name or "").strip()
+        if not is_valid_package_name(pkg_name):
+            return None
         result = subprocess.run(
             ['pidof', pkg_name], capture_output=True, text=True,
             timeout=5, errors='replace',
@@ -174,6 +189,9 @@ def get_pids(pkg_name):
         return None
     except Exception:
         return None
+    pkg_name = str(pkg_name or "").strip()
+    if not is_valid_package_name(pkg_name):
+        return None
     raw = (result.stdout or "").strip().split()
     candidates = [p for p in raw if p.isdigit()]
     if not candidates:
@@ -181,13 +199,17 @@ def get_pids(pkg_name):
         return set() if result.returncode in (0, 1) else None
     alive = set()
     for pid in candidates:
-        if _validate_pid(pid, pkg_name) is not False:
-            alive.add(pid)
+        if not _validate_pid(pid, pkg_name):
+            return None
+        alive.add(pid)
     return alive
 
 def pid_exists(pid):
+    pid = str(pid or "").strip()
+    if not pid.isdigit():
+        return False
     result = subprocess.run(
-        ["su", "-c", f"kill -0 {pid}"],
+        ["su", "-c", f"kill -0 {shlex.quote(pid)}"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -199,8 +221,11 @@ def _proc_dir_exists(pid):
     graceful_kill() sebagai pengaman ganda SEBELUM eskalasi ke `am
     force-stop`, supaya tidak salah eskalasi hanya karena satu metode cek
     saja kebetulan lambat/gagal baca."""
+    pid = str(pid or "").strip()
+    if not pid.isdigit():
+        return False
     result = subprocess.run(
-        ["su", "-c", f"test -d /proc/{pid}"],
+        ["su", "-c", f"test -d /proc/{shlex.quote(pid)}"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -292,7 +317,7 @@ def graceful_kill(pid, package=None):
     # ====================================================
     if package:
         subprocess.run(
-            ["su", "-c", f"am force-stop {package}"],
+            ["su", "-c", f"am force-stop {shlex.quote(package)}"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -399,11 +424,12 @@ def restore_foreground(package):
     Ini bukan jaminan window benar-benar sudah tidak bubble secara visual,
     hanya konfirmasi command-nya berhasil dieksekusi.
     """
-    if not package:
+    package = str(package or "").strip()
+    if not is_valid_package_name(package):
         return False
 
     result = subprocess.run(
-        ["su", "-c", f"monkey -p {package} 1"],
+        ["su", "-c", f"monkey -p {shlex.quote(package)} 1"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -432,11 +458,12 @@ def clear_package_data(package):
     (returncode 0 DAN output mengandung 'Success') -- returncode 0 saja
     tidak selalu berarti berhasil untuk command `pm` di sebagian device.
     """
-    if not package:
+    package = str(package or "").strip()
+    if not is_valid_package_name(package):
         return False
 
     result = subprocess.run(
-        ["su", "-c", f"pm clear {package}"],
+        ["su", "-c", f"pm clear {shlex.quote(package)}"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -452,7 +479,7 @@ def hard_force_stop(package, expected_pid=None, expected_start_time=None):
     that PID still belongs to the exact target package and process start time.
     """
     package = str(package or "").strip()
-    if not package:
+    if not is_valid_package_name(package):
         return False
 
     expected_pid = str(expected_pid or "").strip()
@@ -465,7 +492,7 @@ def hard_force_stop(package, expected_pid=None, expected_start_time=None):
             return False
 
     result = subprocess.run(
-        ["su", "-c", f"am force-stop {package}"],
+        ["su", "-c", f"am force-stop {shlex.quote(package)}"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

@@ -32,6 +32,7 @@ import asyncio
 import random
 import time
 import uuid
+import threading
 
 import datetime
 
@@ -69,6 +70,7 @@ WATCHDOG_DEBUG_LOG = True
 # Pastikan PID lama benar-benar mati: berapa kali kill ulang kalau masih ada.
 KILL_VERIFY_MAX_ROUNDS = 3
 WATCHDOG_ALIVE_LOG_EVERY_SECONDS = 300
+MAX_RECOVERY_ATTEMPTS = 10
 # Interval scan username berkala (tampilan heartbeat/panel). Dulu konstanta ini
 # dipakai di _username_scanner_loop tapi TIDAK pernah didefinisikan -> NameError
 # di baris pertama loop, scanner mati diam-diam, username selalu None.
@@ -173,6 +175,10 @@ SESSIONS: dict = {}
 _watchdog_tasks: dict = {}
 _username_tasks: dict = {}
 _start_tasks: dict = {}
+_start_cancel_events: dict = {}  # pkg -> threading.Event used by blocking workers
+_package_locks: dict = {}         # pkg -> asyncio.Lock for lifecycle mutations
+_device_restore_locks: dict = {}  # device -> lock for sibling/window restores
+_STOP_TASKS: dict = {}             # pkg -> stop cleanup task
 
 # Recovery lock per package. Satu package hanya boleh punya satu recovery aktif.
 _recovery_in_progress: set = set()
@@ -187,6 +193,64 @@ _FREEFORM_REGISTRY: dict = {}
 _FREEFORM_RESTORE_STEP_DELAY_SECONDS = 0.3
 _FINISH_RESTORE_DELAY_SECONDS = 2.5
 _FINISH_RESTORE_STEP_DELAY_SECONDS = 0.3
+
+
+def _get_package_lock(pkg: str) -> asyncio.Lock:
+    lock = _package_locks.get(pkg)
+    if lock is None:
+        lock = asyncio.Lock()
+        _package_locks[pkg] = lock
+    return lock
+
+
+def _get_cancel_event(pkg: str):
+    return _start_cancel_events.get(pkg)
+
+
+def _get_device_restore_lock(device_id: str) -> asyncio.Lock:
+    key = str(device_id or "").strip().upper() or "__UNKNOWN_DEVICE__"
+    lock = _device_restore_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _device_restore_locks[key] = lock
+    return lock
+
+
+async def _sleep_or_cancel(seconds: float, cancel_event=None) -> bool:
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        await asyncio.sleep(min(1.0, remaining))
+
+
+async def _kill_package_and_verify(pkg: str, max_rounds: int = KILL_VERIFY_MAX_ROUNDS) -> bool:
+    """Terminate every VERIFIED PID of one package and prove that package has no
+    remaining PID. Never converts an unknown probe (None) into success."""
+    pkg = str(pkg or "").strip()
+    if not process_manager.is_valid_package_name(pkg):
+        return False
+    for _ in range(max(1, int(max_rounds))):
+        pids = await asyncio.to_thread(process_manager.get_pids, pkg)
+        if pids == set():
+            return True
+        if pids is None:
+            await asyncio.sleep(0.5)
+            continue
+        for pid in sorted(pids):
+            identity = await asyncio.to_thread(process_manager.get_process_identity, pid)
+            if not identity or identity.get("package") != pkg:
+                continue
+            await asyncio.to_thread(
+                process_manager.kill_pid_direct,
+                pid, package=pkg, expected_start_time=identity.get("start_time")
+            )
+        await asyncio.sleep(0.5)
+    final = await asyncio.to_thread(process_manager.get_pids, pkg)
+    return final == set()
 
 
 def register_sender(callback) -> None:
@@ -214,6 +278,7 @@ async def _emit_status(local_device_id: str, session_id: str, pkg: str, order_id
         info["last_status_at"] = time.time()
         payload = {
             "username": username_scanner.get_cached_username(pkg),
+            "username_verified": bool(username_scanner.get_cached_identity(pkg).get("read_ok")),
             "target": info.get("target"),
             "pid": info.get("pid", "-"),
             "timestamp": info["last_status_at"],
@@ -222,6 +287,7 @@ async def _emit_status(local_device_id: str, session_id: str, pkg: str, order_id
     else:
         payload = {
             "username": username_scanner.get_cached_username(pkg),
+            "username_verified": bool(username_scanner.get_cached_identity(pkg).get("read_ok")),
             "timestamp": time.time(),
         }
 
@@ -272,6 +338,8 @@ def _snapshot_for_heartbeat() -> dict:
             "pid_start_time": info.get("pid_start_time"),
             "state": info.get("runtime_status") or info.get("status", "UNKNOWN"),
             "username": username_scanner.get_cached_username(pkg),
+            "username_verified": username_scanner.get_cached_identity(pkg).get("read_ok", False),
+            "username_scanned_at": username_scanner.get_cached_identity(pkg).get("scanned_at", 0),
             "session_id": info.get("session_id", ""),
             "last_status_at": info.get("last_status_at"),
             # Tambahan (additive, bot lama mengabaikan): hasil cek PID nyata
@@ -295,6 +363,8 @@ def _snapshot_for_sync() -> dict:
             "pid": info.get("pid", "-"),
             "pid_start_time": info.get("pid_start_time"),
             "username": username_scanner.get_cached_username(pkg),
+            "username_verified": username_scanner.get_cached_identity(pkg).get("read_ok", False),
+            "username_scanned_at": username_scanner.get_cached_identity(pkg).get("scanned_at", 0),
             "expected_username": info.get("expected_username", ""),
             "target": info.get("target", ""),
             "last_status_at": info.get("last_status_at"),
@@ -310,7 +380,11 @@ def _snapshot_for_sync() -> dict:
     }
 
 async def handle_start_session(msg: dict, local_device_id: str) -> dict:
-    """Terima START_SESSION secara idempotent dan mulai staged flow di background."""
+    """Accept START_SESSION idempotently and reserve exactly one package.
+
+    Reservation and lifecycle ownership are decided under the per-package lock
+    so two concurrent START requests cannot both observe a free package.
+    """
     session_id = str(msg.get("session_id", "")).strip()
     order_id = msg.get("order_id")
     pkg = str(msg.get("package_name", "")).strip()
@@ -321,87 +395,75 @@ async def handle_start_session(msg: dict, local_device_id: str) -> dict:
         timeout_seconds = int(msg.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
     except (TypeError, ValueError):
         timeout_seconds = DEFAULT_TIMEOUT_SECONDS
+    timeout_seconds = max(15, min(timeout_seconds, 300))
 
     if not session_id or not pkg or not target:
-        return {
-            "type": "COMMAND_RESULT", "command": "START_SESSION",
-            "device_id": local_device_id, "session_id": session_id,
-            "ok": False, "reason": "MISSING_FIELDS",
-        }
+        return {"type":"COMMAND_RESULT","command":"START_SESSION","device_id":local_device_id,
+                "session_id":session_id,"ok":False,"reason":"MISSING_FIELDS"}
+    if not process_manager.is_valid_package_name(pkg):
+        return {"type":"COMMAND_RESULT","command":"START_SESSION","device_id":local_device_id,
+                "session_id":session_id,"ok":False,"reason":"INVALID_PACKAGE"}
 
     try:
         intent_url = get_intent_url(target)
     except ValueError as e:
-        return {
-            "type": "COMMAND_RESULT", "command": "START_SESSION",
-            "device_id": local_device_id, "session_id": session_id,
-            "ok": False, "reason": f"INVALID_TARGET: {e}",
-        }
+        return {"type":"COMMAND_RESULT","command":"START_SESSION","device_id":local_device_id,
+                "session_id":session_id,"ok":False,"reason":f"INVALID_TARGET: {e}"}
 
-    existing = SESSIONS.get(pkg)
-    if existing is not None:
-        existing_session = str(existing.get("session_id", ""))
-        if existing_session == session_id:
+    async with _get_package_lock(pkg):
+        existing = SESSIONS.get(pkg)
+        if existing is not None:
+            existing_session = str(existing.get("session_id", ""))
+            status = str(existing.get("status") or "").upper()
+            if existing_session != session_id:
+                log.warning(
+                    f"SESSION_AGENT: START_SESSION untuk {pkg} ditolak karena masih dipegang "
+                    f"session '{existing_session}'. Request baru '{session_id}' tidak boleh menimpa."
+                )
+                return {"type":"COMMAND_RESULT","command":"START_SESSION","device_id":local_device_id,
+                        "session_id":session_id,"ok":False,"reason":"PACKAGE_BUSY"}
+
             task = _start_tasks.get(pkg)
             if task is not None and not task.done():
-                return {
-                    "type": "COMMAND_RESULT", "command": "START_SESSION",
-                    "device_id": local_device_id, "session_id": session_id,
-                    "ok": True, "reason": "ALREADY_PROCESSING",
-                }
-            if existing.get("status") == "ACTIVE":
-                return {
-                    "type": "COMMAND_RESULT", "command": "START_SESSION",
-                    "device_id": local_device_id, "session_id": session_id,
-                    "ok": True, "reason": "ALREADY_ACTIVE",
-                }
-            if existing.get("status") in ("RECOVERING", "STARTING"):
-                return {
-                    "type": "COMMAND_RESULT", "command": "START_SESSION",
-                    "device_id": local_device_id, "session_id": session_id,
-                    "ok": True, "reason": "ALREADY_PROCESSING",
-                }
-            if existing.get("status") == "FAILED":
-                SESSIONS.pop(pkg, None)
-        else:
-            log.warning(
-                f"SESSION_AGENT: START_SESSION untuk {pkg} ditolak karena "
-                f"masih dipegang session '{existing_session}'. "
-                f"Request baru '{session_id}' tidak boleh menimpa session lama."
-            )
-            return {
-                "type": "COMMAND_RESULT", "command": "START_SESSION",
-                "device_id": local_device_id, "session_id": session_id,
-                "ok": False, "reason": "PACKAGE_BUSY",
-            }
+                return {"type":"COMMAND_RESULT","command":"START_SESSION","device_id":local_device_id,
+                        "session_id":session_id,"ok":True,"reason":"ALREADY_PROCESSING"}
+            if status in {"ACTIVE", "RECOVERING", "STARTING", "STOPPING"}:
+                return {"type":"COMMAND_RESULT","command":"START_SESSION","device_id":local_device_id,
+                        "session_id":session_id,"ok":True,"reason":"ALREADY_PROCESSING"}
+            if status not in {"FAILED", "START_FAILED", "STOPPED"}:
+                return {"type":"COMMAND_RESULT","command":"START_SESSION","device_id":local_device_id,
+                        "session_id":session_id,"ok":False,"reason":"PACKAGE_BUSY"}
 
-    SESSIONS[pkg] = {
-        "session_id": session_id,
-        "order_id": order_id,
-        "_device_id": local_device_id,
-        "target": target,
-        "expected_username": expected_username,
-        "session_kind": str(msg.get("session_kind", "") or "").strip().upper(),
-        "status": "STARTING",
-        "runtime_status": "PREPARING",
-        "pid": "-",
-        "launch_count": 1,
-        "crash_count": 0,
-        "status_seq": 0,
-        "last_status_at": time.time(),
-        # Liveness probe fields. None = belum terverifikasi, bukan RUNNING.
-        "pid_alive": None,
-        "package_alive": None,
-        "adj": None,
-        "liveness_state": "UNKNOWN",
-        "last_pid_check_at": None,
-        "pid_start_time": None,
-    }
+            # Terminal local entry is safe to replace, provided it is not still
+            # in STOPPING. A STOPPING session remains the owner until STOPPED.
+            SESSIONS.pop(pkg, None)
+            _FREEFORM_REGISTRY.pop(pkg, None)
+            username_scanner.forget(pkg)
 
-    # Username scanner dimulai SEBELUM staged flow supaya heartbeat tidak
-    # perlu menunggu RUNNING untuk memperoleh username pertama.
+        _start_cancel_events[pkg] = threading.Event()
+        SESSIONS[pkg] = {
+            "session_id": session_id,
+            "order_id": order_id,
+            "_device_id": local_device_id,
+            "target": target,
+            "expected_username": expected_username,
+            "session_kind": str(msg.get("session_kind", "") or "").strip().upper(),
+            "status": "STARTING",
+            "runtime_status": "PREPARING",
+            "pid": "-",
+            "launch_count": 1,
+            "crash_count": 0,
+            "status_seq": 0,
+            "last_status_at": time.time(),
+            "pid_alive": None,
+            "package_alive": None,
+            "adj": None,
+            "liveness_state": "UNKNOWN",
+            "last_pid_check_at": None,
+            "pid_start_time": None,
+        }
+
     _ensure_username_scanner(pkg)
-
     task = asyncio.create_task(
         _run_start_flow(
             local_device_id, session_id, pkg, order_id,
@@ -415,19 +477,14 @@ async def handle_start_session(msg: dict, local_device_id: str) -> dict:
             _start_tasks.pop(pkg, None)
 
     task.add_done_callback(_cleanup_start_task)
-
     log.info(
-        f"SESSION_AGENT: START_SESSION diterima -> {pkg} "
-        f"(session {session_id}), expected_username="
-        f"{expected_username or '(tidak divalidasi)'}."
+        f"SESSION_AGENT: START_SESSION diterima -> {pkg} (session {session_id}), "
+        f"expected_username={expected_username or '(tidak divalidasi)'}.",
     )
-    return {
-        "type": "COMMAND_RESULT", "command": "START_SESSION",
-        "device_id": local_device_id, "session_id": session_id,
-        "ok": True, "reason": "PROCESSING",
-    }
+    return {"type":"COMMAND_RESULT","command":"START_SESSION","device_id":local_device_id,
+            "session_id":session_id,"ok":True,"reason":"PROCESSING"}
 
-async def _wait_in_lobby(pkg: str, session_id: str, *, recovery: bool = False) -> bool:
+async def _wait_in_lobby(pkg: str, session_id: str, *, recovery: bool = False, cancel_event=None) -> bool:
     """Tunggu 60-90 detik di lobby sebelum package boleh lanjut ke target."""
     current = SESSIONS.get(pkg)
     if not current or str(current.get("session_id")) != str(session_id):
@@ -440,13 +497,14 @@ async def _wait_in_lobby(pkg: str, session_id: str, *, recovery: bool = False) -
         f"SESSION_AGENT: {prefix}{pkg}/{session_id} menunggu di lobby "
         f"{delay:.1f}s sebelum lanjut ke tahap berikutnya."
     )
-    await asyncio.sleep(delay)
+    if not await _sleep_or_cancel(delay, cancel_event):
+        return False
 
     current = SESSIONS.get(pkg)
     return bool(current and str(current.get("session_id")) == str(session_id))
 
 
-async def _wait_before_map_entry(pkg: str, session_id: str) -> bool:
+async def _wait_before_map_entry(pkg: str, session_id: str, *, cancel_event=None) -> bool:
     """Delay 10-30 detik acak per package sebelum join target/map."""
     current = SESSIONS.get(pkg)
     if not current or str(current.get("session_id")) != str(session_id):
@@ -458,26 +516,82 @@ async def _wait_before_map_entry(pkg: str, session_id: str) -> bool:
         f"SESSION_AGENT: {pkg}/{session_id} selesai lobby; "
         f"menunggu {delay:.1f}s sebelum JOIN MAP."
     )
-    await asyncio.sleep(delay)
+    if not await _sleep_or_cancel(delay, cancel_event):
+        return False
 
     current = SESSIONS.get(pkg)
     return bool(current and str(current.get("session_id")) == str(session_id))
 
 
+async def _fail_start_session(
+    local_device_id: str,
+    session_id: str,
+    pkg: str,
+    order_id,
+    reason: str,
+) -> None:
+    """Fail one start attempt and clean only that package before START_FAILED."""
+    current = SESSIONS.get(pkg)
+    if (not current or str(current.get("session_id")) != str(session_id)
+            or str(current.get("status") or "").upper() in {"STOPPING", "STOPPED"}):
+        return
+
+    cancel_event = _start_cancel_events.get(pkg)
+    if cancel_event is not None:
+        cancel_event.set()
+    current["status"] = "STOPPING"
+    current["runtime_status"] = "STOPPING"
+    await _emit_status(
+        local_device_id, session_id, pkg, order_id,
+        "STOPPING", reason=f"START_FAILURE_CLEANUP:{reason}",
+    )
+
+    killed = await _kill_package_and_verify(pkg)
+    current = SESSIONS.get(pkg)
+    if (not current or str(current.get("session_id")) != str(session_id)
+            or str(current.get("status") or "").upper() in {"STOPPING", "STOPPED"}):
+        return
+
+    current["status"] = "FAILED"
+    current["runtime_status"] = "FAILED"
+    current["pid"] = "-"
+    current["pid_alive"] = not killed
+    current["package_alive"] = not killed
+    if not killed:
+        log.error(
+            f"SESSION_AGENT: start failure cleanup {pkg}/{session_id} gagal memastikan "
+            "process benar-benar mati; START_FAILED tetap dilaporkan dengan cleanup_failed=True."
+        )
+    username_scanner.forget(pkg)
+    await _emit_status(
+        local_device_id, session_id, pkg, order_id,
+        "START_FAILED",
+        reason=reason,
+        cleanup_failed=not killed,
+    )
+
 async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order_id,
                            intent_url: str, expected_username: str, timeout_seconds: int) -> None:
     """PREPARING -> WAITING_LOGIN -> ACCOUNT_READY -> JOINING_GAME -> RUNNING."""
+    cancel_event = _start_cancel_events.get(pkg)
+
     def _still_current() -> bool:
         current = SESSIONS.get(pkg)
-        return bool(current and current.get("session_id") == session_id)
+        if not current or current.get("session_id") != session_id:
+            return False
+        if str(current.get("status") or "").upper() in {"STOPPING", "STOPPED", "FAILED", "START_FAILED"}:
+            return False
+        return not (cancel_event is not None and cancel_event.is_set())
 
     try:
+        if cancel_event and cancel_event.is_set():
+            return
         await _emit_status(local_device_id, session_id, pkg, order_id, "PREPARING")
 
         try:
             lobby_ok = await _launch_then_freeform_soon(
                 pkg, get_lobby_intent(), LOBBY_TIMEOUT_SECONDS,
-                require_join_signal=False, session_id=session_id,
+                require_join_signal=False, session_id=session_id, cancel_event=cancel_event,
             )
         except Exception:
             log.error(f"SESSION_AGENT: exception saat buka lobby {pkg}.", exc_info=True)
@@ -486,16 +600,12 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
         if not _still_current():
             return
         if not lobby_ok:
-            SESSIONS[pkg]["status"] = "FAILED"
-            await _emit_status(
-                local_device_id, session_id, pkg, order_id,
-                "START_FAILED", reason="LOBBY_LAUNCH_FAILED",
-            )
+            await _fail_start_session(local_device_id, session_id, pkg, order_id, "LOBBY_LAUNCH_FAILED")
             return
 
         SESSIONS[pkg]["pid"] = get_pid_quick(pkg) or "-"
 
-        if not await _wait_in_lobby(pkg, session_id):
+        if not await _wait_in_lobby(pkg, session_id, cancel_event=cancel_event):
             return
 
         if expected_username:
@@ -511,9 +621,10 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
                 if not _still_current():
                     return
                 try:
-                    detected = await asyncio.to_thread(
-                        username_scanner.scan_username_blocking, pkg
+                    scan_result = await asyncio.to_thread(
+                        username_scanner.scan_username_result_blocking, pkg
                     )
+                    detected = scan_result.get("username") if scan_result.get("read_ok") else None
                 except Exception:
                     log.error(
                         f"SESSION_AGENT: exception scan username {pkg}.",
@@ -534,17 +645,12 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
                         mismatch=True,
                     )
 
-                await asyncio.sleep(LOGIN_POLL_INTERVAL_SECONDS)
+                if not await _sleep_or_cancel(LOGIN_POLL_INTERVAL_SECONDS, cancel_event):
+                    return
             else:
                 if not _still_current():
                     return
-                SESSIONS[pkg]["status"] = "FAILED"
-                await _emit_status(
-                    local_device_id, session_id, pkg, order_id,
-                    "START_FAILED",
-                    reason="LOGIN_TIMEOUT",
-                    expected_username=expected_username,
-                )
+                await _fail_start_session(local_device_id, session_id, pkg, order_id, "LOGIN_TIMEOUT")
                 return
 
             if not _still_current():
@@ -557,13 +663,13 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
 
         await _emit_status(local_device_id, session_id, pkg, order_id, "JOINING_GAME")
 
-        if not await _wait_before_map_entry(pkg, session_id):
+        if not await _wait_before_map_entry(pkg, session_id, cancel_event=cancel_event):
             return
 
         try:
             join_status, join_reason = await _launch_then_freeform_soon(
                 pkg, intent_url, timeout_seconds,
-                require_join_signal=True, session_id=session_id,
+                require_join_signal=True, session_id=session_id, cancel_event=cancel_event,
             )
         except Exception:
             log.error(
@@ -576,12 +682,7 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
             return
 
         if join_status == "FAILED":
-            SESSIONS[pkg]["status"] = "FAILED"
-            await _emit_status(
-                local_device_id, session_id, pkg, order_id,
-                "START_FAILED",
-                reason=f"JOIN_FAILED:{join_reason}",
-            )
+            await _fail_start_session(local_device_id, session_id, pkg, order_id, f"JOIN_FAILED:{join_reason}")
             return
 
         if join_status == "UNCERTAIN":
@@ -591,19 +692,15 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
             )
 
             grace_start_str = datetime.datetime.now().strftime("%m-%d %H:%M:%S.000")
-            await asyncio.sleep(JOIN_VERIFY_GRACE_SECONDS)
+            if not await _sleep_or_cancel(JOIN_VERIFY_GRACE_SECONDS, cancel_event):
+                return
 
             if not _still_current():
                 return
 
             pid_after_grace = get_pid_quick(pkg)
             if not pid_after_grace:
-                SESSIONS[pkg]["status"] = "FAILED"
-                await _emit_status(
-                    local_device_id, session_id, pkg, order_id,
-                    "START_FAILED",
-                    reason="PROCESS_DIED_DURING_VERIFY",
-                )
+                await _fail_start_session(local_device_id, session_id, pkg, order_id, "PROCESS_DIED_DURING_VERIFY")
                 return
 
             try:
@@ -621,11 +718,9 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
                 has_failure, failure_code = False, None
 
             if has_failure:
-                SESSIONS[pkg]["status"] = "FAILED"
-                await _emit_status(
+                await _fail_start_session(
                     local_device_id, session_id, pkg, order_id,
-                    "START_FAILED",
-                    reason=f"JOIN_ERROR_SIGNAL_DURING_VERIFY_{failure_code}",
+                    f"JOIN_ERROR_SIGNAL_DURING_VERIFY_{failure_code}",
                 )
                 return
 
@@ -658,10 +753,8 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
             exc_info=True,
         )
         if _still_current():
-            SESSIONS[pkg]["status"] = "FAILED"
-            await _emit_status(
-                local_device_id, session_id, pkg, order_id,
-                "START_FAILED", reason="UNHANDLED_EXCEPTION",
+            await _fail_start_session(
+                local_device_id, session_id, pkg, order_id, "UNHANDLED_EXCEPTION"
             )
 
 async def _activate_freeform_and_restore_siblings(pkg: str, session_id: str) -> None:
@@ -697,6 +790,12 @@ async def _activate_freeform_and_restore_siblings(pkg: str, session_id: str) -> 
         log.error(f"SESSION_AGENT: exception saat activate_freeform {pkg}.", exc_info=True)
         ok, task_id = False, None
 
+    current = SESSIONS.get(pkg)
+    if not current or str(current.get("session_id")) != str(session_id):
+        return
+    if str(current.get("status") or "").upper() in {"STOPPING", "STOPPED", "FAILED", "START_FAILED"}:
+        return
+
     if not ok:
         log.warning(f"SESSION_AGENT: {pkg} (session {session_id}) belum kekonfirmasi Freeform+tampil -- "
                     f"lanjut proses seperti biasa (tidak menghentikan session gara-gara ini).")
@@ -708,22 +807,22 @@ async def _activate_freeform_and_restore_siblings(pkg: str, session_id: str) -> 
 
     # Sibling: package LAIN yang sudah lebih dulu Freeform DAN masih ACTIVE
     # di SESSIONS (jangan restore package yang sesi-nya sudah berhenti/mati).
-    siblings = [p for p in _FREEFORM_REGISTRY
-                if p != pkg and p in SESSIONS and SESSIONS[p].get("status") == "ACTIVE"]
-    if not siblings:
-        return
+    device_id = str((SESSIONS.get(pkg) or {}).get("_device_id") or "")
+    async with _get_device_restore_lock(device_id):
+        siblings = [p for p in _FREEFORM_REGISTRY
+                    if p != pkg and p in SESSIONS and SESSIONS[p].get("status") == "ACTIVE"]
+        if not siblings:
+            return
 
-    log.info(f"SESSION_AGENT: {pkg} {'re-verify' if was_registered else 'baru'} Freeform -- "
-             f"bangkitkan {len(siblings)} package lain yang sudah lebih dulu Freeform: {siblings}")
-    for sibling_pkg in siblings:
-        # Re-cek per iterasi: kalau sibling ini berhenti selagi loop restore
-        # masih jalan, jangan sentuh.
-        if sibling_pkg not in SESSIONS or SESSIONS[sibling_pkg].get("status") != "ACTIVE":
-            continue
-        restored = await asyncio.to_thread(process_manager.restore_foreground, sibling_pkg)
-        log.info(f"SESSION_AGENT: restore foreground sibling {sibling_pkg} (rotasi freeform): "
-                 f"{'OK' if restored else 'GAGAL'}")
-        await asyncio.sleep(_FREEFORM_RESTORE_STEP_DELAY_SECONDS)
+        log.info(f"SESSION_AGENT: {pkg} {'re-verify' if was_registered else 'baru'} Freeform -- "
+                 f"bangkitkan {len(siblings)} package lain yang sudah lebih dulu Freeform: {siblings}")
+        for sibling_pkg in siblings:
+            if sibling_pkg not in SESSIONS or SESSIONS[sibling_pkg].get("status") != "ACTIVE":
+                continue
+            restored = await asyncio.to_thread(process_manager.restore_foreground, sibling_pkg)
+            log.info(f"SESSION_AGENT: restore foreground sibling {sibling_pkg} (rotasi freeform): "
+                     f"{'OK' if restored else 'GAGAL'}")
+            await asyncio.sleep(_FREEFORM_RESTORE_STEP_DELAY_SECONDS)
 
 
 async def _launch_then_freeform_soon(
@@ -733,11 +832,17 @@ async def _launch_then_freeform_soon(
     require_join_signal: bool,
     session_id: str,
     only_if_previously_freeform: bool = False,
+    cancel_event=None,
 ):
     """Launch normal -> timer Freeform -> Smart Wait secara paralel."""
+    if cancel_event is not None and cancel_event.is_set():
+        return (("FAILED", "CANCELLED") if require_join_signal else False)
+
     ok, start_time_str = await asyncio.to_thread(
         launch_normal, pkg, intent_url
     )
+    if cancel_event is not None and cancel_event.is_set():
+        return (("FAILED", "CANCELLED") if require_join_signal else False)
     if not ok:
         return (
             ("FAILED", "LAUNCH_COMMAND_FAILED")
@@ -747,7 +852,8 @@ async def _launch_then_freeform_soon(
     async def _freeform_after_delay():
         if only_if_previously_freeform and pkg not in _FREEFORM_REGISTRY:
             return
-        await asyncio.sleep(FREEFORM_ACTIVATION_DELAY_SECONDS)
+        if not await _sleep_or_cancel(FREEFORM_ACTIVATION_DELAY_SECONDS, cancel_event):
+            return
         try:
             await _activate_freeform_and_restore_siblings(pkg, session_id)
         except Exception:
@@ -764,10 +870,15 @@ async def _launch_then_freeform_soon(
             start_time_str,
             timeout_seconds,
             require_join_signal,
+            cancel_event,
         )
     finally:
+        if not freeform_task.done():
+            freeform_task.cancel()
         try:
             await freeform_task
+        except asyncio.CancelledError:
+            pass
         except Exception:
             log.error(
                 f"SESSION_AGENT: exception freeform timer cleanup {pkg}.",
@@ -863,20 +974,37 @@ async def _username_scanner_loop(pkg: str) -> None:
 
 async def _snapshot_survivor_pids(exclude_pkg: str) -> dict:
     """Snapshot PID set package ACTIVE lain sebelum operasi target."""
+    survivors = [
+        pkg for pkg, info in list(SESSIONS.items())
+        if pkg != exclude_pkg and info.get("status") == "ACTIVE"
+    ]
+    if not survivors:
+        return {}
+    results = await asyncio.gather(
+        *(asyncio.to_thread(process_manager.get_pids, pkg) for pkg in survivors),
+        return_exceptions=True,
+    )
     snapshot = {}
-    for survivor_pkg, info in list(SESSIONS.items()):
-        if survivor_pkg == exclude_pkg or info.get("status") != "ACTIVE":
-            continue
-        pids = await asyncio.to_thread(process_manager.get_pids, survivor_pkg)
-        snapshot[survivor_pkg] = None if pids is None else set(pids)
+    for pkg, pids in zip(survivors, results):
+        if isinstance(pids, Exception):
+            log.warning(f"[ISOLATION_CHECK] snapshot survivor={pkg}: probe exception: {pids!r}")
+            snapshot[pkg] = None
+        else:
+            snapshot[pkg] = None if pids is None else set(pids)
     return snapshot
 
 
 async def _verify_survivor_pids_unchanged(snapshot: dict, phase: str) -> None:
     """Detect unexpected PID changes in packages that were not targeted."""
-    for survivor_pkg, before in snapshot.items():
-        current = await asyncio.to_thread(process_manager.get_pids, survivor_pkg)
-        if before is None or current is None:
+    if not snapshot:
+        return
+    packages = list(snapshot)
+    results = await asyncio.gather(
+        *(asyncio.to_thread(process_manager.get_pids, pkg) for pkg in packages),
+        return_exceptions=True,
+    )
+    for survivor_pkg, before, current in zip(packages, (snapshot[p] for p in packages), results):
+        if isinstance(current, Exception) or before is None or current is None:
             log.warning(
                 f"[ISOLATION_CHECK] {phase} survivor={survivor_pkg}: "
                 "PID state UNKNOWN, tidak bisa membuktikan unchanged."
@@ -895,166 +1023,115 @@ async def _verify_survivor_pids_unchanged(snapshot: dict, phase: str) -> None:
             )
 
 
-async def _finish_kill_and_restore_survivors(
-    local_device_id: str,
-    session_id: str,
-    pkg: str,
-    recorded_pid: str,
-    order_id=None,
-) -> None:
-    """Kill target secara terisolasi lalu restore package survivor."""
-    log.info(
-        f"[FINISH] session={session_id} package={pkg} -- mulai stop."
-    )
+async def _finish_kill_and_restore_survivors(local_device_id: str, session_id: str, pkg: str, recorded_pid: str, order_id=None) -> None:
+    log.info(f"[FINISH] session={session_id} package={pkg} -- mulai stop.")
+    try:
+        survivor_snapshot = await _snapshot_survivor_pids(pkg)
+        killed = await _kill_package_and_verify(pkg)
+        if not killed:
+            await _emit_status(local_device_id, session_id, pkg, order_id, "STOPPING",
+                               pid=recorded_pid, reason="PROCESS_STILL_ALIVE")
+            log.error(f"[FINISH] {pkg}/{session_id} gagal diverifikasi mati.")
+            return
 
-    survivor_snapshot = await _snapshot_survivor_pids(pkg)
+        await _sleep_or_cancel(_FINISH_RESTORE_DELAY_SECONDS)
+        async with _get_device_restore_lock(local_device_id):
+            survivors = [p for p, info in list(SESSIONS.items()) if p != pkg and info.get("status") == "ACTIVE"]
+            for survivor_pkg in survivors:
+                info = SESSIONS.get(survivor_pkg)
+                if not info or info.get("status") != "ACTIVE":
+                    continue
+                ok = await asyncio.to_thread(process_manager.restore_foreground, survivor_pkg)
+                log.info(f"[FINISH] session={session_id} restore survivor {survivor_pkg}: {'OK' if ok else 'GAGAL'}")
+                await asyncio.sleep(_FINISH_RESTORE_STEP_DELAY_SECONDS)
+                current = await asyncio.to_thread(process_manager.get_pids, survivor_pkg)
+                before = survivor_snapshot.get(survivor_pkg)
+                if before is not None and current is not None and set(current) != set(before):
+                    log.error(f"[CROSS_PACKAGE_IMPACT] finish/{pkg} survivor={survivor_pkg}: PID {sorted(before)} -> {sorted(current)}")
 
-    current_pid = await asyncio.to_thread(process_manager.get_pid, pkg)
-    if current_pid:
-        identity = await asyncio.to_thread(
-            process_manager.get_process_identity, current_pid
+        async with _get_package_lock(pkg):
+            current = SESSIONS.get(pkg)
+            if current is None or str(current.get("session_id")) != session_id:
+                return
+            current["status"] = "STOPPED"
+            current["runtime_status"] = "STOPPED"
+            current["pid"] = "-"
+            current["pid_alive"] = False
+            current["package_alive"] = False
+            stopped_seq = int(current.get("status_seq", 0)) + 1
+            current["status_seq"] = stopped_seq
+            # Remove ownership BEFORE emitting the terminal event. This closes
+            # the tiny race where a retrying START could replace the old entry
+            # between STOPPED emission and cleanup, after which a late pop could
+            # accidentally delete the brand-new session.
+            SESSIONS.pop(pkg, None)
+            _FREEFORM_REGISTRY.pop(pkg, None)
+            _start_cancel_events.pop(pkg, None)
+            username_scanner.forget(pkg)
+
+        await _emit_status(
+            local_device_id, session_id, pkg, order_id, "STOPPED",
+            pid="-", status_seq=stopped_seq, username_verified=False,
         )
-        if not identity or identity.get("package") != pkg:
-            log.error(
-                f"[PID_OWNERSHIP] {pkg}: refuse kill pid={current_pid}; "
-                "ownership tidak terverifikasi."
-            )
-        else:
-            start_time = identity.get("start_time")
-            log.info(
-                f"[PID_OWNERSHIP] {pkg}: pid={current_pid} "
-                f"start_time={start_time} ownership=VERIFIED."
-            )
-            killed = await asyncio.to_thread(
-                process_manager.kill_pid_direct,
-                current_pid,
-                package=pkg,
-                expected_start_time=start_time,
-            )
-            if not killed:
-                log.warning(
-                    f"[KILL] {pkg}: pid={current_pid} SIGTERM/SIGKILL gagal; "
-                    "mencoba target-only force-stop fallback."
-                )
-                fallback = await asyncio.to_thread(
-                    process_manager.hard_force_stop,
-                    pkg,
-                    current_pid,
-                    start_time,
-                )
-                log.info(
-                    f"[FORCE_STOP_FALLBACK] {pkg}: "
-                    f"{'OK' if fallback else 'GAGAL'}."
-                )
-                killed = bool(fallback)
-            if killed:
-                log.info(
-                    f"[KILL] session={session_id} package={pkg} "
-                    f"pid={current_pid} -- target dipastikan mati."
-                )
-            else:
-                log.error(
-                    f"[KILL] session={session_id} package={pkg} "
-                    f"pid={current_pid} -- target gagal dipastikan mati."
-                )
-    else:
-        log.info(
-            f"[FINISH] session={session_id} package={pkg} "
-            f"(recorded_pid={recorded_pid}) -- proses sudah tidak ada."
-        )
-
-    await asyncio.sleep(_FINISH_RESTORE_DELAY_SECONDS)
-
-    survivors = [
-        p for p, info in SESSIONS.items()
-        if p != pkg and info.get("status") == "ACTIVE"
-    ]
-    for survivor_pkg in survivors:
-        info = SESSIONS.get(survivor_pkg)
-        if not info or info.get("status") != "ACTIVE":
-            continue
-
-        ok = await asyncio.to_thread(
-            process_manager.restore_foreground, survivor_pkg
-        )
-        log.info(
-            f"[FINISH] session={session_id} restore survivor "
-            f"{survivor_pkg}: {'OK' if ok else 'GAGAL'}"
-        )
-        await asyncio.sleep(_FINISH_RESTORE_STEP_DELAY_SECONDS)
-
-    await _emit_status(
-        local_device_id,
-        session_id,
-        pkg,
-        order_id,
-        "STOPPED",
-        pid="-",
-    )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.error(f"SESSION_AGENT: finish stop exception {pkg}/{session_id}.", exc_info=True)
 
 async def handle_stop_session(msg: dict, local_device_id: str, do_reset: bool = True) -> dict:
-    """STOP_SESSION dengan anti-rejoin dan status STOPPING -> STOPPED."""
+    """Transition one package to STOPPING and asynchronously prove STOPPED.
+
+    The immediate command result means "stop accepted", not "process is dead".
+    The authoritative terminal STOPPED event is emitted only after all target
+    PIDs disappear (or the command is reported failed).
+    """
     session_id = str(msg.get("session_id", "")).strip()
     pkg = str(msg.get("package_name", "")).strip()
-
     if not session_id or not pkg:
-        return {
-            "type": "COMMAND_RESULT", "command": "STOP_SESSION",
-            "device_id": local_device_id, "session_id": session_id,
-            "ok": False, "reason": "MISSING_FIELDS",
-        }
+        return {"type":"COMMAND_RESULT","command":"STOP_SESSION","device_id":local_device_id,"session_id":session_id,"ok":False,"reason":"MISSING_FIELDS"}
+    if not process_manager.is_valid_package_name(pkg):
+        return {"type":"COMMAND_RESULT","command":"STOP_SESSION","device_id":local_device_id,"session_id":session_id,"ok":False,"reason":"INVALID_PACKAGE"}
 
-    info = SESSIONS.get(pkg)
-    if info is None:
-        return {
-            "type": "COMMAND_RESULT", "command": "STOP_SESSION",
-            "device_id": local_device_id, "session_id": session_id,
-            "ok": True, "reason": "NO_LOCAL_SESSION",
-        }
+    async with _get_package_lock(pkg):
+        info = SESSIONS.get(pkg)
+        if info is None:
+            return {"type":"COMMAND_RESULT","command":"STOP_SESSION","device_id":local_device_id,"session_id":session_id,"ok":True,"reason":"NO_LOCAL_SESSION"}
+        if str(info.get("session_id")) != session_id:
+            return {"type":"COMMAND_RESULT","command":"STOP_SESSION","device_id":local_device_id,"session_id":session_id,"ok":False,"reason":"STALE_SESSION_ID"}
+        if info.get("status") == "STOPPING":
+            return {"type":"COMMAND_RESULT","command":"STOP_SESSION","device_id":local_device_id,"session_id":session_id,"ok":True,"reason":"ALREADY_STOPPING"}
 
-    if str(info.get("session_id")) != session_id:
-        return {
-            "type": "COMMAND_RESULT", "command": "STOP_SESSION",
-            "device_id": local_device_id, "session_id": session_id,
-            "ok": False, "reason": "STALE_SESSION_ID",
-        }
+        info["status"] = "STOPPING"
+        info["runtime_status"] = "STOPPING"
+        target_pid = info.get("pid", "-")
+        cancel_event = _start_cancel_events.get(pkg)
+        if cancel_event is not None:
+            cancel_event.set()
+        for registry, pop_only in ((_watchdog_tasks, True), (_username_tasks, True), (_start_tasks, True)):
+            task = registry.pop(pkg, None)
+            if task is not None and not task.done():
+                task.cancel()
+        _FREEFORM_REGISTRY.pop(pkg, None)
+        username_scanner.forget(pkg)
 
-    await _emit_status(
-        local_device_id, session_id, pkg, info.get("order_id"),
-        "STOPPING",
-    )
+        await _emit_status(local_device_id, session_id, pkg, info.get("order_id"), "STOPPING", pid=target_pid)
+        order_id = info.get("order_id")
 
-    info["status"] = "STOPPED"
-    info["runtime_status"] = "STOPPING"
-    target_pid = info.get("pid", "-")
-
-    watchdog = _watchdog_tasks.pop(pkg, None)
-    if watchdog is not None and not watchdog.done():
-        watchdog.cancel()
-
-    scanner = _username_tasks.pop(pkg, None)
-    if scanner is not None and not scanner.done():
-        scanner.cancel()
-
-    start_task = _start_tasks.pop(pkg, None)
-    if start_task is not None and not start_task.done():
-        start_task.cancel()
-
-    SESSIONS.pop(pkg, None)
-    _FREEFORM_REGISTRY.pop(pkg, None)
-
-    if do_reset:
-        asyncio.create_task(
-            _finish_kill_and_restore_survivors(
-                local_device_id, session_id, pkg, target_pid,
-                order_id=info.get("order_id"),
-            )
-        )
+        old_stop = _STOP_TASKS.get(pkg)
+        if old_stop is None or old_stop.done():
+            task = asyncio.create_task(_finish_kill_and_restore_survivors(
+                local_device_id, session_id, pkg, target_pid, order_id=order_id
+            ))
+            _STOP_TASKS[pkg] = task
+            def _cleanup_stop(done_task):
+                if _STOP_TASKS.get(pkg) is done_task:
+                    _STOP_TASKS.pop(pkg, None)
+            task.add_done_callback(_cleanup_stop)
 
     return {
-        "type": "COMMAND_RESULT", "command": "STOP_SESSION",
-        "device_id": local_device_id, "session_id": session_id,
-        "ok": True, "reason": "STOPPED",
+        "type":"COMMAND_RESULT","command":"STOP_SESSION",
+        "device_id":local_device_id,"session_id":session_id,
+        "ok":True,"reason":"STOPPING"
     }
 
 _restart_tasks: set = set()
@@ -1520,9 +1597,15 @@ async def _run_package_recovery(
     trigger_reason: str,
     incident_id: str | None = None,
 ) -> None:
+    cancel_event = _start_cancel_events.get(pkg)
+
     def _still_current() -> bool:
         current = SESSIONS.get(pkg)
-        return bool(current and current.get("session_id") == session_id)
+        if not current or current.get("session_id") != session_id:
+            return False
+        if str(current.get("status") or "").upper() in {"STOPPING", "STOPPED", "FAILED", "START_FAILED"}:
+            return False
+        return not (cancel_event is not None and cancel_event.is_set())
 
     try:
         if not _still_current():
@@ -1535,6 +1618,21 @@ async def _run_package_recovery(
 
         while _still_current():
             attempt += 1
+            if attempt > MAX_RECOVERY_ATTEMPTS:
+                info = SESSIONS.get(pkg)
+                if info is not None:
+                    info["status"] = "FAILED"
+                    info["runtime_status"] = "RECOVERY_EXHAUSTED"
+                log.error(
+                    f"[{pkg}] recovery exhausted after {MAX_RECOVERY_ATTEMPTS} attempts "
+                    f"(session={session_id}, trigger={trigger_reason})."
+                )
+                if info is not None:
+                    await _emit_status(
+                        info.get("_device_id", ""), session_id, pkg, info.get("order_id"),
+                        "START_FAILED", reason="RECOVERY_EXHAUSTED",
+                    )
+                return
             info = SESSIONS[pkg]
             manual = bool(info.get("_manual_restart"))
             info["status"] = "RECOVERING"
@@ -1543,25 +1641,31 @@ async def _run_package_recovery(
             info["runtime_status"] = "RESTARTING" if manual else "RECOVERING"
 
             if attempt > 1:
-                await asyncio.sleep(_recovery_backoff_delay(attempt - 1))
+                if not await _sleep_or_cancel(_recovery_backoff_delay(attempt - 1), cancel_event):
+                    return
             if not _still_current():
                 return
 
             if not manual:  # restart manual dijalankan langsung, tanpa jitter
-                await asyncio.sleep(random.uniform(
+                if not await _sleep_or_cancel(random.uniform(
                     RECOVERY_PRE_KILL_JITTER_MIN_SECONDS,
                     RECOVERY_PRE_KILL_JITTER_MAX_SECONDS,
-                ))
+                ), cancel_event):
+                    return
             if not _still_current():
                 return
 
             survivor_snapshot = await _snapshot_survivor_pids(pkg)
+            if not _still_current():
+                return
 
             # Resolve and kill only PIDs currently owned by this package.
             old_pids = set()
             stale_pids = await asyncio.to_thread(
                 process_manager.get_pids, pkg
             )
+            if not _still_current():
+                return
             if stale_pids is None:
                 log.warning(
                     f"[PID_OWNERSHIP] {pkg}: get_pids UNKNOWN; "
@@ -1570,6 +1674,8 @@ async def _run_package_recovery(
                 continue
 
             for stale_pid in sorted(stale_pids):
+                if not _still_current():
+                    return
                 identity = await asyncio.to_thread(
                     process_manager.get_process_identity, stale_pid
                 )
@@ -1622,6 +1728,8 @@ async def _run_package_recovery(
                     f"{pkg}: target pid={stale_pid} gagal dihentikan."
                 )
 
+            if not _still_current():
+                return
             await _emit_status(
                 info.get("_device_id", ""), session_id, pkg,
                 info.get("order_id"), "RECOVERING",
@@ -1631,10 +1739,12 @@ async def _run_package_recovery(
                 # _emit_status menimpa runtime_status; kembalikan ke state restart.
                 info["runtime_status"] = "WAITING_FOR_PID"
 
+            if not _still_current():
+                return
             lobby_ok = await _launch_then_freeform_soon(
                 pkg, get_lobby_intent(), LOBBY_TIMEOUT_SECONDS,
                 require_join_signal=False, session_id=session_id,
-                only_if_previously_freeform=True,
+                only_if_previously_freeform=True, cancel_event=cancel_event,
             )
             if not _still_current():
                 return
@@ -1655,7 +1765,8 @@ async def _run_package_recovery(
                     if fresh:
                         info["pid"] = _pick_pid(fresh)
                         break
-                    await asyncio.sleep(1)
+                    if not await _sleep_or_cancel(1, cancel_event):
+                        return
                 else:
                     if _still_current():
                         log.warning(f"[{pkg}] restart: PID baru belum terdeteksi dalam "
@@ -1665,7 +1776,7 @@ async def _run_package_recovery(
                 info["runtime_status"] = "RESTARTING"
             log.info(f"[{pkg}] Roblox launched (lobby). PID {old_pid or '-'} -> {info['pid']}")
 
-            if not await _wait_in_lobby(pkg, session_id, recovery=True):
+            if not await _wait_in_lobby(pkg, session_id, recovery=True, cancel_event=cancel_event):
                 return
 
             # Jangan rejoin menggunakan akun yang salah. Recovery wajib
@@ -1685,7 +1796,8 @@ async def _run_package_recovery(
                         == expected_username.strip().lower()
                     ):
                         break
-                    await asyncio.sleep(LOGIN_POLL_INTERVAL_SECONDS)
+                    if not await _sleep_or_cancel(LOGIN_POLL_INTERVAL_SECONDS, cancel_event):
+                        return
                 else:
                     await _emit_status(
                         info.get("_device_id", ""), session_id, pkg,
@@ -1700,7 +1812,7 @@ async def _run_package_recovery(
                 info.get("order_id"), "JOINING_GAME",
             )
 
-            if not await _wait_before_map_entry(pkg, session_id):
+            if not await _wait_before_map_entry(pkg, session_id, cancel_event=cancel_event):
                 return
 
             try:
@@ -1711,8 +1823,11 @@ async def _run_package_recovery(
                 )
                 continue
 
+            if not _still_current():
+                return
             joined = await _attempt_join_target(
-                pkg, session_id, intent_url, DEFAULT_TIMEOUT_SECONDS
+                pkg, session_id, intent_url, DEFAULT_TIMEOUT_SECONDS,
+                cancel_event=cancel_event,
             )
             if not _still_current():
                 return
@@ -1743,11 +1858,16 @@ async def _run_package_recovery(
             else:
                 log.info(f"[{pkg}] New PID detected: {info['pid']}. Recovery successful. State: RUNNING")
 
+            if not _still_current():
+                return
+
             _ensure_watchdog(pkg)
             _ensure_username_scanner(pkg)
             _ensure_error_watcher()
 
             await _activate_freeform_and_restore_siblings(pkg, session_id)
+            if not _still_current():
+                return
             await _verify_survivor_pids_unchanged(
                 survivor_snapshot,
                 phase=f"recovery/{pkg}/attempt-{attempt}",
@@ -1782,7 +1902,7 @@ async def _run_package_recovery(
 
 
 async def _attempt_join_target(
-    pkg: str, session_id: str, intent_url: str, timeout_seconds: int
+    pkg: str, session_id: str, intent_url: str, timeout_seconds: int, cancel_event=None
 ) -> bool:
     def _still_current() -> bool:
         current = SESSIONS.get(pkg)
@@ -1790,7 +1910,7 @@ async def _attempt_join_target(
 
     result = await _launch_then_freeform_soon(
         pkg, intent_url, timeout_seconds,
-        require_join_signal=True, session_id=session_id,
+        require_join_signal=True, session_id=session_id, cancel_event=cancel_event,
     )
     if not _still_current():
         return False

@@ -32,3 +32,4 @@ class UpdateResult:
     current_version: str
     latest_version: str
     error_code: UpdateErrorCode = UpdateErrorCode.NONE
+  

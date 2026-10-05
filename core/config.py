@@ -38,6 +38,9 @@ def load_config(config_path="config.conf"):
         "DEVICE_ID": "",
         "DEVICE_TOKEN": "",
         "BOT_WS_URL": "ws://nano-1.nura.host:5067",
+        # DIAGNOSTIC RELEASE: aktif secara default supaya pengujian bot dapat
+        # mengisolasi error-detect -> SIGTERM tanpa recovery otomatis.
+        "KILL_ONLY_TEST_MODE": True,
     }
 
     with open(config_path, 'r') as f:

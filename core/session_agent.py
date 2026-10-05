@@ -67,6 +67,15 @@ WATCHDOG_POST_STATUS_GRACE_SECONDS = 60
 # Log diagnostik per package per tick (SEMENTARA, untuk debugging).
 # Set False kalau sudah tidak diperlukan.
 WATCHDOG_DEBUG_LOG = True
+
+# DIAGNOSTIC MODE: ketika aktif, event error hanya melakukan exact-PID SIGTERM
+# dan berhenti di sana. Tidak ada automatic recovery dan watchdog tidak boleh
+# memulai recovery. Ini sengaja dibuat sebagai mode uji untuk membuktikan
+# apakah masalah terjadi pada jalur kill atau pada jalur recovery/launch.
+# Release diagnostik ini default ON; caller utama dapat mengubahnya lewat
+# configure_runtime() sebelum agent background dimulai.
+KILL_ONLY_TEST_MODE = True
+
 # Pastikan PID lama benar-benar mati: berapa kali kill ulang kalau masih ada.
 KILL_VERIFY_MAX_ROUNDS = 3
 WATCHDOG_ALIVE_LOG_EVERY_SECONDS = 300
@@ -145,6 +154,22 @@ LOBBY_WAIT_MIN_SECONDS = 60
 LOBBY_WAIT_MAX_SECONDS = 90
 MAP_ENTRY_DELAY_MIN_SECONDS = 10
 MAP_ENTRY_DELAY_MAX_SECONDS = 30
+
+def configure_runtime(*, kill_only_test_mode=None) -> None:
+    """Configure runtime diagnostics before the agent thread starts.
+
+    `KILL_ONLY_TEST_MODE=True` menonaktifkan semua automatic recovery trigger
+    tetapi TIDAK mematikan ErrorDetector. Error yang tervalidasi tetap boleh
+    memicu exact-PID SIGTERM untuk keperluan isolation test.
+    """
+    global KILL_ONLY_TEST_MODE
+    if kill_only_test_mode is not None:
+        KILL_ONLY_TEST_MODE = bool(kill_only_test_mode)
+    log.warning(
+        "SESSION_AGENT: KILL_ONLY_TEST_MODE=%s",
+        KILL_ONLY_TEST_MODE,
+    )
+
 
 def _recovery_backoff_delay(attempt: int) -> float:
     if attempt >= RECOVERY_CIRCUIT_BREAKER_THRESHOLD:
@@ -1320,6 +1345,13 @@ async def _start_recovery_inline(pkg: str, info: dict, trigger: str) -> None:
     """Mulai recovery SATU package. WAJIB dipanggil dengan _recovery_in_progress
     sudah di-add secara SINKRON oleh caller (tidak ada await di antara cek
     lock dan add) supaya tidak ada dua recovery untuk package yang sama."""
+    if KILL_ONLY_TEST_MODE:
+        log.warning(
+            f"[KILL_ONLY_TEST] recovery request diblokir untuk {pkg} "
+            f"trigger={trigger}."
+        )
+        return
+
     session_id = info.get("session_id", "")
     info["crash_count"] = info.get("crash_count", 0) + 1
     info["status"] = "RECOVERING"
@@ -1375,6 +1407,14 @@ async def _watchdog_tick(pkg: str, info: dict) -> None:
     diperlakukan sebagai sehat dan juga tidak boleh memicu kill palsu.
     """
     status = info.get("status")
+
+    if KILL_ONLY_TEST_MODE:
+        # Keep watchdog task alive for heartbeat supervision, but never allow
+        # a missing/cached PID to become an automatic recovery trigger during
+        # the diagnostic kill-only experiment.
+        if WATCHDOG_DEBUG_LOG and status == "ACTIVE":
+            log.info(f"[KILL_ONLY_TEST] watchdog recovery disabled for {pkg}.")
+        return
 
     if status == "RECOVERING":
         if pkg in _recovery_in_progress:
@@ -1648,6 +1688,38 @@ async def _error_event_consumer_loop() -> None:
         raise
 
 
+async def _handle_kill_only_error(event: dict, info: dict, pkg: str, pid: str, incident_id: str, reason, event_start_time) -> None:
+    """Diagnostic path: validate target was already done, then SIGTERM EXACT PID only.
+
+    Recovery, relaunch, rejoin, sibling restore, and watchdog-triggered recovery
+    are deliberately not entered. This gives a clean experiment boundary:
+    ERROR -> VERIFY -> SIGTERM -> STOP.
+    """
+    del event  # kept in signature for future diagnostic metadata extensions
+    killed = await _kill_exact_pid_and_verify(pkg, pid, event_start_time)
+    info["pid_alive"] = False if killed else None
+    info["package_alive"] = False if killed else None
+    info["adj"] = None
+    info["liveness_state"] = "KILL_ONLY_DEAD" if killed else "KILL_ONLY_KILL_FAILED"
+    info["last_kill_only_incident_id"] = incident_id
+    info["last_kill_only_reason"] = reason
+    info["last_kill_only_pid"] = pid
+    info["last_kill_only_at"] = time.time()
+    if killed:
+        info["pid"] = "-"
+        log.warning(
+            f"[KILL_ONLY_TEST] incident={incident_id} package={pkg} "
+            f"pid={pid} reason={reason} signal=SIGTERM result=DEAD "
+            "recovery=DISABLED sibling_touch=NONE."
+        )
+    else:
+        log.error(
+            f"[KILL_ONLY_TEST] incident={incident_id} package={pkg} "
+            f"pid={pid} reason={reason} signal=SIGTERM result=FAILED "
+            "no-fallback=no-recovery."
+        )
+
+
 async def _handle_disconnect_event(event: dict) -> None:
     pid = str(event.get("pid") or "").strip()
     pkg = str(event.get("package") or "").strip()
@@ -1695,6 +1767,12 @@ async def _handle_disconnect_event(event: dict) -> None:
         log.warning(
             f"[ERROR_EVENT] incident={incident_id} {pkg}: event pid={pid} "
             f"bukan PID session saat ini ({current_tracked_pid}); DROP."
+        )
+        return
+
+    if KILL_ONLY_TEST_MODE:
+        await _handle_kill_only_error(
+            event, info, pkg, pid, incident_id, reason, event_start_time
         )
         return
 

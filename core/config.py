@@ -38,9 +38,9 @@ def load_config(config_path="config.conf"):
         "DEVICE_ID": "",
         "DEVICE_TOKEN": "",
         "BOT_WS_URL": "ws://nano-1.nura.host:5067",
-        # DIAGNOSTIC RELEASE: aktif secara default supaya pengujian bot dapat
-        # mengisolasi error-detect -> SIGTERM tanpa recovery otomatis.
-        "KILL_ONLY_TEST_MODE": True,
+        # Diagnostic release: Phase B active by default.
+        "KILL_ONLY_TEST_MODE": False,
+        "KILL_THEN_LAUNCH_TEST_MODE": True,
     }
 
     with open(config_path, 'r') as f:
@@ -60,6 +60,8 @@ def load_config(config_path="config.conf"):
                 
                 if key in ["DEVICE_ID", "DEVICE_TOKEN", "BOT_WS_URL"]:
                     config[key] = val
+                elif key in ["KILL_ONLY_TEST_MODE", "KILL_THEN_LAUNCH_TEST_MODE"]:
+                    config[key] = val.lower() in {"1", "true", "yes", "on"}
                     
     log.info("CONFIG: Konfigurasi berhasil dimuat dengan aman.")
     return config

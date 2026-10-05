@@ -74,7 +74,10 @@ WATCHDOG_DEBUG_LOG = True
 # apakah masalah terjadi pada jalur kill atau pada jalur recovery/launch.
 # Release diagnostik ini default ON; caller utama dapat mengubahnya lewat
 # configure_runtime() sebelum agent background dimulai.
-KILL_ONLY_TEST_MODE = True
+KILL_ONLY_TEST_MODE = False
+# DIAGNOSTIC PHASE B: kill exact target PID, then launch target package only.
+# No join/rejoin, watchdog recovery, retry, sibling restore, or sibling launch.
+KILL_THEN_LAUNCH_TEST_MODE = True
 
 # Pastikan PID lama benar-benar mati: berapa kali kill ulang kalau masih ada.
 KILL_VERIFY_MAX_ROUNDS = 3
@@ -155,19 +158,28 @@ LOBBY_WAIT_MAX_SECONDS = 90
 MAP_ENTRY_DELAY_MIN_SECONDS = 10
 MAP_ENTRY_DELAY_MAX_SECONDS = 30
 
-def configure_runtime(*, kill_only_test_mode=None) -> None:
+def configure_runtime(*, kill_only_test_mode=None, kill_then_launch_test_mode=None) -> None:
     """Configure runtime diagnostics before the agent thread starts.
 
-    `KILL_ONLY_TEST_MODE=True` menonaktifkan semua automatic recovery trigger
-    tetapi TIDAK mematikan ErrorDetector. Error yang tervalidasi tetap boleh
-    memicu exact-PID SIGTERM untuk keperluan isolation test.
+    Diagnostic modes keep ErrorDetector active but stop normal recovery.
+    KILL_ONLY_TEST_MODE performs exact-PID SIGTERM only.
+    KILL_THEN_LAUNCH_TEST_MODE performs exact-PID SIGTERM followed by a
+    target-only lobby launch, then stops.
     """
-    global KILL_ONLY_TEST_MODE
+    global KILL_ONLY_TEST_MODE, KILL_THEN_LAUNCH_TEST_MODE
     if kill_only_test_mode is not None:
         KILL_ONLY_TEST_MODE = bool(kill_only_test_mode)
+    if kill_then_launch_test_mode is not None:
+        KILL_THEN_LAUNCH_TEST_MODE = bool(kill_then_launch_test_mode)
+    if KILL_ONLY_TEST_MODE and KILL_THEN_LAUNCH_TEST_MODE:
+        log.warning(
+            "SESSION_AGENT: both diagnostic modes enabled; "
+            "KILL_THEN_LAUNCH_TEST_MODE takes precedence."
+        )
     log.warning(
-        "SESSION_AGENT: KILL_ONLY_TEST_MODE=%s",
+        "SESSION_AGENT: KILL_ONLY_TEST_MODE=%s KILL_THEN_LAUNCH_TEST_MODE=%s",
         KILL_ONLY_TEST_MODE,
+        KILL_THEN_LAUNCH_TEST_MODE,
     )
 
 
@@ -1345,7 +1357,7 @@ async def _start_recovery_inline(pkg: str, info: dict, trigger: str) -> None:
     """Mulai recovery SATU package. WAJIB dipanggil dengan _recovery_in_progress
     sudah di-add secara SINKRON oleh caller (tidak ada await di antara cek
     lock dan add) supaya tidak ada dua recovery untuk package yang sama."""
-    if KILL_ONLY_TEST_MODE:
+    if KILL_ONLY_TEST_MODE or KILL_THEN_LAUNCH_TEST_MODE:
         log.warning(
             f"[KILL_ONLY_TEST] recovery request diblokir untuk {pkg} "
             f"trigger={trigger}."
@@ -1408,7 +1420,7 @@ async def _watchdog_tick(pkg: str, info: dict) -> None:
     """
     status = info.get("status")
 
-    if KILL_ONLY_TEST_MODE:
+    if KILL_ONLY_TEST_MODE or KILL_THEN_LAUNCH_TEST_MODE:
         # Keep watchdog task alive for heartbeat supervision, but never allow
         # a missing/cached PID to become an automatic recovery trigger during
         # the diagnostic kill-only experiment.
@@ -1688,6 +1700,103 @@ async def _error_event_consumer_loop() -> None:
         raise
 
 
+async def _handle_kill_then_launch_test_error(
+    event: dict,
+    info: dict,
+    pkg: str,
+    pid: str,
+    incident_id: str,
+    reason,
+    event_start_time,
+) -> None:
+    """Diagnostic Phase B: exact-PID SIGTERM, then launch TARGET ONLY.
+
+    This intentionally stops before full recovery. No join/rejoin, watchdog
+    recovery, retry, freeform, sibling restore, or sibling launch is allowed.
+    The purpose is to isolate whether the target launch operation itself causes
+    cross-package impact after the proven-safe SIGTERM.
+    """
+    del event
+    killed = await _kill_exact_pid_and_verify(pkg, pid, event_start_time)
+    info["pid_alive"] = False if killed else None
+    info["package_alive"] = False if killed else None
+    info["adj"] = None
+    info["last_phase_b_incident_id"] = incident_id
+    info["last_phase_b_reason"] = reason
+    info["last_phase_b_old_pid"] = pid
+    info["last_phase_b_at"] = time.time()
+
+    if not killed:
+        info["liveness_state"] = "PHASE_B_KILL_FAILED"
+        log.error(
+            f"[PHASE_B] incident={incident_id} package={pkg} pid={pid} "
+            f"reason={reason} signal=SIGTERM result=FAILED; "
+            "launch=SKIPPED recovery=DISABLED sibling_touch=NONE."
+        )
+        return
+
+    info["pid"] = "-"
+    info["liveness_state"] = "PHASE_B_TARGET_DEAD"
+    log.warning(
+        f"[PHASE_B] incident={incident_id} package={pkg} pid={pid} "
+        f"reason={reason} signal=SIGTERM result=DEAD; "
+        "launching TARGET ONLY; recovery/join/watchdog/sibling actions disabled."
+    )
+
+    # Use the same lobby launch primitive the normal recovery would use, but
+    # deliberately do NOT call _launch_then_freeform_soon(): that helper also
+    # starts Freeform/Smart-Wait tasks. Phase B needs exactly one additional
+    # variable: target launch.
+    try:
+        launch_ok, launch_start_time = await asyncio.to_thread(
+            launch_normal, pkg, get_lobby_intent()
+        )
+    except Exception:
+        launch_ok, launch_start_time = False, None
+        log.error(
+            f"[PHASE_B] incident={incident_id} package={pkg}: exception during target-only launch.",
+            exc_info=True,
+        )
+
+    if not launch_ok:
+        info["liveness_state"] = "PHASE_B_LAUNCH_FAILED"
+        log.error(
+            f"[PHASE_B] incident={incident_id} package={pkg}: "
+            "target-only launch failed; recovery=DISABLED."
+        )
+        return
+
+    # Lightweight target-only verification: wait for any PID belonging to the
+    # same package. We never enumerate or act on sibling packages here.
+    deadline = time.monotonic() + LOBBY_TIMEOUT_SECONDS
+    new_pid = ""
+    while time.monotonic() < deadline:
+        current_pids = await asyncio.to_thread(process_manager.get_pids, pkg)
+        if current_pids:
+            new_pid = _pick_pid(current_pids)
+            break
+        await asyncio.sleep(1)
+
+    if new_pid:
+        info["pid"] = new_pid
+        info["pid_start_time"] = None
+        info["pid_alive"] = True
+        info["package_alive"] = True
+        info["liveness_state"] = "PHASE_B_TARGET_LAUNCHED"
+        log.warning(
+            f"[PHASE_B] incident={incident_id} package={pkg}: "
+            f"target-only launch verified pid={new_pid}; "
+            "join/recovery/watchdog remain DISABLED."
+        )
+    else:
+        info["liveness_state"] = "PHASE_B_LAUNCH_UNVERIFIED"
+        log.error(
+            f"[PHASE_B] incident={incident_id} package={pkg}: "
+            f"no target PID detected after {LOBBY_TIMEOUT_SECONDS}s; "
+            "recovery=DISABLED sibling_touch=NONE."
+        )
+
+
 async def _handle_kill_only_error(event: dict, info: dict, pkg: str, pid: str, incident_id: str, reason, event_start_time) -> None:
     """Diagnostic path: validate target was already done, then SIGTERM EXACT PID only.
 
@@ -1767,6 +1876,12 @@ async def _handle_disconnect_event(event: dict) -> None:
         log.warning(
             f"[ERROR_EVENT] incident={incident_id} {pkg}: event pid={pid} "
             f"bukan PID session saat ini ({current_tracked_pid}); DROP."
+        )
+        return
+
+    if KILL_THEN_LAUNCH_TEST_MODE:
+        await _handle_kill_then_launch_test_error(
+            event, info, pkg, pid, incident_id, reason, event_start_time
         )
         return
 

@@ -14,6 +14,7 @@ from core.ui import clear_screen
 from core.menu import show_main_menu
 from core.config import load_config
 from core.agent_client import start_agent_background
+from core import session_agent
 
 def ensure_root():
     """Memastikan script berjalan di bawah environment Root."""
@@ -58,6 +59,9 @@ def main():
     # utama TETAP JALAN seperti biasa (fitur ini tidak boleh jadi titik gagal).
     try:
         cfg = load_config()
+        session_agent.configure_runtime(
+            kill_only_test_mode=cfg.get("KILL_ONLY_TEST_MODE", True)
+        )
         start_agent_background(
             device_id=cfg.get("DEVICE_ID", ""),
             token=cfg.get("DEVICE_TOKEN", ""),

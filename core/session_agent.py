@@ -2623,32 +2623,146 @@ async def _attempt_join_target(
 # ==========================================================
 
 async def handle_sync_sessions(msg: dict, local_device_id: str) -> dict:
-    """Entry point dipanggil agent_client.py saat terima SYNC_SESSIONS dari
-    bot. Bot SELALU mengirim ini sesaat setelah REGISTER_OK -- mencakup TIGA
-    skenario reconnect sekaligus lewat jalur yang sama (bot restart, device
-    reconnect, WS putus-nyambung), device tidak perlu tahu/bedakan mana yang
-    mana. Lihat reconcile_sync() untuk aturan lengkap."""
-    expected = msg.get("sessions", [])
-    if not isinstance(expected, list):
-        expected = []
-    snapshot = await reconcile_sync(expected, local_device_id)
-    return {"type": "SYNC_RESPONSE", "device_id": local_device_id, "packages": snapshot}
+    """Handle one *validated* authoritative sync snapshot from the bot.
+
+    SYNC_SESSIONS is safety-sensitive because a valid snapshot may cause a
+    local orphan session to be stopped. Therefore malformed/partial/legacy
+    syncs are rejected instead of being converted into an empty list.
+    """
+    expected = msg.get("sessions")
+    sync_id = str(msg.get("sync_id") or "").strip()[:128]
+    command_id = str(msg.get("command_id") or "").strip()[:128]
+    sync_mode = str(msg.get("sync_mode") or "")
+
+    if (msg.get("complete") is not True
+            or sync_mode != "AUTHORITATIVE_COMPLETE_V2"
+            or not sync_id
+            or not command_id
+            or not isinstance(expected, list)):
+        log.error(
+            f"SYNC_SESSIONS ditolak: payload tidak authoritative-complete; "
+            f"device={local_device_id} sync_id={sync_id or '-'} command_id={command_id or '-'}"
+        )
+        return {
+            "type": "SYNC_RESPONSE",
+            "device_id": local_device_id,
+            "sync_id": sync_id,
+            "command_id": command_id,
+            "sync_mode": sync_mode,
+            "complete": False,
+            "session_count": 0,
+            "ok": False,
+            "error": "INVALID_SYNC_PAYLOAD",
+            "packages": {},
+        }
+
+    try:
+        declared_count = int(msg.get("session_count"))
+    except (TypeError, ValueError):
+        declared_count = -1
+    if declared_count != len(expected):
+        log.error(
+            f"SYNC_SESSIONS ditolak: session_count mismatch device={local_device_id} "
+            f"declared={msg.get('session_count')!r} actual={len(expected)} sync_id={sync_id}"
+        )
+        return {
+            "type": "SYNC_RESPONSE",
+            "device_id": local_device_id,
+            "sync_id": sync_id,
+            "command_id": command_id,
+            "sync_mode": sync_mode,
+            "complete": False,
+            "session_count": 0,
+            "ok": False,
+            "error": "SYNC_COUNT_MISMATCH",
+            "packages": {},
+        }
+
+    # Validate every binding before permitting any destructive reconciliation.
+    seen_sessions = set()
+    seen_packages = set()
+    for entry in expected:
+        if not isinstance(entry, dict):
+            return {
+                "type": "SYNC_RESPONSE", "device_id": local_device_id,
+                "sync_id": sync_id, "command_id": command_id,
+                "sync_mode": sync_mode, "complete": False,
+                "session_count": 0, "ok": False,
+                "error": "SYNC_ENTRY_INVALID", "packages": {},
+            }
+        pkg = str(entry.get("package_name") or "").strip()
+        sid = str(entry.get("session_id") or "").strip()
+        if not pkg or not process_manager.is_valid_package_name(pkg) or not sid:
+            return {
+                "type": "SYNC_RESPONSE", "device_id": local_device_id,
+                "sync_id": sync_id, "command_id": command_id,
+                "sync_mode": sync_mode, "complete": False,
+                "session_count": 0, "ok": False,
+                "error": "SYNC_ENTRY_BINDING_INVALID", "packages": {},
+            }
+        if sid in seen_sessions or pkg in seen_packages:
+            return {
+                "type": "SYNC_RESPONSE", "device_id": local_device_id,
+                "sync_id": sync_id, "command_id": command_id,
+                "sync_mode": sync_mode, "complete": False,
+                "session_count": 0, "ok": False,
+                "error": "SYNC_DUPLICATE_BINDING", "packages": {},
+            }
+        seen_sessions.add(sid)
+        seen_packages.add(pkg)
+
+    snapshot = await reconcile_sync(
+        expected, local_device_id,
+        authoritative_complete=True,
+        sync_id=sync_id,
+    )
+    return {
+        "type": "SYNC_RESPONSE",
+        "device_id": local_device_id,
+        "sync_id": sync_id,
+        "command_id": command_id,
+        "sync_mode": "AUTHORITATIVE_COMPLETE_V2",
+        "complete": True,
+        "session_count": len(expected),
+        "ok": True,
+        "packages": snapshot,
+    }
 
 
-async def reconcile_sync(expected_sessions: list, local_device_id: str) -> dict:
-    """Reconcile bot-authoritative session list dengan proses fisik device."""
+async def reconcile_sync(
+    expected_sessions: list,
+    local_device_id: str,
+    *,
+    authoritative_complete: bool = False,
+    sync_id: str = "",
+) -> dict:
+    """Reconcile a bot-authoritative session list with physical device state.
+
+    Destructive orphan stopping is permitted ONLY for an explicitly validated
+    complete sync snapshot. This prevents malformed/partial sync payloads from
+    becoming a device-wide STOP operation.
+    """
+    if not authoritative_complete:
+        log.error(
+            f"SYNC_RECONCILE blocked for device={local_device_id}: "
+            f"non-authoritative or incomplete snapshot. sync_id={sync_id or '-'}"
+        )
+        return _snapshot_for_sync()
+
     expected_by_pkg = {}
     for entry in expected_sessions:
-        if not isinstance(entry, dict):
-            continue
         pkg = str(entry.get("package_name", "")).strip()
-        if pkg:
-            expected_by_pkg[pkg] = entry
+        expected_by_pkg[pkg] = entry
 
-    # Local-only sessions adalah orphan dari perspektif bot.
+    # Local-only sessions are considered orphans ONLY after the authoritative
+    # snapshot has passed every completeness/binding validation above.
     for pkg in list(SESSIONS.keys()):
         if pkg not in expected_by_pkg:
             local_session_id = SESSIONS[pkg].get("session_id", "")
+            log.warning(
+                f"[SYNC_RECONCILE] authoritative orphan -> STOP_SESSION "
+                f"device={local_device_id} package={pkg} session={local_session_id} sync_id={sync_id or '-'}"
+            )
             await handle_stop_session(
                 {"session_id": local_session_id, "package_name": pkg},
                 local_device_id,

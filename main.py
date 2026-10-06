@@ -62,6 +62,7 @@ def main():
         session_agent.configure_runtime(
             kill_only_test_mode=cfg.get("KILL_ONLY_TEST_MODE", False),
             kill_then_launch_test_mode=cfg.get("KILL_THEN_LAUNCH_TEST_MODE", True),
+            phase_b1_single_incident_mode=cfg.get("PHASE_B1_SINGLE_INCIDENT_MODE", True),
         )
         start_agent_background(
             device_id=cfg.get("DEVICE_ID", ""),

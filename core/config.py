@@ -41,6 +41,7 @@ def load_config(config_path="config.conf"):
         # Diagnostic release: Phase B active by default.
         "KILL_ONLY_TEST_MODE": False,
         "KILL_THEN_LAUNCH_TEST_MODE": True,
+        "PHASE_B1_SINGLE_INCIDENT_MODE": True,
     }
 
     with open(config_path, 'r') as f:
@@ -60,7 +61,7 @@ def load_config(config_path="config.conf"):
                 
                 if key in ["DEVICE_ID", "DEVICE_TOKEN", "BOT_WS_URL"]:
                     config[key] = val
-                elif key in ["KILL_ONLY_TEST_MODE", "KILL_THEN_LAUNCH_TEST_MODE"]:
+                elif key in ["KILL_ONLY_TEST_MODE", "KILL_THEN_LAUNCH_TEST_MODE", "PHASE_B1_SINGLE_INCIDENT_MODE"]:
                     config[key] = val.lower() in {"1", "true", "yes", "on"}
                     
     log.info("CONFIG: Konfigurasi berhasil dimuat dengan aman.")

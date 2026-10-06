@@ -78,6 +78,11 @@ KILL_ONLY_TEST_MODE = False
 # DIAGNOSTIC PHASE B: kill exact target PID, then launch target package only.
 # No join/rejoin, watchdog recovery, retry, sibling restore, or sibling launch.
 KILL_THEN_LAUNCH_TEST_MODE = True
+# DIAGNOSTIC PHASE B.1: same as Phase B, but only the FIRST verified error
+# incident is allowed to drive kill+launch for the lifetime of this agent
+# process. Later error events are recorded as ignored, so a cross-package
+# side-effect cannot cascade into a second diagnostic recovery.
+PHASE_B1_SINGLE_INCIDENT_MODE = False
 
 # Pastikan PID lama benar-benar mati: berapa kali kill ulang kalau masih ada.
 KILL_VERIFY_MAX_ROUNDS = 3
@@ -158,7 +163,7 @@ LOBBY_WAIT_MAX_SECONDS = 90
 MAP_ENTRY_DELAY_MIN_SECONDS = 10
 MAP_ENTRY_DELAY_MAX_SECONDS = 30
 
-def configure_runtime(*, kill_only_test_mode=None, kill_then_launch_test_mode=None) -> None:
+def configure_runtime(*, kill_only_test_mode=None, kill_then_launch_test_mode=None, phase_b1_single_incident_mode=None) -> None:
     """Configure runtime diagnostics before the agent thread starts.
 
     Diagnostic modes keep ErrorDetector active but stop normal recovery.
@@ -166,20 +171,28 @@ def configure_runtime(*, kill_only_test_mode=None, kill_then_launch_test_mode=No
     KILL_THEN_LAUNCH_TEST_MODE performs exact-PID SIGTERM followed by a
     target-only lobby launch, then stops.
     """
-    global KILL_ONLY_TEST_MODE, KILL_THEN_LAUNCH_TEST_MODE
+    global KILL_ONLY_TEST_MODE, KILL_THEN_LAUNCH_TEST_MODE, PHASE_B1_SINGLE_INCIDENT_MODE
     if kill_only_test_mode is not None:
         KILL_ONLY_TEST_MODE = bool(kill_only_test_mode)
     if kill_then_launch_test_mode is not None:
         KILL_THEN_LAUNCH_TEST_MODE = bool(kill_then_launch_test_mode)
+    if phase_b1_single_incident_mode is not None:
+        PHASE_B1_SINGLE_INCIDENT_MODE = bool(phase_b1_single_incident_mode)
+    if PHASE_B1_SINGLE_INCIDENT_MODE and not KILL_THEN_LAUNCH_TEST_MODE:
+        log.warning(
+            "SESSION_AGENT: Phase B.1 requires KILL_THEN_LAUNCH_TEST_MODE; enabling Phase B."
+        )
+        KILL_THEN_LAUNCH_TEST_MODE = True
     if KILL_ONLY_TEST_MODE and KILL_THEN_LAUNCH_TEST_MODE:
         log.warning(
             "SESSION_AGENT: both diagnostic modes enabled; "
             "KILL_THEN_LAUNCH_TEST_MODE takes precedence."
         )
     log.warning(
-        "SESSION_AGENT: KILL_ONLY_TEST_MODE=%s KILL_THEN_LAUNCH_TEST_MODE=%s",
+        "SESSION_AGENT: KILL_ONLY_TEST_MODE=%s KILL_THEN_LAUNCH_TEST_MODE=%s PHASE_B1_SINGLE_INCIDENT_MODE=%s",
         KILL_ONLY_TEST_MODE,
         KILL_THEN_LAUNCH_TEST_MODE,
+        PHASE_B1_SINGLE_INCIDENT_MODE,
     )
 
 
@@ -219,6 +232,12 @@ _STOP_TASKS: dict = {}             # pkg -> stop cleanup task
 
 # Recovery lock per package. Satu package hanya boleh punya satu recovery aktif.
 _recovery_in_progress: set = set()
+
+# Phase B.1: only one verified error incident is allowed to execute
+# kill+launch during the current agent process. The incident is intentionally
+# sticky until process restart so later cross-package side-effect events cannot
+# cascade into additional kill/launch operations.
+_phase_b1_incident: dict | None = None
 
 # Consumer error_detector global, satu per event loop agent.
 _error_watcher_task = None
@@ -1420,12 +1439,15 @@ async def _watchdog_tick(pkg: str, info: dict) -> None:
     """
     status = info.get("status")
 
-    if KILL_ONLY_TEST_MODE or KILL_THEN_LAUNCH_TEST_MODE:
+    if KILL_ONLY_TEST_MODE or KILL_THEN_LAUNCH_TEST_MODE or PHASE_B1_SINGLE_INCIDENT_MODE:
         # Keep watchdog task alive for heartbeat supervision, but never allow
         # a missing/cached PID to become an automatic recovery trigger during
         # the diagnostic kill-only experiment.
         if WATCHDOG_DEBUG_LOG and status == "ACTIVE":
-            log.info(f"[KILL_ONLY_TEST] watchdog recovery disabled for {pkg}.")
+            log.info(
+                f"[DIAGNOSTIC] watchdog recovery disabled for {pkg}. "
+                f"mode=kill-only/phase-B"
+            )
         return
 
     if status == "RECOVERING":
@@ -1700,6 +1722,198 @@ async def _error_event_consumer_loop() -> None:
         raise
 
 
+
+def _format_phase_b1_snapshot(snapshot: dict) -> str:
+    parts = []
+    for pkg in sorted(snapshot):
+        data = snapshot[pkg]
+        pids = data.get("pids")
+        if pids is None:
+            pid_text = "UNKNOWN"
+        else:
+            pid_text = ",".join(sorted(str(p) for p in pids)) or "-"
+        parts.append(
+            f"{pkg}[pids={pid_text},tracked_pid={data.get('tracked_pid') or '-'},"
+            f"session={data.get('session_id') or '-'}]"
+        )
+    return " ; ".join(parts) if parts else "<no-active-sessions>"
+
+
+async def _phase_b1_snapshot_active_sessions(label: str, target_pkg: str, incident_id: str) -> dict:
+    """Read-only forensic snapshot of every ACTIVE session's PID set.
+
+    This helper deliberately performs only non-mutating PID probes. It never
+    launches, kills, restores, foregrounds, or otherwise controls sibling
+    packages. The snapshots make it possible to distinguish:
+      - sibling process died before target launch
+      - sibling process died after target launch
+      - sibling process PID stayed unchanged
+    """
+    sessions = list(SESSIONS.items())
+
+    async def probe(pkg: str, info: dict):
+        status = str(info.get("status") or "").upper()
+        if status != "ACTIVE" and pkg != target_pkg:
+            return pkg, None
+        pids = await asyncio.to_thread(process_manager.get_pids, pkg)
+        data = {
+            "session_id": str(info.get("session_id") or ""),
+            "tracked_pid": str(info.get("pid") or ""),
+            "pids": None if pids is None else set(str(p) for p in pids),
+            "ts": time.time(),
+        }
+        return pkg, data
+
+    results = await asyncio.gather(
+        *(probe(pkg, info) for pkg, info in sessions),
+        return_exceptions=True,
+    )
+    snapshot = {}
+    for item in results:
+        if isinstance(item, Exception) or not item:
+            continue
+        pkg, data = item
+        if data is not None:
+            snapshot[pkg] = data
+
+    log.warning(
+        f"[PHASE_B1][SNAPSHOT] incident={incident_id} label={label} "
+        f"target={target_pkg} state={_format_phase_b1_snapshot(snapshot)}"
+    )
+    return snapshot
+
+
+async def _handle_phase_b1_single_incident_error(
+    event: dict,
+    info: dict,
+    pkg: str,
+    pid: str,
+    incident_id: str,
+    reason,
+    event_start_time,
+) -> None:
+    """Phase B.1: ONE error incident, exact kill + target-only launch.
+
+    A sticky incident gate prevents any later error event from producing a
+    second kill/launch in the same diagnostic process. Read-only snapshots are
+    captured before kill, after kill, and after target launch. Sibling packages
+    are never launched/killed/restored by this path.
+    """
+    global _phase_b1_incident
+    del event
+
+    before = await _phase_b1_snapshot_active_sessions(
+        "BEFORE_KILL", pkg, incident_id
+    )
+
+    killed = await _kill_exact_pid_and_verify(pkg, pid, event_start_time)
+    info["pid_alive"] = False if killed else None
+    info["package_alive"] = False if killed else None
+    info["adj"] = None
+    info["last_phase_b1_incident_id"] = incident_id
+    info["last_phase_b1_reason"] = reason
+    info["last_phase_b1_old_pid"] = pid
+    info["last_phase_b1_at"] = time.time()
+
+    after_kill = await _phase_b1_snapshot_active_sessions(
+        "AFTER_KILL", pkg, incident_id
+    )
+
+    if not killed:
+        info["liveness_state"] = "PHASE_B1_KILL_FAILED"
+        log.error(
+            f"[PHASE_B1] incident={incident_id} package={pkg} pid={pid} "
+            f"reason={reason} signal=SIGTERM result=FAILED; "
+            "launch=SKIPPED recovery=DISABLED sibling_touch=NONE."
+        )
+        log.warning(
+            f"[PHASE_B1][DELTA] incident={incident_id} "
+            f"before={_format_phase_b1_snapshot(before)} "
+            f"after_kill={_format_phase_b1_snapshot(after_kill)}"
+        )
+        return
+
+    info["pid"] = "-"
+    info["liveness_state"] = "PHASE_B1_TARGET_DEAD"
+    log.warning(
+        f"[PHASE_B1] incident={incident_id} package={pkg} pid={pid} "
+        f"reason={reason} signal=SIGTERM result=DEAD; "
+        "launching TARGET ONLY; later incidents ignored."
+    )
+
+    try:
+        launch_ok, _launch_start_time = await asyncio.to_thread(
+            launch_normal, pkg, get_lobby_intent()
+        )
+    except Exception:
+        launch_ok = False
+        log.error(
+            f"[PHASE_B1] incident={incident_id} package={pkg}: "
+            "exception during target-only launch.",
+            exc_info=True,
+        )
+
+    after_launch = await _phase_b1_snapshot_active_sessions(
+        "AFTER_TARGET_LAUNCH", pkg, incident_id
+    )
+
+    if not launch_ok:
+        info["liveness_state"] = "PHASE_B1_LAUNCH_FAILED"
+        log.error(
+            f"[PHASE_B1] incident={incident_id} package={pkg}: "
+            "target-only launch failed; recovery=DISABLED."
+        )
+    else:
+        # Verify target only. This probe does not affect siblings.
+        deadline = time.monotonic() + LOBBY_TIMEOUT_SECONDS
+        new_pid = ""
+        while time.monotonic() < deadline:
+            current_pids = await asyncio.to_thread(process_manager.get_pids, pkg)
+            if current_pids:
+                new_pid = _pick_pid(current_pids)
+                break
+            await asyncio.sleep(1)
+
+        if new_pid:
+            info["pid"] = new_pid
+            info["pid_start_time"] = None
+            info["pid_alive"] = True
+            info["package_alive"] = True
+            info["liveness_state"] = "PHASE_B1_TARGET_LAUNCHED"
+            log.warning(
+                f"[PHASE_B1] incident={incident_id} package={pkg}: "
+                f"target-only launch verified pid={new_pid}; "
+                "join/recovery/watchdog remain DISABLED."
+            )
+        else:
+            info["liveness_state"] = "PHASE_B1_LAUNCH_UNVERIFIED"
+            log.error(
+                f"[PHASE_B1] incident={incident_id} package={pkg}: "
+                f"no target PID detected after {LOBBY_TIMEOUT_SECONDS}s; "
+                "recovery=DISABLED sibling_touch=NONE."
+            )
+
+    log.warning(
+        f"[PHASE_B1][DELTA] incident={incident_id} "
+        f"before={_format_phase_b1_snapshot(before)} "
+        f"after_kill={_format_phase_b1_snapshot(after_kill)} "
+        f"after_launch={_format_phase_b1_snapshot(after_launch)}"
+    )
+    _phase_b1_incident = {
+        "incident_id": incident_id,
+        "target_package": pkg,
+        "target_pid": pid,
+        "reason": reason,
+        "started_at": before.get(pkg, {}).get("ts", time.time()),
+        "finished_at": time.time(),
+        "snapshots": {
+            "before_kill": before,
+            "after_kill": after_kill,
+            "after_launch": after_launch,
+        },
+    }
+
+
 async def _handle_kill_then_launch_test_error(
     event: dict,
     info: dict,
@@ -1876,6 +2090,29 @@ async def _handle_disconnect_event(event: dict) -> None:
         log.warning(
             f"[ERROR_EVENT] incident={incident_id} {pkg}: event pid={pid} "
             f"bukan PID session saat ini ({current_tracked_pid}); DROP."
+        )
+        return
+
+    if PHASE_B1_SINGLE_INCIDENT_MODE:
+        global _phase_b1_incident
+        if _phase_b1_incident is not None:
+            log.warning(
+                f"[PHASE_B1] incident={incident_id} package={pkg} pid={pid} "
+                f"reason={reason} IGNORED: single-incident already locked to "
+                f"{_phase_b1_incident['target_package']}"
+                f"/{_phase_b1_incident['target_pid']} (incident={_phase_b1_incident['incident_id']})."
+            )
+            return
+        _phase_b1_incident = {
+            "incident_id": incident_id,
+            "target_package": pkg,
+            "target_pid": pid,
+            "reason": reason,
+            "started_at": time.time(),
+            "state": "RUNNING",
+        }
+        await _handle_phase_b1_single_incident_error(
+            event, info, pkg, pid, incident_id, reason, event_start_time
         )
         return
 

@@ -41,19 +41,25 @@ NETWORK_PATTERN = re.compile(
     r"\[FLog::Network\]"
 )
 
-# 285 = disconnect/error event seen in Roblox FLog::Network; treat as recoverable.
-# 287 = "Koneksi Terputus ... Server telah dimatikan" (server shutdown). Pada
-# dialog ini proses Roblox TETAP HIDUP (PID ada), jadi watchdog PID tidak bisa
-# menangkapnya -- satu-satunya sinyal adalah baris log ini.
+# Known Roblox disconnect/error codes observed by this project.
+# Keep the list explicit to avoid turning arbitrary numbers into recovery triggers.
+SUPPORTED_REASON_CODES = (266, 267, 277, 279, 280, 285, 287)
+
+# Typical FLog::Network format: "Sending disconnect with reason: 267".
 REASON_PATTERN = re.compile(
-    r"reason\s*:\s*(266|267|277|279|280|285|287)",
-    re.IGNORECASE
+    r"reason\s*[:=]\s*(266|267|277|279|280|285|287)\b",
+    re.IGNORECASE,
 )
 
-# Diagnostik: kode reason 3 digit APA PUN pada baris FLog::Network. Dipakai
-# hanya untuk mencatat kode yang BELUM ada di REASON_PATTERN (sekali per kode),
-# supaya kode error baru bisa ketahuan dari log agent tanpa menebak.
-ANY_REASON_PATTERN = re.compile(r"reason\s*:\s*(\d{3})", re.IGNORECASE)
+# Delta/modified clients can also expose the same condition as a UI/log line
+# such as "Error code: 267" instead of FLog::Network's "reason: 267".
+ERROR_CODE_PATTERN = re.compile(
+    r"error\s*code\s*[:=]?\s*(266|267|277|279|280|285|287)\b",
+    re.IGNORECASE,
+)
+
+ANY_REASON_PATTERN = re.compile(r"reason\s*[:=]\s*(\d{3})\b", re.IGNORECASE)
+ANY_ERROR_CODE_PATTERN = re.compile(r"error\s*code\s*[:=]?\s*(\d{3})\b", re.IGNORECASE)
 _seen_unknown_reasons = set()
 
 # ==========================================================
@@ -119,22 +125,29 @@ class ErrorDetector:
                     line = process.stdout.readline()
                     if not line:
                         break
-                    if not NETWORK_PATTERN.search(line):
-                        continue
-
                     pid_match = PID_PATTERN.search(line)
                     if not pid_match:
                         continue
 
+                    # Accept either the canonical FLog::Network reason or the
+                    # explicit "Error code: N" format emitted by some modified
+                    # Roblox clients. A bare unrelated number is never enough.
                     reason_match = REASON_PATTERN.search(line)
-                    if not reason_match:
-                        any_match = ANY_REASON_PATTERN.search(line)
+                    error_code_match = ERROR_CODE_PATTERN.search(line)
+                    if not reason_match and not error_code_match:
+                        any_match = ANY_REASON_PATTERN.search(line) or ANY_ERROR_CODE_PATTERN.search(line)
                         if any_match and any_match.group(1) not in _seen_unknown_reasons:
                             _seen_unknown_reasons.add(any_match.group(1))
                             print(
-                                f"[ERROR_DETECTOR] Reason {any_match.group(1)} terlihat di log "
+                                f"[ERROR_DETECTOR] Error code/reason {any_match.group(1)} terlihat di log "
                                 f"tapi TIDAK ditangani: {line.strip()[:200]}"
                             )
+                        continue
+
+                    # Do not accept an arbitrary "error code" from a random
+                    # Roblox log line unless it carries either network context
+                    # or the explicit error-code label.
+                    if not NETWORK_PATTERN.search(line) and not error_code_match:
                         continue
 
                     pid = pid_match.group(1)
@@ -142,7 +155,7 @@ class ErrorDetector:
                     if not identity or not identity.get("package"):
                         continue
 
-                    reason = int(reason_match.group(1))
+                    reason = int((reason_match or error_code_match).group(1))
                     start_time = identity.get("start_time")
                     if start_time is None:
                         continue

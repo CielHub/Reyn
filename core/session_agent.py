@@ -570,6 +570,12 @@ async def handle_start_session(msg: dict, local_device_id: str) -> dict:
             "pid_start_time": None,
         }
 
+    # Start the shared ErrorDetector immediately after session ownership is
+    # reserved, not only after the session reaches ACTIVE. This prevents an
+    # early disconnect/error from being missed while startup/join is still
+    # transitioning. The handler remains session-scoped and will ignore
+    # non-actionable states safely.
+    _ensure_error_watcher()
     _ensure_username_scanner(pkg)
     task = asyncio.create_task(
         _run_start_flow(
@@ -590,6 +596,80 @@ async def handle_start_session(msg: dict, local_device_id: str) -> dict:
     )
     return {"type":"COMMAND_RESULT","command":"START_SESSION","device_id":local_device_id,
             "session_id":session_id,"ok":True,"reason":"PROCESSING"}
+
+async def _refresh_primary_pid_identity(pkg: str, info: dict) -> str:
+    """Refresh the session's primary PID + kernel start time without killing anything.
+
+    The session tracks one deterministic primary PID for package lifecycle
+    control. This is intentionally read-only and is used to prevent PID-reuse
+    ambiguity when an error event comes from a secondary Roblox process.
+    """
+    pids = await asyncio.to_thread(process_manager.get_pids, pkg)
+    if not pids:
+        info["pid"] = "-"
+        info["pid_start_time"] = None
+        return ""
+
+    pid = _pick_pid(pids)
+    identity = await asyncio.to_thread(process_manager.get_process_identity, pid)
+    if not identity or identity.get("package") != pkg:
+        info["pid"] = pid
+        info["pid_start_time"] = None
+        return pid
+
+    info["pid"] = pid
+    info["pid_start_time"] = identity.get("start_time")
+    info["pid_alive"] = True
+    info["package_alive"] = True
+    return pid
+
+
+async def _resolve_error_target_pid(
+    info: dict, pkg: str, event_pid: str, event_start_time, incident_id: str
+):
+    """Resolve the SAFE lifecycle PID for one verified error event.
+
+    The log PID is allowed to be a secondary process of the same package.
+    When a trusted primary session PID is still owned by the same package and
+    has not been PID-reused, that primary PID is the lifecycle kill target.
+    Otherwise the verified event PID itself is used. No sibling package is
+    ever consulted or selected here.
+
+    Returns ``(target_pid, target_start_time, source)`` or ``(None, None, reason)``.
+    """
+    event_pid = str(event_pid or "").strip()
+    if not event_pid.isdigit():
+        return None, None, "INVALID_EVENT_PID"
+
+    tracked_pid = str(info.get("pid") or "").strip()
+    tracked_start = info.get("pid_start_time")
+
+    if tracked_pid.isdigit():
+        tracked_identity = await asyncio.to_thread(
+            process_manager.get_process_identity, tracked_pid
+        )
+        if tracked_identity and tracked_identity.get("package") == pkg:
+            tracked_start_actual = tracked_identity.get("start_time")
+            if tracked_start is None or str(tracked_start_actual) == str(tracked_start):
+                if tracked_pid != event_pid:
+                    log.info(
+                        f"[ERROR_CORRELATION] incident={incident_id} package={pkg} "
+                        f"event_pid={event_pid} is secondary; using trusted primary "
+                        f"target_pid={tracked_pid}."
+                    )
+                    return tracked_pid, tracked_start_actual, "SESSION_PRIMARY_PID"
+                return tracked_pid, tracked_start_actual, "EVENT_IS_PRIMARY_PID"
+
+    # The event PID has already passed package + start_time ownership checks
+    # in _handle_disconnect_event. If the tracked primary is unavailable or
+    # stale, the event PID is still the safest exact process identity available.
+    log.warning(
+        f"[ERROR_CORRELATION] incident={incident_id} package={pkg} "
+        f"primary_pid={tracked_pid or '-'} unavailable/stale; "
+        f"using verified event_pid={event_pid}."
+    )
+    return event_pid, event_start_time, "EVENT_PID_FALLBACK"
+
 
 async def _wait_in_lobby(pkg: str, session_id: str, *, recovery: bool = False, cancel_event=None) -> bool:
     """Tunggu 60-90 detik di lobby sebelum package boleh lanjut ke target."""
@@ -710,7 +790,9 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
             await _fail_start_session(local_device_id, session_id, pkg, order_id, "LOBBY_LAUNCH_FAILED")
             return
 
-        SESSIONS[pkg]["pid"] = get_pid_quick(pkg) or "-"
+        current_info = SESSIONS.get(pkg)
+        if current_info and str(current_info.get("session_id")) == session_id:
+            await _refresh_primary_pid_identity(pkg, current_info)
 
         if not await _wait_in_lobby(pkg, session_id, cancel_event=cancel_event):
             return
@@ -840,7 +922,7 @@ async def _run_start_flow(local_device_id: str, session_id: str, pkg: str, order
 
         SESSIONS[pkg]["status"] = "ACTIVE"
         SESSIONS[pkg]["runtime_status"] = "RUNNING"
-        SESSIONS[pkg]["pid"] = get_pid_quick(pkg) or "-"
+        await _refresh_primary_pid_identity(pkg, SESSIONS[pkg])
 
         _ensure_watchdog(pkg)
         _ensure_username_scanner(pkg)
@@ -2058,9 +2140,30 @@ async def _handle_disconnect_event(event: dict) -> None:
         return
 
     info = SESSIONS.get(pkg)
-    if info is None or info.get("status") != "ACTIVE":
+    if info is None:
+        log.info(
+            f"[ERROR_DROP] incident={incident_id} package={pkg} pid={pid} "
+            "reason=NO_LOCAL_SESSION"
+        )
+        return
+
+    lifecycle_status = str(info.get("status") or "").upper()
+    runtime_status = str(info.get("runtime_status") or "").upper()
+    # ACTIVE is the normal recovery state. JOINING_GAME/VERIFYING_GAME are
+    # still part of the same session lifecycle, but we keep their existing
+    # startup state machine authoritative until it explicitly reaches ACTIVE.
+    if lifecycle_status != "ACTIVE":
+        log.info(
+            f"[ERROR_DROP] incident={incident_id} package={pkg} pid={pid} "
+            f"reason=SESSION_NOT_ACTIVE status={lifecycle_status or '-'} "
+            f"runtime_status={runtime_status or '-'}"
+        )
         return
     if pkg in _recovery_in_progress:
+        log.info(
+            f"[ERROR_DROP] incident={incident_id} package={pkg} pid={pid} "
+            "reason=RECOVERY_ALREADY_IN_PROGRESS"
+        )
         return
 
     identity = await asyncio.to_thread(
@@ -2085,13 +2188,22 @@ async def _handle_disconnect_event(event: dict) -> None:
         )
         return
 
-    current_tracked_pid = str(info.get("pid") or "").strip()
-    if current_tracked_pid and current_tracked_pid != pid:
-        log.warning(
-            f"[ERROR_EVENT] incident={incident_id} {pkg}: event pid={pid} "
-            f"bukan PID session saat ini ({current_tracked_pid}); DROP."
+    target_pid, target_pid_start_time, target_source = await _resolve_error_target_pid(
+        info, pkg, pid, event_start_time, incident_id
+    )
+    if not target_pid:
+        log.error(
+            f"[ERROR_DROP] incident={incident_id} package={pkg} event_pid={pid} "
+            f"reason={target_source or 'TARGET_PID_UNRESOLVED'}"
         )
         return
+
+    log.warning(
+        f"[ERROR_CORRELATION] incident={incident_id} package={pkg} "
+        f"event_pid={pid} event_start={event_start_time} "
+        f"target_pid={target_pid} target_start={target_pid_start_time} "
+        f"source={target_source} reason={reason}."
+    )
 
     if PHASE_B1_SINGLE_INCIDENT_MODE:
         global _phase_b1_incident
@@ -2112,36 +2224,39 @@ async def _handle_disconnect_event(event: dict) -> None:
             "state": "RUNNING",
         }
         await _handle_phase_b1_single_incident_error(
-            event, info, pkg, pid, incident_id, reason, event_start_time
+            event, info, pkg, target_pid, incident_id, reason, target_pid_start_time
         )
         return
 
     if KILL_THEN_LAUNCH_TEST_MODE:
         await _handle_kill_then_launch_test_error(
-            event, info, pkg, pid, incident_id, reason, event_start_time
+            event, info, pkg, target_pid, incident_id, reason, target_pid_start_time
         )
         return
 
     if KILL_ONLY_TEST_MODE:
         await _handle_kill_only_error(
-            event, info, pkg, pid, incident_id, reason, event_start_time
+            event, info, pkg, target_pid, incident_id, reason, target_pid_start_time
         )
         return
 
     session_id = info.get("session_id", "")
     # Pin the recovery to the exact process that emitted the error. This is
     # stronger than re-enumerating every PID of the package later.
-    info["pid"] = pid
-    info["pid_start_time"] = event_start_time
+    info["pid"] = target_pid
+    info["pid_start_time"] = target_pid_start_time
     info["last_error_incident_id"] = incident_id
     info["last_error_reason"] = reason
+    info["last_error_event_pid"] = pid
+    info["last_error_event_pid_start_time"] = event_start_time
     _recovery_in_progress.add(pkg)
     info["status"] = "RECOVERING"
     info["runtime_status"] = "RECOVERING"
     info["pid_alive"] = False
     log.warning(
         f"[RECOVERY_TARGET] incident={incident_id} package={pkg} "
-        f"session={session_id} pid={pid} reason={reason} target=ONLY_THIS_PACKAGE"
+        f"session={session_id} event_pid={pid} target_pid={target_pid} "
+        f"reason={reason} target=ONLY_THIS_PACKAGE"
     )
     await _emit_status(
         info.get("_device_id", ""),
@@ -2153,6 +2268,8 @@ async def _handle_disconnect_event(event: dict) -> None:
         incident_id=incident_id,
         error_pid=pid,
         error_pid_start_time=event_start_time,
+        target_pid=target_pid,
+        target_pid_start_time=target_pid_start_time,
     )
     asyncio.create_task(
         _run_package_recovery(
@@ -2160,8 +2277,8 @@ async def _handle_disconnect_event(event: dict) -> None:
             session_id,
             f"LOGCAT_{reason}",
             incident_id=incident_id,
-            target_pid=pid,
-            target_pid_start_time=event_start_time,
+            target_pid=target_pid,
+            target_pid_start_time=target_pid_start_time,
         )
     )
 
@@ -2299,7 +2416,6 @@ async def _run_package_recovery(
 
             info = SESSIONS[pkg]
             old_pid = info.get("pid")
-            info["pid"] = get_pid_quick(pkg) or "-"
             if manual:
                 # Tunggu PID BARU (bukan PID lama) sebelum lanjut verifikasi.
                 info["runtime_status"] = "WAITING_FOR_PID"
@@ -2319,6 +2435,8 @@ async def _run_package_recovery(
                 if not _still_current():
                     return
                 info["runtime_status"] = "RESTARTING"
+            else:
+                await _refresh_primary_pid_identity(pkg, info)
             log.info(f"[{pkg}] Roblox launched (lobby). PID {old_pid or '-'} -> {info['pid']}")
 
             if not await _wait_in_lobby(pkg, session_id, recovery=True, cancel_event=cancel_event):
@@ -2383,8 +2501,7 @@ async def _run_package_recovery(
             info = SESSIONS[pkg]
             info["status"] = "ACTIVE"
             info["runtime_status"] = "RUNNING"
-            info["pid"] = get_pid_quick(pkg) or "-"
-            info["pid_start_time"] = None
+            await _refresh_primary_pid_identity(pkg, info)
             info["_pid_misses"] = 0
             info["launch_count"] = info.get("launch_count", 0) + 1
             # PID baru sudah terdeteksi, tetapi probe liveness lengkap belum

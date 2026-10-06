@@ -92,8 +92,12 @@ async def _snapshot(test: dict) -> dict:
     }
 
 
-async def _activate_test_freeform_and_restore(test: dict, pkg: str) -> None:
-    """Mirror the normal CARRERA Freeform step, but keep state isolated from SESSIONS."""
+async def _activate_test_freeform(test: dict, pkg: str) -> None:
+    """Activate Freeform for the target package only.
+
+    This diagnostic agent intentionally performs no sibling foreground/restore
+    action. A floating-window transition is therefore isolated to ``pkg``.
+    """
     try:
         ok, task_id = await asyncio.to_thread(activate_freeform, pkg)
     except Exception:
@@ -107,14 +111,6 @@ async def _activate_test_freeform_and_restore(test: dict, pkg: str) -> None:
     if not ok:
         return
 
-    # Same idea as session_agent sibling restore, but ONLY for packages in this test.
-    for sibling, sibling_info in test["packages"].items():
-        if sibling == pkg or sibling_info.get("state") != "ALIVE":
-            continue
-        try:
-            await asyncio.to_thread(process_manager.restore_foreground, sibling)
-        except Exception:
-            log.warning(f"TEST_AGENT: gagal restore sibling {sibling} setelah Freeform {pkg}.", exc_info=True)
 
 
 async def _launch_one(test: dict, pkg: str) -> None:
@@ -151,7 +147,7 @@ async def _launch_one(test: dict, pkg: str) -> None:
 
     info["launch_ok"] = True
     info["pid"] = get_pid_quick(pkg) or "-"
-    await _activate_test_freeform_and_restore(test, pkg)
+    await _activate_test_freeform(test, pkg)
 
     if not get_pid_quick(pkg):
         info["state"] = "DEAD"
@@ -206,7 +202,7 @@ async def _launch_one(test: dict, pkg: str) -> None:
             info["reason"] = f"JOIN_ERROR_SIGNAL_{failure_code}"
             return
 
-    await _activate_test_freeform_and_restore(test, pkg)
+    await _activate_test_freeform(test, pkg)
     info["pid"] = get_pid_quick(pkg) or "-"
     info["state"] = "ALIVE" if info["pid"] != "-" else "DEAD"
     if info["state"] == "DEAD":

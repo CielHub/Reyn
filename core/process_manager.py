@@ -241,22 +241,38 @@ def wait_until_process_dead(pid, timeout=5.0):
 
     return False
 
-def graceful_kill(pid, package=None):
-    """Terminate exactly one PID with SIGTERM (`kill -15`).
+def graceful_kill(pid, package=None, expected_start_time=None):
+    """Terminate exactly one PID with SIGTERM (`kill -15`) only.
 
-    The client intentionally does NOT escalate to a hard kill or `am force-stop`.
-    On the target Android 10 / clone environment, SIGTERM has been verified
-    manually to stop only the targeted Roblox clone while leaving sibling
-    packages alive. If the process refuses to exit, return False so the
-    caller can decide how to handle the failure without risking sibling
-    termination.
+    When ``package`` is supplied, ownership and (optionally) kernel
+    ``start_time`` are verified immediately before the signal is sent. This
+    prevents a reused PID from receiving SIGTERM after its original process
+    has already disappeared.
 
-    Return: (killed: bool, used_force_stop: bool). The second value is kept
-    for backward compatibility and is always False.
+    There is deliberately NO package-wide fallback, SIGKILL fallback, or
+    implicit ``am force-stop`` here. A caller that needs an emergency
+    package-scoped stop must opt into ``hard_force_stop()`` explicitly.
+
+    Return: ``(killed: bool, used_force_stop: bool)``. The second value is
+    retained for compatibility and is always ``False``.
     """
     pid = str(pid or "").strip()
     if not pid.isdigit():
         return False, False
+
+    if package is not None:
+        package = str(package or "").strip()
+        if not is_valid_package_name(package):
+            return False, False
+        identity = get_process_identity(pid)
+        if identity is None or identity.get("package") != package:
+            return False, False
+        if expected_start_time is not None:
+            try:
+                if int(identity.get("start_time")) != int(expected_start_time):
+                    return False, False
+            except (TypeError, ValueError, KeyError):
+                return False, False
 
     subprocess.run(
         ["su", "-c", f"kill -15 {pid}"],
@@ -264,7 +280,16 @@ def graceful_kill(pid, package=None):
         stderr=subprocess.DEVNULL,
     )
 
-    killed = wait_until_process_dead(pid, timeout=7.0)
+    if package is not None:
+        killed = _wait_until_pid_not_owned(
+            pid,
+            package,
+            expected_start_time if expected_start_time is not None else identity.get("start_time"),
+            timeout=7.0,
+        )
+    else:
+        killed = wait_until_process_dead(pid, timeout=7.0)
+
     return killed, False
 
 def _wait_until_pid_not_owned(pid, package, expected_start_time, timeout=5.0):

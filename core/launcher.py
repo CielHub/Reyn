@@ -11,6 +11,7 @@ import select
 import shlex
 from core.logger import log
 from core.join_verifier import verify_join
+from core import process_manager
 
 # Sinkron dengan join_verifier._FLOG_NETWORK_PATTERN / _DISCONNECT_REASON_PATTERN
 # (dan core/error_detector.py) -- dipakai di sini HANYA untuk fast-fail dini
@@ -28,18 +29,20 @@ _LOGCAT_THREADTIME_PID_RE = re.compile(
 
 
 def get_pids_quick(pkg_name):
-    """Return every current PID belonging to one Android package."""
-    try:
-        result = subprocess.run(
-            ['pidof', pkg_name],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            errors='replace',
-        )
-        return {pid for pid in (result.stdout or '').strip().split() if pid.isdigit()}
-    except Exception:
+    """Return current, identity-validated PIDs for exactly one package.
+
+    ``None`` means the probe failed/was ambiguous. An empty set means the
+    package was successfully queried and has no live process. Keeping that
+    distinction prevents a transient ``pidof`` failure from being interpreted
+    as a real process death.
+    """
+    pkg_name = str(pkg_name or "").strip()
+    if not process_manager.is_valid_package_name(pkg_name):
         return set()
+    try:
+        return process_manager.get_pids(pkg_name)
+    except Exception:
+        return None
 
 
 def get_pid_quick(pkg_name):
@@ -55,21 +58,28 @@ def _extract_logcat_pid(line):
 
 
 def _logcat_line_belongs_to_package(line, pkg_name, tracked_pids):
-    """Reject logcat events from other Roblox clones.
+    """Accept a logcat line only when its PID is explicitly tracked.
 
-    A matching PID is the primary correlation key. Package text is accepted as
-    a secondary fallback for vendor logcat formats that omit/alter threadtime
-    fields or emit package names in the message itself.
+    Package-name text is never a fallback because clone package names can
+    appear in unrelated diagnostic messages. PID correlation is the only
+    accepted key at this layer.
     """
+    del pkg_name  # package identity is already represented by tracked_pids
     line_pid = _extract_logcat_pid(line)
-    if line_pid:
-        return line_pid in tracked_pids
-    return pkg_name.lower() in (line or "").lower()
+    return bool(line_pid and line_pid in (tracked_pids or set()))
 
 
 def _refresh_tracked_pids(pkg_name, tracked_pids):
-    """Add newly-created package PIDs without losing the original ones."""
-    tracked_pids.update(get_pids_quick(pkg_name))
+    """Replace stale tracked PIDs with the current identity-validated set.
+
+    A replacement, rather than ``update()``, is important because Android can
+    reuse a PID. Retaining an old PID would let a future process with that
+    number pass the log filter accidentally.
+    """
+    current = get_pids_quick(pkg_name)
+    if current is not None:
+        tracked_pids.clear()
+        tracked_pids.update(current)
     return tracked_pids
 
 
@@ -93,6 +103,10 @@ _FREEFORM_SCREEN_SIZE = None       # (width, height) hasil 'wm size', di-cache
 _FREEFORM_SLOT_MAP = {}            # pkg_name -> slot grid (0..4), konsisten selama proses hidup
 _FREEFORM_MAX_SLOTS = 5
 _FREEFORM_RETRY_ATTEMPTS = 3       # sesuai keputusan: coba paksa dulu beberapa kali sebelum fallback normal
+
+# Recovery-only task isolation. NEW_TASK + MULTIPLE_TASK keeps each clone in
+# an independent task instead of reusing or replacing another clone's task.
+RECOVERY_TASK_FLAGS = "0x18080000"
 
 
 def _run_shell(args, use_su=False, timeout=10):
@@ -327,7 +341,7 @@ def _get_current_activity_component(pkg_name, max_wait_seconds=3.0, poll_interva
     return last_component
 
 
-def _switch_task_to_freeform(pkg_name, task_id=None, max_attempts=3):
+def _switch_task_to_freeform(pkg_name, task_id=None, max_attempts=3, isolated_task=False):
     """Ubah task yang SUDAH aktif dari fullscreen -> freeform.
 
     `am task resize` TIDAK melakukan perubahan windowing mode. Android AOSP
@@ -345,7 +359,10 @@ def _switch_task_to_freeform(pkg_name, task_id=None, max_attempts=3):
         return False
 
     _ensure_freeform_settings_once()
-    args = ['am', 'start', '--windowingMode', '5', '--activity-single-top', '-n', component]
+    args = ['am', 'start', '--windowingMode', '5', '--activity-single-top']
+    if isolated_task:
+        args += ['-f', RECOVERY_TASK_FLAGS]
+    args += ['-n', component]
 
     for attempt in range(1, max_attempts + 1):
         result = _shell_with_fallback(args)
@@ -559,7 +576,7 @@ def _window_appears_onscreen(pkg_name, task_id):
     return is_onscreen, relevant_text
 
 
-def activate_freeform(pkg_name):
+def activate_freeform(pkg_name, *, isolated_task=False):
     """Aktifkan Freeform SETELAH Roblox sudah ready.
 
     Urutan penting:
@@ -570,6 +587,10 @@ def activate_freeform(pkg_name):
       4) verifikasi mode + surface.
 
     Freeform tetap kosmetik. Gagal di sini tidak menggagalkan session.
+
+    ``isolated_task=True`` menambahkan ``-f 0x18080000`` saat transition
+    Activity, sehingga recovery tidak mengandalkan task yang sedang dipakai
+    clone lain.
     """
     if not is_android12():
         return False, None
@@ -587,7 +608,11 @@ def activate_freeform(pkg_name):
         last_task_id = task_id
 
         # KUNCI FIX: resize saja tidak mengubah fullscreen -> freeform.
-        mode_changed = _switch_task_to_freeform(pkg_name, task_id)
+        mode_changed = _switch_task_to_freeform(
+            pkg_name,
+            task_id,
+            isolated_task=isolated_task,
+        )
         if not mode_changed:
             log.warning(f"FREEFORM ACTIVATE: {pkg_name} gagal mengirim transition ke windowingMode=5 "
                         f"(attempt {attempt}/{_FREEFORM_VERIFY_ATTEMPTS}).")
@@ -629,54 +654,91 @@ def activate_freeform(pkg_name):
     return False, last_task_id
 
 
-def launch_normal(pkg_name, intent_url):
-    """Kirim `am start` NORMAL (tanpa windowingMode dipaksa) dan LANGSUNG
-    kembali -- TIDAK menunggu Roblox aktif/Smart Wait sama sekali.
+def launch_normal(pkg_name, intent_url, *, isolated_task=False):
+    """Start one exact package and return immediately.
 
-    IMPROVE ANDROID 12 (Timer utk Proses Freeform): dipisah dari badan
-    launch_and_wait() supaya session_agent.py bisa memanggil activate_freeform()
-    lewat TIMER TETAP (2-3 detik) segera setelah `am start` terkirim, alih-alih
-    menunggu seluruh Smart Wait (yang bisa puluhan detik) selesai dulu.
-    Menunggu Smart Wait sebelum freeform berarti package LAIN yang sudah
-    Freeform ikut lama tertahan di background tanpa dibangkitkan
-    (_activate_freeform_and_restore_siblings) -- makin lama, makin besar
-    risiko package itu di-kill sistem. wait_for_launch_signal() (Smart Wait)
-    tetap jalan seperti biasa, cuma sekarang BERBARENGAN dengan timer
-    freeform, bukan sebelumnya.
+    ``isolated_task=True`` is reserved for recovery/diagnostic relaunches. It
+    first requests Android freeform windowing plus
+    ``FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_MULTIPLE_TASK`` (0x18080000).
+    If the vendor rejects ``--windowingMode``, a second attempt keeps the task
+    isolation flag and drops only the windowing-mode option.
 
-    --activity-single-top: WAJIB supaya intent ini TETAP dikirim ke activity
-    yang sudah berjalan lewat onNewIntent() walau activity tsb kebetulan
-    sudah di posisi paling atas/foreground (skenario "trigger balik ke
-    Lobby" pada package yang masih hidup di tengah game -- tanpa flag ini
-    Android cuma membalas "brought to the front" tanpa mengirim intent).
-
-    Return (ok: bool, start_time_str: str | None). start_time_str WAJIB
-    dipakai sebagai titik awal filter logcat di wait_for_launch_signal() --
-    diambil SEBELUM `am start` dikirim (sama seperti sebelumnya) supaya
-    tidak ada baris logcat relevan yang kelewat.
+    The activity is intentionally left implicit here because a cold Roblox
+    clone may expose a temporary/proxy Activity before the final native
+    Activity exists. The package selector (``-p``) remains exact.
     """
+    pkg_name = str(pkg_name or "").strip()
+    if not process_manager.is_valid_package_name(pkg_name):
+        log.error(f"LAUNCH FAILED: invalid package name {pkg_name!r}.")
+        return False, None
+
     if not intent_url:
         log.error(f"LAUNCH FAILED: {pkg_name} tidak memiliki Intent URL.")
         return False, None
 
-    log.info(f"LAUNCH: Membuka {pkg_name}...")
+    log.info(
+        f"LAUNCH: Membuka {pkg_name} "
+        f"(isolated_task={bool(isolated_task)})."
+    )
 
     start_time_str = datetime.datetime.now().strftime('%m-%d %H:%M:%S.000')
 
-    base_am_args = ['am', 'start', '--activity-single-top', '-p', pkg_name,
-                     '-a', 'android.intent.action.VIEW', '-d', intent_url]
+    common_args = [
+        'am', 'start', '--activity-single-top',
+    ]
+    if isolated_task:
+        isolated_args = common_args + [
+            '--windowingMode', '5',
+            '-f', RECOVERY_TASK_FLAGS,
+            '-p', pkg_name,
+            '-a', 'android.intent.action.VIEW',
+            '-d', intent_url,
+        ]
+        fallback_args = common_args + [
+            '-f', RECOVERY_TASK_FLAGS,
+            '-p', pkg_name,
+            '-a', 'android.intent.action.VIEW',
+            '-d', intent_url,
+        ]
 
-    launch_result = subprocess.run(base_am_args, capture_output=True, text=True, errors='replace')
+        launch_result = _shell_with_fallback(isolated_args)
+        output = ((launch_result.stdout or '') + '\n' + (launch_result.stderr or '')).strip()
+        if launch_result.returncode != 0 or 'error' in output.lower():
+            log.warning(
+                f"LAUNCH ISOLATED: {pkg_name} windowingMode=5 gagal/ditolak; "
+                "fallback tetap memakai task flag 0x18080000."
+            )
+            launch_result = _shell_with_fallback(fallback_args)
+    else:
+        base_am_args = common_args + [
+            '-p', pkg_name,
+            '-a', 'android.intent.action.VIEW',
+            '-d', intent_url,
+        ]
+        launch_result = subprocess.run(
+            base_am_args,
+            capture_output=True,
+            text=True,
+            errors='replace',
+        )
 
-    launch_output = ((launch_result.stdout or '') + '\n' + (launch_result.stderr or '')).strip()
+    launch_output = (
+        (launch_result.stdout or '') + '\n' + (launch_result.stderr or '')
+    ).strip()
     if launch_output:
-        log.info(f"LAUNCH RESULT [{pkg_name}]: {launch_output.replace(chr(10), ' | ')}")
+        log.info(
+            f"LAUNCH RESULT [{pkg_name}]: "
+            f"{launch_output.replace(chr(10), ' | ')}"
+        )
+
     if launch_result.returncode != 0:
-        log.error(f"LAUNCH COMMAND FAILED [{pkg_name}]: rc={launch_result.returncode}")
+        log.error(
+            f"LAUNCH COMMAND FAILED [{pkg_name}]: "
+            f"rc={launch_result.returncode}"
+        )
         return False, start_time_str
 
     return True, start_time_str
-
 
 def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_join_signal=False, cancel_event=None):
     """Smart Wait -- DIPISAH dari launch_normal() (lihat docstring-nya) supaya
@@ -711,7 +773,7 @@ def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_jo
     start_time = time.time()
     PID_CHECK_INTERVAL_SECONDS = 3
     last_pid_check = start_time
-    tracked_pids = get_pids_quick(pkg_name)
+    tracked_pids = get_pids_quick(pkg_name) or set()
 
     try:
         while True:
@@ -759,8 +821,13 @@ def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_jo
         except subprocess.TimeoutExpired:
             process.kill()
 
-    final_pid = get_pid_quick(pkg_name)
-    if not final_pid:
+    final_pids = get_pids_quick(pkg_name)
+    final_pid = min(
+        final_pids,
+        key=lambda value: int(value),
+        default="",
+    ) if final_pids else ""
+    if final_pids is None or not final_pid:
         log.error(f"LAUNCH FAILED: {pkg_name} gagal diluncurkan (Proses mati secara prematur).")
         return ("FAILED", "PROCESS_NOT_RUNNING") if require_join_signal else False
 
@@ -791,7 +858,7 @@ def wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_jo
     return ("UNCERTAIN", "NO_JOIN_SIGNAL_TIMEOUT")
 
 
-def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=False, defer_freeform=False):
+def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=False, defer_freeform=False, isolated_task=False):
     """
     IMPROVE ANDROID 12 (Timer utk Proses Freeform): kalau defer_freeform=True,
     fungsi ini sekarang MURNI wrapper launch_normal() + wait_for_launch_signal()
@@ -805,18 +872,11 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     core/menu.py, core/tester.py, core/recovery_manager.py) supaya tidak ada
     yang perlu diubah di luar session_agent.py.
 
-    defer_freeform (default False -- PERILAKU LAMA TIDAK BERUBAH untuk semua
-    pemanggil existing yang tidak mengisi argumen ini): kalau True, fungsi
-    ini SELALU melakukan launch NORMAL (`base_am_args`, tanpa `--windowingMode
-    5` sama sekali) dan TIDAK melakukan resize/verify freeform apa pun di
-    sini -- walaupun device Android 12. Dipakai session_agent.py supaya
-    urutan barunya jadi: LAUNCH NORMAL -> tunggu Roblox benar-benar aktif
-    (Smart Wait selesai di sini) -> BARU caller memanggil
-    activate_freeform(pkg_name) secara eksplisit setelah itu. Ini menghindari
-    memaksa windowingMode freeform SAAT Roblox masih transisi
-    (ActivityProtocolLaunch -> ActivityNativeMain / splash), yang terbukti
-    jadi sumber window "freeform tapi tidak muncul di layar" walau dumpsys
-    bilang visible=true.
+    defer_freeform (default False): kalau True, fungsi ini tetap melakukan
+    launch NORMAL tanpa memaksa windowingMode=5 di badan fungsi, lalu caller
+    dapat menjalankan activate_freeform() setelah Smart Wait. Opsi
+    ``isolated_task`` tetap diteruskan ke launch_normal(), sehingga recovery
+    dapat memperoleh task isolation tanpa mengubah startup biasa.
 
     FIX (Lobby-trigger tidak sampai ke app): `am start` di bawah SELALU
     memakai `--activity-single-top`. Tanpa flag ini, kalau activity package
@@ -829,6 +889,9 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     positive). Dengan flag ini, intent TETAP dikirim lewat onNewIntent()
     walau activity sudah di atas, sekaligus tidak mengubah perilaku kalau
     activity BELUM di atas (start normal seperti biasa).
+
+    isolated_task=True hanya dipakai untuk recovery/diagnostic relaunch. Ia meminta
+    --windowingMode 5 + -f 0x18080000 agar task target dipisahkan dari clone lain.
 
     require_join_signal (LIFECYCLE REVISION, default False -- PERILAKU LAMA
     TIDAK BERUBAH untuk semua pemanggil existing yang tidak mengisi argumen
@@ -873,7 +936,7 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     (cukup proses hidup + verify_join()).
     """
     if defer_freeform:
-        ok, start_time_str = launch_normal(pkg_name, intent_url)
+        ok, start_time_str = launch_normal(pkg_name, intent_url, isolated_task=isolated_task)
         if not ok:
             return ("FAILED", "LAUNCH_COMMAND_FAILED") if require_join_signal else False
         return wait_for_launch_signal(pkg_name, start_time_str, timeout_seconds, require_join_signal)
@@ -896,7 +959,10 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     # sehingga Roblox tidak pernah tahu ada perintah roblox:// baru dan
     # tetap diam di layar game lama walau proses/foreground check kita
     # tetap lolos/false-positive).
-    base_am_args = ['am', 'start', '--activity-single-top', '-p', pkg_name,
+    base_am_args = ['am', 'start', '--activity-single-top']
+    if isolated_task:
+        base_am_args += ['-f', RECOVERY_TASK_FLAGS]
+    base_am_args += ['-p', pkg_name,
                      '-a', 'android.intent.action.VIEW', '-d', intent_url]
 
     # === AUTO FREEFORM/FLOATING WINDOW -- KHUSUS ANDROID 12 (SDK 31/32) ===
@@ -913,8 +979,10 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
 
     if use_freeform:
         _ensure_freeform_settings_once()
-        freeform_am_args = ['am', 'start', '--windowingMode', '5', '--activity-single-top',
-                             '-p', pkg_name, '-a', 'android.intent.action.VIEW', '-d', intent_url]
+        freeform_am_args = ['am', 'start', '--windowingMode', '5', '--activity-single-top']
+        if isolated_task:
+            freeform_am_args += ['-f', RECOVERY_TASK_FLAGS]
+        freeform_am_args += ['-p', pkg_name, '-a', 'android.intent.action.VIEW', '-d', intent_url]
 
         for attempt in range(1, _FREEFORM_RETRY_ATTEMPTS + 1):
             candidate = _shell_with_fallback(freeform_am_args)
@@ -976,7 +1044,7 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     # diputuskan sama sekali, cuma mempercepat jalur proses mati.
     PID_CHECK_INTERVAL_SECONDS = 3
     last_pid_check = start_time
-    tracked_pids = get_pids_quick(pkg_name)
+    tracked_pids = get_pids_quick(pkg_name) or set()
 
     try:
         while True:
@@ -1032,8 +1100,13 @@ def launch_and_wait(pkg_name, intent_url, timeout_seconds, require_join_signal=F
     if freeform_applied:
         _reverify_freeform_window(pkg_name, freeform_task_id)
 
-    final_pid = get_pid_quick(pkg_name)
-    if not final_pid:
+    final_pids = get_pids_quick(pkg_name)
+    final_pid = min(
+        final_pids,
+        key=lambda value: int(value),
+        default="",
+    ) if final_pids else ""
+    if final_pids is None or not final_pid:
         log.error(f"LAUNCH FAILED: {pkg_name} gagal diluncurkan (Proses mati secara prematur).")
         return ("FAILED", "PROCESS_NOT_RUNNING") if require_join_signal else False
 

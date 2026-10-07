@@ -195,7 +195,11 @@ async def _run_agent(device_id: str, token: str, ws_url: str) -> None:
                     await asyncio.sleep(30)
                     continue
 
+                # CRITICAL ORDERING: inventory must exist before HEARTBEAT #1.
+                # Otherwise the bot can persist packages_json={} even though
+                # Android already has all Roblox clone packages installed.
                 log.info(f"AGENT: Terhubung ke Joki Control Bot sebagai '{device_id}'.")
+                await _initial_package_inventory_scan()
                 _set_status("ONLINE", device_id, "")
                 attempt = 0
 
@@ -211,7 +215,7 @@ async def _run_agent(device_id: str, token: str, ws_url: str) -> None:
                 connection_tasks = [
                     asyncio.create_task(_heartbeat_loop(ws, device_id)),
                     asyncio.create_task(_receive_loop(ws, device_id, command_tasks)),
-                    asyncio.create_task(_package_inventory_loop()),
+                    asyncio.create_task(_package_inventory_loop(skip_initial_scan=True)),
                 ]
 
                 try:
@@ -243,15 +247,77 @@ async def _run_agent(device_id: str, token: str, ws_url: str) -> None:
             await asyncio.sleep(delay)
 
 
-async def _package_inventory_loop() -> None:
+async def _initial_package_inventory_scan(max_attempts: int = 3, retry_delay: float = 2.0) -> list:
+    """Populate inventory before the first heartbeat is allowed to run.
+
+    This removes the startup race where HEARTBEAT #1 could be sent with an
+    empty inventory while the background scanner had not executed yet.
+    ``scan_installed_packages_blocking`` itself preserves last-known-good data
+    on a real pm command failure, so retries here are safe and non-destructive.
+    """
+    attempts = max(1, int(max_attempts))
+    last_packages = package_inventory.get_cached_packages()
+
+    for attempt in range(1, attempts + 1):
+        try:
+            packages = await asyncio.to_thread(
+                package_inventory.scan_installed_packages_blocking
+            )
+            scan_status = package_inventory.get_scan_status()
+            if scan_status.get("last_scan_ok") is False:
+                log.warning(
+                    f"AGENT: initial package inventory gagal pada attempt "
+                    f"{attempt}/{attempts}; akan retry."
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(retry_delay)
+                    continue
+                log.warning(
+                    "AGENT: initial inventory gagal setelah retry; heartbeat "
+                    "tetap dimulai menggunakan last-known-good cache (jika ada)."
+                )
+                return packages
+
+            log.info(
+                f"AGENT: initial package inventory siap "
+                f"({len(packages)} package, attempt {attempt}/{attempts})."
+            )
+            return packages
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Defensive guard: the inventory contract should already swallow
+            # command failures, but an unexpected implementation error must
+            # never block the agent forever.
+            log.error(
+                f"AGENT: initial package inventory attempt {attempt}/{attempts} "
+                "gagal.",
+                exc_info=True,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(retry_delay)
+
+    return last_packages
+
+
+async def _package_inventory_loop(skip_initial_scan: bool = False) -> None:
+    """Refresh inventory periodically without racing the first heartbeat."""
+    if not skip_initial_scan:
+        try:
+            await asyncio.to_thread(package_inventory.scan_installed_packages_blocking)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.error("AGENT: exception saat initial package inventory loop.", exc_info=True)
+
     while True:
+        await asyncio.sleep(package_inventory.INVENTORY_SCAN_INTERVAL_SECONDS)
         try:
             await asyncio.to_thread(package_inventory.scan_installed_packages_blocking)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.error("AGENT: exception tak terduga saat package inventory scan.", exc_info=True)
-        await asyncio.sleep(package_inventory.INVENTORY_SCAN_INTERVAL_SECONDS)
 
 
 def _safe_snapshot_packages() -> dict:

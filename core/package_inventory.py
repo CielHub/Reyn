@@ -64,50 +64,105 @@ _cache = {"packages": None, "scanned_at": None}
 # Supaya kondisi "tidak ada package / scan gagal" cuma dilog SEKALI saat
 # terjadi (dan sekali lagi saat pulih), bukan tiap siklus 60 detik.
 _empty_or_failed_logged = False
+_last_scan_ok = None
+
+
+def _run_pm_list_packages() -> str:
+    """Return the Android package-manager listing without a shell pipeline.
+
+    Direct execution is preferred. On Termux/root setups where the app UID
+    cannot query the full package inventory, retry through ``su``. Both paths
+    are explicit argv calls, so no broad shell matching is involved.
+    """
+    commands = [
+        ["/system/bin/pm", "list", "packages"],
+        ["pm", "list", "packages"],
+        ["su", "-c", "/system/bin/pm list packages"],
+    ]
+    last_error = None
+    for command in commands:
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if completed.returncode == 0:
+                return completed.stdout or ""
+            last_error = RuntimeError(
+                f"command exit={completed.returncode}: {command[0]}"
+            )
+        except Exception as exc:
+            last_error = exc
+    raise last_error or RuntimeError("pm list packages failed")
 
 
 def scan_installed_packages_blocking() -> list:
-    """BLOCKING (subprocess 'pm list packages') -- panggil lewat
-    asyncio.to_thread dari caller async (lihat
-    agent_client._package_inventory_loop()). TIDAK PERNAH sys.exit() atau
-    raise ke pemanggil -- selalu return list (boleh kosong). Update cache
-    in-memory SEBELUM return, supaya get_cached_packages() langsung
-    konsisten dengan hasil scan ini.
-    """
-    global _empty_or_failed_logged
-    try:
-        raw_output = subprocess.check_output(
-            ['pm', 'list', 'packages'], text=True, timeout=10,
-        )
-        packages = sorted(
-            line.split(':', 1)[1].strip()
-            for line in raw_output.splitlines()
-            if 'roblox' in line.lower() and ':' in line
-        )
-    except Exception:
-        log.warning(
-            "PACKAGE_INVENTORY: gagal menjalankan 'pm list packages' (root "
-            "belum siap / device belum jalan sepenuhnya?). Agent tetap "
-            "jalan, akan dicoba lagi siklus berikutnya.",
-            exc_info=True,
-        )
-        packages = []
+    """Scan installed Roblox packages and update the cache only on success.
 
+    CRITICAL ISOLATION/LIVENESS RULE:
+    - A successful ``pm list packages`` with zero Roblox matches is a real
+      empty inventory and may replace the cache with ``[]``.
+    - A command/process/permission failure is *not* an empty inventory. In
+      that case the previous last-known-good cache is preserved so one
+      transient Android/Termux failure cannot make Discord hide every package.
+
+    The function never exits or raises to the agent caller.
+    """
+    global _empty_or_failed_logged, _last_scan_ok
+
+    try:
+        raw_output = _run_pm_list_packages()
+        packages = sorted({
+            line.split(":", 1)[1].strip()
+            for line in raw_output.splitlines()
+            if ":" in line and "roblox" in line.lower()
+        })
+    except Exception:
+        _last_scan_ok = False
+        if not _empty_or_failed_logged:
+            log.warning(
+                "PACKAGE_INVENTORY: gagal membaca Android package manager; "
+                "mempertahankan last-known-good inventory dan akan mencoba lagi.",
+                exc_info=True,
+            )
+        _empty_or_failed_logged = True
+        return get_cached_packages()
+
+    _last_scan_ok = True
+
+    # Command succeeded. An empty result is therefore meaningful and should
+    # replace the cache. A non-empty result clears the degraded-state latch.
     if packages:
         if _empty_or_failed_logged:
-            log.info(f"PACKAGE_INVENTORY: package Roblox kembali terdeteksi ({len(packages)}).")
+            log.info(
+                f"PACKAGE_INVENTORY: package Roblox kembali terdeteksi "
+                f"({len(packages)})."
+            )
         _empty_or_failed_logged = False
     elif not _empty_or_failed_logged:
         log.warning(
-            "PACKAGE_INVENTORY: tidak ada package Roblox terdeteksi saat ini "
-            "(akan dicoba lagi tiap siklus, TIDAK menghentikan agent -- "
-            "beda dari core/scanner.py mode manual yang sys.exit)."
+            "PACKAGE_INVENTORY: pm berhasil, tetapi tidak ada package Roblox "
+            "terdeteksi saat ini. Akan dicoba lagi tiap siklus."
         )
         _empty_or_failed_logged = True
 
     _cache["packages"] = packages
     _cache["scanned_at"] = time.time()
-    return packages
+    return list(packages)
+
+
+def get_scan_status() -> dict:
+    """Return lightweight diagnostics for the local agent/TUI."""
+    return {
+        "scanned": _cache["scanned_at"] is not None,
+        "package_count": len(_cache["packages"] or []),
+        "scanned_at": _cache["scanned_at"],
+        "degraded": _empty_or_failed_logged,
+        "last_scan_ok": _last_scan_ok,
+    }
 
 
 def get_cached_packages() -> list:
